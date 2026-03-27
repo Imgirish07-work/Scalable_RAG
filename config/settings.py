@@ -1,0 +1,247 @@
+from pydantic_settings import BaseSettings
+from pydantic import Field, field_validator, model_validator
+from functools import lru_cache
+from typing import Optional
+
+
+class Settings(BaseSettings):
+
+    # LLM Providers
+    openai_api_key: Optional[str] = Field(default=None, env="OPENAI_API_KEY")
+    gemini_api_key: Optional[str] = Field(default=None, env="GEMINI_API_KEY")
+
+    # LLM Model Names
+    openai_model: str = Field(default="gpt-3.5-turbo", env="OPENAI_MODEL")
+    gemini_model: str = Field(default="gemini-2.5-flash", env="GEMINI_MODEL")
+    default_provider: str = Field(default="gemini", env="DEFAULT_PROVIDER")
+
+    # LLM Parameters
+    temperature: float = Field(default=0.7, env="TEMPERATURE")
+    max_tokens: int = Field(default=1024, env="MAX_TOKENS")
+    request_timeout: float = Field(default=30.0, env="REQUEST_TIMEOUT")
+
+    # Embedding Model
+    # embedding_model: str = Field(default="BAAI/bge-m3", env="EMBEDDING_MODEL")
+    embedding_model        : str = Field(
+        default="BAAI/bge-small-en-v1.5",
+        env="EMBEDDING_MODEL",
+    )
+    embedding_model_local_path: str = Field(
+        default=None,
+        env="EMBEDDING_MODEL_LOCAL_PATH",
+    )
+    
+    # Document cleaner settings
+    min_chars_per_page : int = Field(default=50, env="MIN_CHARS_PER_PAGE")
+    prefer_pdfplumber : bool = Field(default=False, env="PREFER_PDFPLUMBER")
+
+    # Chunker settings
+    chunk_size : int = Field(default=512, env="CHUNK_SIZE")
+    chunk_overlap : int = Field(default=100, env="CHUNK_OVERLAP")
+    code_chunk_overlap: int = Field(default=150, env="CODE_CHUNK_OVERLAP")
+    min_chunk_tokens : int = Field(default=20, env="MIN_CHUNK_TOKENS")
+
+    # Qdrant Settings
+    qdrant_collection_name : str = Field(
+        default="rag_collection",
+        env="QDRANT_COLLECTION_NAME",
+    )
+    qdrant_url : str = Field(
+        default="http://localhost:6333",
+        env="QDRANT_URL",
+    )
+    qdrant_api_key: Optional[str] = Field(default=None, env="QDRANT_API_KEY")
+
+    # RLM Settings
+    max_tokens_per_chunk: int = Field(default=500, env="MAX_TOKENS_PER_CHUNK")
+    max_recursion_depth: int = Field(default=5, env="MAX_RECURSION_DEPTH")
+    effective_context_limit: int = Field(default=8000, env="EFFECTIVE_CONTEXT_LIMIT")
+
+    # RAG Settings
+    top_k_retrieval: int = Field(default=5, env="TOP_K_RETRIEVAL")
+    chunk_size: int = Field(default=1000, env="CHUNK_SIZE")
+    chunk_overlap: int = Field(default=200, env="CHUNK_OVERLAP")
+
+    # Cache Settings
+    cache_enabled: bool = Field(default=True, env="CACHE_ENABLED")
+    cache_directory: str = Field(default="./data/cache", env="CACHE_DIRECTORY")
+    cache_ttl_seconds: int = Field(default=3600, env="CACHE_TTL_SECONDS")
+    # Cache L1 (in-memory)
+    CACHE_L1_MAX_SIZE: int = 1000
+    """Maximum entries in the L1 in-memory LRU cache.
+    Per application instance. Higher = more RAM, more hits."""
+
+    # Cache L2 (Redis)
+    REDIS_ENV: str = "local"
+    """Redis environment: 'local', 'cloud', 'test', or 'disabled'.
+        local    — redis://localhost:6379/0, no TLS, dev prefix
+        cloud    — reads REDIS_CLOUD_URL, TLS, prod prefix
+        test     — redis://localhost:6379/1, test prefix
+        disabled — skip Redis entirely, L1 only
+    """
+
+    REDIS_URL: str = "redis://localhost:6379/0"
+    """Local Redis URL. Used when REDIS_ENV=local."""
+
+    REDIS_CLOUD_URL: str = ""
+    """Redis Cloud URL with credentials. Used when REDIS_ENV=cloud.
+    Example: rediss://user:password@host:port/0"""
+
+    REDIS_MAX_CONNECTIONS: int = 20
+    """Maximum connections in the Redis async connection pool."""
+
+    REDIS_SOCKET_TIMEOUT: float = 2.0
+    """Timeout in seconds for individual Redis operations."""
+
+    REDIS_RETRY_ON_TIMEOUT: bool = True
+    """Whether to retry Redis operations on timeout."""
+
+    # --- Cache strategy ---
+    CACHE_STRATEGY: str = "exact"
+    """Active cache strategy: 'exact' or 'semantic'.
+    Start with 'exact', switch to 'semantic' after Phase 6."""
+
+    # --- Semantic cache ---
+    CACHE_SEMANTIC_THRESHOLD: float = 0.95
+    """Minimum cosine similarity for a semantic cache hit.
+    Range: 0.0 - 1.0. Start at 0.95, tune based on metrics.
+    Only used when CACHE_STRATEGY='semantic'."""
+
+    CACHE_SEMANTIC_THRESHOLD_HIGH: float = 0.93
+    """Threshold for 'high confidence' semantic tier.
+    Hits between this and CACHE_SEMANTIC_THRESHOLD are flagged
+    for monitoring but still served."""
+
+    CACHE_SEMANTIC_THRESHOLD_PARTIAL: float = 0.88
+    """Threshold for 'partial' semantic tier.
+    Hits between this and CACHE_SEMANTIC_THRESHOLD_HIGH are used
+    as LLM seed context (cheaper call, not direct serve)."""
+
+    CACHE_SEMANTIC_COLLECTION: str = "cache_semantic"
+    """Qdrant collection name for the semantic cache index.
+    Separate from your RAG collection to avoid pollution."""
+
+    # --- Cache circuit breaker ---
+    CACHE_CIRCUIT_BREAKER_THRESHOLD: int = 5
+    """Consecutive failures before opening the circuit breaker.
+    Once open, all requests skip the failed backend for the
+    reset period."""
+
+    CACHE_CIRCUIT_BREAKER_RESET_SECONDS: float = 60.0
+    """Seconds to wait before retrying a tripped circuit breaker."""
+
+    # --- Cache quality gate ---
+    CACHE_MIN_RESPONSE_TOKENS: int = 20
+    """Minimum response tokens to cache. Shorter responses are
+    likely errors, refusals, or degenerate outputs."""
+
+    CACHE_MIN_RESPONSE_LATENCY_MS: float = 100.0
+    """Minimum LLM latency to cache. Sub-100ms responses are
+    likely errors returning instantly, not real generations."""
+
+    # --- RAG Configuration ---
+    # RAG layer
+    RAG_DEFAULT_VARIANT: str = "simple"
+    RAG_TOP_K: int = 5
+    RAG_MAX_CONTEXT_TOKENS: int = 3072
+    RAG_RERANK_STRATEGY: str = "mmr"
+    RAG_RETRIEVAL_MODE: str = "dense"
+    RAG_CONFIDENCE_METHOD: str = "retrieval"
+
+    # CorrectiveRAG specific
+    CRAG_RELEVANCE_THRESHOLD_PASS: float = 0.7
+    CRAG_RELEVANCE_THRESHOLD_RETRY: float = 0.4
+    CRAG_MAX_RETRIES: int = 1
+
+    # CoRAG (Chain-of-RAG) 
+    CHAIN_RAG_MAX_HOPS: int = 3
+    CHAIN_RAG_DRAFT_MAX_TOKENS: int = 512
+    CHAIN_RAG_COMPLETENESS_MAX_TOKENS: int = 512
+
+    # --- Cost per token (for savings calculation) ---
+    COST_PER_TOKEN_OPENAI: float = 0.000002
+    """Approximate cost per token for OpenAI (gpt-3.5-turbo).
+    Used to estimate cost savings from cache hits."""
+
+    COST_PER_TOKEN_GEMINI: float = 0.0000001
+    """Approximate cost per token for Gemini (2.5-flash).
+    Used to estimate cost savings from cache hits."""
+
+    # Cost Optimization
+    use_cheap_model_threshold: int = Field(default=500, env="USE_CHEAP_MODEL_THRESHOLD")
+    llm_max_retries: int = Field(default=3, env="LLM_MAX_RETRIES")  
+
+    # Logging
+    log_level: str = Field(default="INFO", env="LOG_LEVEL")
+    log_file: str = Field(default="./data/logs/app.log", env="LOG_FILE")
+
+    # Backend
+    app_name: str = Field(default="Scalable RAG RLM", env="APP_NAME")
+    app_version: str = Field(default="1.0.0", env="APP_VERSION")
+    debug: bool = Field(default=False, env="DEBUG")
+    host: str = Field(default="0.0.0.0", env="HOST")
+    port: int = Field(default=8000, env="PORT")
+
+    # Validate default_provider 
+    @field_validator("default_provider")
+    @classmethod
+    def validate_provider(cls, v: str) -> str:
+        allowed = ["openai", "gemini"]
+        if v.lower() not in allowed:
+            raise ValueError(f"default_provider must be one of {allowed}, got '{v}'")
+        return v.lower()
+
+    # Validate chunk_overlap < chunk_size
+    @model_validator(mode="after")
+    def validate_chunk_settings(self) -> "Settings":
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError(
+                f"chunk_overlap ({self.chunk_overlap}) must be "
+                f"less than chunk_size ({self.chunk_size})"
+            )
+        return self
+
+    # Use model_config instead of class Config
+    model_config = {
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "case_sensitive": False,
+        "extra": "ignore",
+    }
+
+    @field_validator("CACHE_STRATEGY")
+    @classmethod
+    def validate_cache_strategy(cls, v: str) -> str:
+        allowed = {"exact", "semantic"}
+        if v not in allowed:
+            raise ValueError(
+                f"CACHE_STRATEGY must be one of {allowed}, got '{v}'"
+            )
+        return v
+
+    @field_validator("CACHE_SEMANTIC_THRESHOLD")
+    @classmethod
+    def validate_semantic_threshold(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(
+                f"CACHE_SEMANTIC_THRESHOLD must be between 0.0 and 1.0, got {v}"
+            )
+        return v
+
+    @field_validator("REDIS_ENV")
+    @classmethod
+    def validate_redis_env(cls, v: str) -> str:
+        allowed = {"local", "cloud", "test", "disabled", ""}
+        if v.strip().lower() not in allowed:
+            raise ValueError(
+                f"REDIS_ENV must be one of {allowed}, got '{v}'"
+            )
+        return v.strip().lower()
+
+
+@lru_cache()
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()

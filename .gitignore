@@ -1,0 +1,53 @@
+# Environment
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+env/
+
+# Python 
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Data & Logs
+data/*
+!data/.gitkeep
+*.log
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Large model weight files (safeguard if outside /models/)
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+*.onnx
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build
+dist/
+build/
+*.egg-info/
+
+# Models
+/models/
