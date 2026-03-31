@@ -167,9 +167,16 @@ class Settings(BaseSettings):
     """Approximate cost per token for Gemini (2.5-flash).
     Used to estimate cost savings from cache hits."""
 
+    # Rate Limiter
+    LLM_RATE_LIMITER_ENABLED: bool = True
+    LLM_RPM: int = 60
+    LLM_RPD: int = 1500
+    LLM_MAX_CONCURRENT: int = 5
+    LLM_BURST_MULTIPLIER: float = 1.0
+
     # Cost Optimization
     use_cheap_model_threshold: int = Field(default=500, env="USE_CHEAP_MODEL_THRESHOLD")
-    llm_max_retries: int = Field(default=3, env="LLM_MAX_RETRIES")  
+    llm_max_retries: int = Field(default=3, env="LLM_MAX_RETRIES")
 
     # Logging
     log_level: str = Field(default="INFO", env="LOG_LEVEL")

@@ -39,12 +39,14 @@ from qdrant_client.models import (
     Distance,
     Filter,
     FieldCondition,
+    MatchAny,
     MatchValue,
     SparseVectorParams,
     VectorParams,
 )
 
 from config.settings import settings
+from utils.helpers import hash_text
 from utils.logger import get_logger
 from vectorstore.embeddings import get_embedding_dimension, get_embeddings
 from vectorstore.base_store import BaseVectorStore
@@ -78,6 +80,7 @@ class QdrantStore(BaseVectorStore):
         qdrant_url: Optional[str] = None,
         qdrant_api_key: Optional[str] = None,
         search_mode: SearchMode = "dense",
+        client: Optional[QdrantClient] = None,
     ) -> None:
         """Sync constructor — stores config, no connections made.
 
@@ -87,12 +90,17 @@ class QdrantStore(BaseVectorStore):
             qdrant_url: Qdrant server URL (overrides settings).
             qdrant_api_key: Qdrant API key (overrides settings).
             search_mode: Search strategy — 'dense', 'sparse', or 'hybrid'.
+            client: Optional existing QdrantClient to reuse. When provided,
+                skips client construction entirely — the caller's client is
+                used as-is. Required so multiple collections share one
+                in-memory database (same as connecting to one server in prod).
         """
         self.collection_name = collection_name or settings.qdrant_collection_name
         self.in_memory = in_memory
         self.search_mode = search_mode
         self._qdrant_url = qdrant_url
         self._qdrant_api_key = qdrant_api_key
+        self._injected_client: Optional[QdrantClient] = client
 
         # Initialized in initialize() — not here (two-phase pattern)
         self._client: Optional[QdrantClient] = None
@@ -131,12 +139,17 @@ class QdrantStore(BaseVectorStore):
     def _build_client(self) -> QdrantClient:
         """Build QdrantClient based on connection mode.
 
+        If a client was injected at construction time, returns it directly
+        (shared client — no new connection created).
         in_memory=True → QdrantClient(":memory:") for dev/testing.
         in_memory=False → connects to URL from settings or constructor.
 
         Returns:
             Configured QdrantClient instance.
         """
+        if self._injected_client is not None:
+            return self._injected_client
+
         if self.in_memory:
             logger.info("Initializing in-memory Qdrant client")
             return QdrantClient(":memory:")
@@ -357,19 +370,110 @@ class QdrantStore(BaseVectorStore):
 
         try:
             # Order matters: enrich first (char_count uses original page_content),
-            # then swap to embed_content. Do NOT reorder these two calls.
+            # then dedup, then swap to embed_content. Do NOT reorder these calls.
             enriched_docs = self._enrich_metadata(documents)
-            embed_docs = self._prepare_for_embedding(enriched_docs)
+
+            # Dedup — skip chunks already stored in Qdrant, saves all embedding work
+            new_docs, skipped = await self._filter_existing_documents(enriched_docs)
+
+            if not new_docs:
+                logger.info(
+                    "All %d chunks already stored — skipping embedding entirely",
+                    len(documents),
+                )
+                return []
+
+            embed_docs = self._prepare_for_embedding(new_docs)
 
             # LangChain embeds page_content and stores everything
             ids = await asyncio.to_thread(self._store.add_documents, embed_docs)
 
-            logger.info("QdrantStore stored %d chunks", len(ids))
+            logger.info(
+                "QdrantStore stored %d new chunks, %d duplicates skipped",
+                len(ids), skipped,
+            )
             return ids
 
         except Exception as e:
             logger.exception("Error in add_documents: %s", e)
             raise
+
+    async def _filter_existing_documents(
+        self,
+        documents: List[Document],
+    ) -> tuple[List[Document], int]:
+        """Filter out chunks already stored in Qdrant by chunk_id hash.
+
+        The Chunker stores chunk_id = hash_text(page_content) in every
+        chunk's metadata. We use that hash to check Qdrant in one batch
+        query — no per-chunk round trips, no wasted embedding work.
+
+        Falls back to ingesting all documents if the check fails — never
+        blocks ingestion on a dedup error.
+
+        Args:
+            documents: Enriched documents from _enrich_metadata().
+
+        Returns:
+            Tuple of (new_documents_only, skipped_count).
+        """
+        if not documents:
+            return documents, 0
+
+        # chunk_id is set by Chunker._enrich_metadata() via hash_text(content).
+        # Fall back to hashing page_content directly if somehow missing
+        # (e.g. documents ingested outside the standard Chunker pipeline).
+        chunk_ids = [
+            doc.metadata.get("chunk_id") or hash_text(doc.page_content)
+            for doc in documents
+        ]
+
+        try:
+            # One Qdrant scroll query — find all points whose chunk_id is in
+            # our batch. MatchAny is an OR across all values — far cheaper
+            # than N individual queries (one per chunk).
+            existing_points, _ = await asyncio.to_thread(
+                self._client.scroll,
+                collection_name=self.collection_name,
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="metadata.chunk_id",
+                            match=MatchAny(any=chunk_ids),
+                        )
+                    ]
+                ),
+                with_payload=["metadata.chunk_id"],
+                limit=len(chunk_ids),
+            )
+
+            # Build set of already-stored chunk_ids from the scroll result
+            existing_ids = {
+                point.payload.get("metadata", {}).get("chunk_id")
+                for point in existing_points
+            }
+
+            new_docs = [
+                doc for doc, cid in zip(documents, chunk_ids)
+                if cid not in existing_ids
+            ]
+
+            skipped = len(documents) - len(new_docs)
+            if skipped > 0:
+                logger.info(
+                    "Deduplication: skipping %d/%d chunks already in Qdrant",
+                    skipped, len(documents),
+                )
+
+            return new_docs, skipped
+
+        except Exception as exc:
+            # Never block ingestion on a dedup failure — log and proceed with all
+            logger.warning(
+                "Dedup check failed, ingesting all %d chunks: %s",
+                len(documents), exc,
+            )
+            return documents, 0
 
     def _prepare_for_embedding(self, documents: List[Document]) -> List[Document]:
         """Swap page_content with embed_content for richer embeddings.

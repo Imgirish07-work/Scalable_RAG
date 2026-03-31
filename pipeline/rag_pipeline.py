@@ -17,6 +17,8 @@ import time
 from typing import Optional
 
 # internal
+from agents.agent_orchestrator import AgentOrchestrator
+from agents.planner.complexity_detector import should_decompose
 from cache.cache_manager import CacheManager
 from chunking.chunker import Chunker
 from chunking.document_cleaner import DocumentCleaner
@@ -29,6 +31,7 @@ from llm.exceptions.llm_exceptions import (
     LLMTimeoutError,
 )
 from llm.llm_factory import LLMFactory
+from llm.rate_limiter import LLMRateLimiter, RateLimiterConfig
 from pipeline.exceptions.pipeline_exceptions import (
     PipelineFallbackExhaustedError,
     PipelineIngestionError,
@@ -97,6 +100,11 @@ class RAGPipeline:
         self._store = store
         self._cache = cache
         self._initialized = False
+        self._agent_orchestrator: Optional[AgentOrchestrator] = None
+        self._collections: dict[str, str] = {}
+        # Cache of QdrantStore instances keyed by collection name.
+        # All share self._store._client so they query the same Qdrant database.
+        self._collection_stores: dict[str, QdrantStore] = {}
 
     # ──────────────────────────────────────────────
     # Lifecycle
@@ -128,6 +136,19 @@ class RAGPipeline:
                     self._llm.provider_name, self._llm.model_name,
                 )
 
+            # step 1b — wrap primary LLM with rate limiter (if enabled)
+            if settings.LLM_RATE_LIMITER_ENABLED:
+                self._llm = LLMRateLimiter(
+                    provider=self._llm,
+                    config=RateLimiterConfig(
+                        rpm=settings.LLM_RPM,
+                        rpd=settings.LLM_RPD,
+                        max_concurrent=settings.LLM_MAX_CONCURRENT,
+                        burst_multiplier=settings.LLM_BURST_MULTIPLIER,
+                    ),
+                )
+                logger.info("Primary LLM wrapped with rate limiter")
+
             if self._fallback_llm is None:
                 self._fallback_llm = self._try_create_fallback_llm()
 
@@ -138,7 +159,7 @@ class RAGPipeline:
             logger.info("Vector store initialized")
 
             # step 3 — cache (non-critical — failure degrades, not crashes)
-            if self._cache is None and settings.CACHE_ENABLED:
+            if self._cache is None and settings.cache_enabled:
                 self._cache = CacheManager(settings)
             if self._cache:
                 await self._cache.initialize()
@@ -210,6 +231,37 @@ class RAGPipeline:
                     if self._fallback_llm else "not configured"
                 ),
             },
+        )
+
+    def configure_agents(
+        self,
+        collections: dict[str, str],
+        max_concurrent: int = 4,
+        use_llm_verification: bool = False,
+    ) -> None:
+        """Configure the agent layer for query decomposition.
+
+        Must be called after initialize(). Creates the AgentOrchestrator
+        with the pipeline's LLM and this pipeline instance as the
+        sub-query executor.
+
+        Args:
+            collections: Dict of collection_name -> description.
+                Used by the planner to route sub-queries.
+            max_concurrent: Max concurrent sub-query executions.
+            use_llm_verification: Whether to use LLM-based verification.
+        """
+        self._ensure_initialized()
+        self._collections = collections
+        self._agent_orchestrator = AgentOrchestrator(
+            llm=self._llm,
+            pipeline=self,
+            collections=collections,
+            max_concurrent=max_concurrent,
+            use_llm_verification=use_llm_verification,
+        )
+        logger.info(
+            "Agent layer configured with %d collections", len(collections),
         )
 
     # ──────────────────────────────────────────────
@@ -296,7 +348,11 @@ class RAGPipeline:
         query_start = time.perf_counter()
 
         try:
-            response = await self._execute_query(request, self._llm)
+            # Bypass agent routing — query_raw() is called by the agent's
+            # ParallelRetriever to execute sub-queries and must NEVER
+            # re-enter the agent layer (would cause infinite recursion).
+            rag = await self._build_rag_for_request(request, self._llm)
+            response = await rag.query(request)
             self._log_query_metrics(request, response, query_start)
             return response
 
@@ -360,9 +416,14 @@ class RAGPipeline:
             logger.info("Produced %d chunks", total_chunks)
 
             # step 4 — store in vector db
-            # Create a store scoped to the target collection so ingestion
-            # works for any collection name, not just the pipeline default.
-            ingest_store = QdrantStore(collection_name=collection)
+            # Reuse the pipeline's existing Qdrant client so the ingested
+            # collection is visible to all subsequent queries. Creating a new
+            # QdrantStore without sharing the client would produce an isolated
+            # in-memory database that queries can never reach.
+            ingest_store = QdrantStore(
+                collection_name=collection,
+                client=self._store._client,
+            )
             await ingest_store.initialize()
             point_ids = await ingest_store.add_documents(chunks)
 
@@ -407,32 +468,66 @@ class RAGPipeline:
     ) -> RAGResponse:
         """Build the RAG variant and execute the query.
 
-        This is the method where the agent hook will be added in
-        Layer 8. Currently routes directly to RAGFactory.
+        If the agent layer is configured and the query is complex,
+        routes to agent decomposition. Otherwise routes directly
+        to a RAG variant.
 
         Args:
             request: Validated RAGRequest.
             llm: LLM provider to use for this execution.
 
         Returns:
-            RAGResponse from the selected RAG variant.
+            RAGResponse from the selected execution path.
         """
-        # ── future Layer 8 agent hook ──
-        # if self._agent_router and self._needs_decomposition(request):
-        #     return await self._agent_router.route(request)
+        # agent path — decompose complex queries
+        if self._agent_orchestrator and should_decompose(request.query):
+            logger.info(
+                "Routing request_id=%s to agent decomposition",
+                request.request_id,
+            )
+            agent_response = await self._agent_orchestrator.execute(request)
+            return agent_response.to_rag_response()
 
-        rag = self._build_rag_for_request(request, llm)
+        # direct RAG path (unchanged)
+        rag = await self._build_rag_for_request(request, llm)
         return await rag.query(request)
 
-    def _build_rag_for_request(
+    async def _get_store_for_collection(self, collection_name: str) -> QdrantStore:
+        """Return a QdrantStore scoped to the given collection.
+
+        Returns self._store directly for its own collection. Otherwise
+        creates (once) and caches a new QdrantStore that shares the same
+        Qdrant client — same pattern as ingest(). All collections live in
+        one database; each store just targets a different collection name.
+
+        Args:
+            collection_name: Target Qdrant collection name.
+
+        Returns:
+            Initialized QdrantStore targeting collection_name.
+        """
+        if collection_name == self._store.collection_name:
+            return self._store
+
+        if collection_name not in self._collection_stores:
+            store = QdrantStore(
+                collection_name=collection_name,
+                client=self._store._client,
+            )
+            await store.initialize()
+            self._collection_stores[collection_name] = store
+
+        return self._collection_stores[collection_name]
+
+    async def _build_rag_for_request(
         self,
         request: RAGRequest,
         llm: BaseLLM,
     ) -> BaseRAG:
         """Build the appropriate RAG variant for this request.
 
-        Delegates to RAGFactory.create_from_request(), passing in
-        the pipeline's shared subsystems.
+        Resolves the correct QdrantStore for the request's collection,
+        then delegates to RAGFactory.create_from_request().
 
         Args:
             request: RAGRequest with config specifying the variant.
@@ -441,9 +536,10 @@ class RAGPipeline:
         Returns:
             Configured BaseRAG subclass instance.
         """
+        store = await self._get_store_for_collection(request.collection_name)
         return RAGFactory.create_from_request(
             request=request,
-            store=self._store,
+            store=store,
             llm=llm,
             cache=self._cache,
             embeddings_fn=get_embeddings,
@@ -486,7 +582,8 @@ class RAGPipeline:
             )
             try:
                 fallback_request = self._downgrade_variant(request)
-                response = await self._execute_query(fallback_request, self._llm)
+                rag = await self._build_rag_for_request(fallback_request, self._llm)
+                response = await rag.query(fallback_request)
                 self._log_query_metrics(request, response, query_start, fallback=True)
                 return response
             except Exception as exc:
@@ -503,9 +600,10 @@ class RAGPipeline:
             )
             try:
                 fallback_request = self._downgrade_variant(request)
-                response = await self._execute_query(
+                rag = await self._build_rag_for_request(
                     fallback_request, self._fallback_llm,
                 )
+                response = await rag.query(fallback_request)
                 self._log_query_metrics(request, response, query_start, fallback=True)
                 return response
             except Exception as exc:
@@ -675,7 +773,7 @@ class RAGPipeline:
         Returns:
             "ok", "disabled", "degraded", or error description.
         """
-        if not settings.CACHE_ENABLED:
+        if not settings.cache_enabled:
             return "disabled"
         if not self._cache:
             return "not configured"

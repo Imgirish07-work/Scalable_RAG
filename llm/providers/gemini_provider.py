@@ -287,12 +287,22 @@ class GeminiProvider(BaseLLM):
         """
         temperature = kwargs.get("temperature", self._temperature)
         max_tokens = kwargs.get("max_tokens", self._max_tokens)
+        response_mime_type = kwargs.get("response_mime_type")
+        thinking_budget = kwargs.get("thinking_budget")
 
         # Rebuild config only if overrides differ from defaults
-        generation_config = types.GenerateContentConfig(
+        config_kwargs = dict(
             temperature=temperature,
             max_output_tokens=max_tokens,
         )
+        if response_mime_type:
+            config_kwargs["response_mime_type"] = response_mime_type
+        if thinking_budget is not None:
+            config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_budget=thinking_budget,
+            )
+
+        generation_config = types.GenerateContentConfig(**config_kwargs)
 
         last_exc: Exception | None = None
         for attempt in range(1 + _MAX_RATE_LIMIT_RETRIES):
@@ -482,6 +492,14 @@ class GeminiProvider(BaseLLM):
         if "api key not valid" in error_message or "api_key_invalid" in error_message:
             raise LLMAuthError(
                 f"Gemini authentication failed. Check your API key. | {error}"
+            ) from error
+
+        # String-based rate limit check before isinstance — the new google.genai
+        # SDK raises ClientError(429) which is NOT a subclass of ResourceExhausted
+        # (google.api_core). Both include "resource_exhausted" in the message.
+        if "resource_exhausted" in error_message or "quota" in error_message:
+            raise LLMRateLimitError(
+                f"Gemini rate limit exceeded. Retry after delay. | {error}"
             ) from error
 
         if isinstance(error, Unauthenticated):
