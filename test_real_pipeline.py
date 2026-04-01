@@ -65,7 +65,7 @@ async def run():
     # ── 2. Vector store ───────────────────────────────────────────────────────
     store = QdrantStore(
         collection_name="redis_docs",
-        in_memory=True,
+        in_memory=False,
         search_mode="dense",
     )
     await store.initialize()

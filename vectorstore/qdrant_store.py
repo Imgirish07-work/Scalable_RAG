@@ -41,6 +41,7 @@ from qdrant_client.models import (
     FieldCondition,
     MatchAny,
     MatchValue,
+    PayloadSchemaType,
     SparseVectorParams,
     VectorParams,
 )
@@ -215,6 +216,19 @@ class QdrantStore(BaseVectorStore):
                 "Created collection '%s': search_mode=%s",
                 self.collection_name,
                 self.search_mode,
+            )
+
+            # Create keyword indexes for all filtered fields.
+            # Required on Qdrant Cloud/server — in-memory skips enforcement.
+            for field in ("metadata.chunk_id", "metadata.user_id"):
+                self._client.create_payload_index(
+                    collection_name=self.collection_name,
+                    field_name=field,
+                    field_schema=PayloadSchemaType.KEYWORD,
+                )
+            logger.info(
+                "Created payload indexes: collection=%s, fields=[metadata.chunk_id, metadata.user_id]",
+                self.collection_name,
             )
 
         except Exception as e:

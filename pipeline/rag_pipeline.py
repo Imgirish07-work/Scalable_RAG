@@ -154,7 +154,7 @@ class RAGPipeline:
 
             # step 2 — vector store
             if self._store is None:
-                self._store = QdrantStore()
+                self._store = QdrantStore(in_memory=settings.debug)
             await self._store.initialize()
             logger.info("Vector store initialized")
 
