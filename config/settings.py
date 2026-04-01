@@ -9,11 +9,20 @@ class Settings(BaseSettings):
     # LLM Providers
     openai_api_key: Optional[str] = Field(default=None, env="OPENAI_API_KEY")
     gemini_api_key: Optional[str] = Field(default=None, env="GEMINI_API_KEY")
+    groq_api_key: Optional[str] = Field(default=None, env="GROQ_API_KEY")
 
     # LLM Model Names
     openai_model: str = Field(default="gpt-3.5-turbo", env="OPENAI_MODEL")
     gemini_model: str = Field(default="gemini-2.5-flash", env="GEMINI_MODEL")
     default_provider: str = Field(default="gemini", env="DEFAULT_PROVIDER")
+
+    # Groq Models — role-specific
+    # Fast model: classify, decompose, filter, answer simple queries (RPD: 14,400)
+    GROQ_MODEL_FAST: str = "llama-3.1-8b-instant"
+    # Strong model: final answer generation for complex queries (RPD: 1,000)
+    GROQ_MODEL_STRONG: str = "llama-3.3-70b-versatile"
+    # Fallback #1: if strong model hits 429 (RPD: 1,000, RPM: 60)
+    GROQ_MODEL_FALLBACK: str = "qwen/qwen3-32b"
 
     # LLM Parameters
     temperature: float = Field(default=0.7, env="TEMPERATURE")
@@ -193,7 +202,7 @@ class Settings(BaseSettings):
     @field_validator("default_provider")
     @classmethod
     def validate_provider(cls, v: str) -> str:
-        allowed = ["openai", "gemini"]
+        allowed = ["openai", "gemini", "groq"]
         if v.lower() not in allowed:
             raise ValueError(f"default_provider must be one of {allowed}, got '{v}'")
         return v.lower()

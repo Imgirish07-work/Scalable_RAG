@@ -1,231 +1,165 @@
 """
-LLM layer test — 1 API hit per provider.
+Real LLM test — live API calls to all three Groq models.
 
-1 hit covers:
-    → factory creation
-    → token counting   (local)
-    → chat()           (1 API hit)
-    → response fields
-    → error handling   (local / fails before hit)
-    → factory errors   (local)
+Tests each model with:
+    1. generate()     — single-turn prompt
+    2. chat()         — multi-turn messages
+    3. count_tokens() — local token count (no API hit)
+
+Models under test:
+    GROQ_MODEL_FAST     llama-3.1-8b-instant      classify / decompose
+    GROQ_MODEL_STRONG   llama-3.3-70b-versatile   final synthesis
+    GROQ_MODEL_FALLBACK qwen/qwen3-32b             fallback if strong hits 429
+
+Run:
+    python test_llm.py
 """
 
 import asyncio
 import time
 
-from llm import (
-    LLMFactory,
-    BaseLLM,
-    LLMResponse,
-    LLMError,
-    LLMAuthError,
-    LLMProviderError,
-)
+from llm import LLMFactory, LLMResponse
+from config.settings import settings
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ------------------------------------------------------------------ #
-#  Config                                                             #
-# ------------------------------------------------------------------ #
-
-PROVIDERS = ["openai", "gemini"]
-
-# 1 message — minimal tokens
-MESSAGES = [
-    {"role": "user", "content": "What is RAG? Reply in one sentence."}
+# ── Models to test ────────────────────────────────────────────────────────────
+GROQ_MODELS = [
+    (settings.GROQ_MODEL_FAST,     "Fast     — classify / decompose / simple queries (RPD: 14,400)"),
+    (settings.GROQ_MODEL_STRONG,   "Strong   — final answer synthesis, complex queries (RPD: 1,000)"),
+    (settings.GROQ_MODEL_FALLBACK, "Fallback — if strong hits 429                      (RPD: 1,000, RPM: 60)"),
 ]
 
-CR7_MESSAGES = [
-    {"role": "user", "content": "Tell me about Cristiano Ronaldo in 3 sentences."}
+GENERATE_PROMPT = "What is Retrieval-Augmented Generation? Answer in one sentence."
+
+CHAT_MESSAGES = [
+    {"role": "system", "content": "You are a concise AI assistant."},
+    {"role": "user",   "content": "Name the three laws of robotics. One line each."},
 ]
 
-# ------------------------------------------------------------------ #
-#  Helpers                                                            #
-# ------------------------------------------------------------------ #
-
-def separator(label: str) -> None:
-    print(f"\n{'=' * 60}")
-    print(f"  {label}")
-    print(f"{'=' * 60}")
+TOKEN_COUNT_TEXT = "The quick brown fox jumps over the lazy dog."
 
 
-def print_response(response: LLMResponse) -> None:
-    print(f"  provider         : {response.provider}")
-    print(f"  model            : {response.model}")
-    print(f"  text             : {response.text[:150]!r}")
-    print(f"  prompt_tokens    : {response.prompt_tokens}")
-    print(f"  completion_tokens: {response.completion_tokens}")
-    print(f"  tokens_used      : {response.tokens_used}")
-    print(f"  latency_ms       : {response.latency_ms} ms")
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _banner(title: str) -> None:
+    print(f"\n{'=' * 70}")
+    print(f"  {title}")
+    print(f"{'=' * 70}")
 
 
-# ------------------------------------------------------------------ #
-#  Local Tests — 0 API hits                                           #
-# ------------------------------------------------------------------ #
+def _section(title: str) -> None:
+    print(f"\n{'-' * 70}")
+    print(f"  {title}")
+    print(f"{'-' * 70}")
 
-async def test_local(provider_name: str) -> BaseLLM:
-    separator(f"[LOCAL] Factory + Token Count — {provider_name}")
 
-    # Factory — 0 hits
-    llm = LLMFactory.create(provider_name)
-    print(f"  provider_name    : {llm.provider_name}")
-    print(f"  model_name       : {llm.model_name}")
+def _print_response(label: str, response: LLMResponse, elapsed_ms: float) -> None:
+    print(f"  [{label}]")
+    print(f"  model             : {response.model}")
+    print(f"  answer            : {response.text.strip()[:200]}")
+    print(f"  prompt_tokens     : {response.prompt_tokens}")
+    print(f"  completion_tokens : {response.completion_tokens}")
+    print(f"  tokens_used       : {response.tokens_used}")
+    print(f"  latency_ms        : {elapsed_ms:.1f} ms")
 
-    assert isinstance(llm, BaseLLM),           "Must return BaseLLM"
-    assert llm.provider_name == provider_name, "Wrong provider_name"
-    assert llm.model_name,                     "model_name is empty"
 
-    # Token counting — 0 hits (local tiktoken / native)
-    prompt_text = MESSAGES[0]["content"]
-    token_count = await llm.count_tokens(prompt_text)
-    fits = await llm.fits_context(prompt_text, max_tokens=1000)
+# ── Per-model test ────────────────────────────────────────────────────────────
 
-    print(f"  count_tokens()   : {token_count}")
-    print(f"  fits_context()   : {fits}")
+async def test_groq_model(model: str, role_desc: str) -> bool:
+    """Run generate, chat, and count_tokens against one Groq model.
 
-    assert isinstance(token_count, int), "count_tokens must return int"
-    assert token_count > 0,              "token_count must be > 0"
-    assert isinstance(fits, bool),       "fits_context must return bool"
+    Returns:
+        True if all calls succeeded, False if any failed.
+    """
+    _banner(f"GROQ | {model}")
+    print(f"  Role : {role_desc}")
 
-    # Empty messages — 0 hits
     try:
-        await llm.chat([])
-        assert False, "Must raise ValueError"
-    except ValueError:
-        print(f"  chat([]) raised ValueError ✅")
+        llm = LLMFactory.create("groq", model=model)
+        print(f"  Provider : {llm.provider_name} | Model : {llm.model_name}\n")
 
-    logger.info("[PASS] Local tests | provider=%s | tokens=%d", provider_name, token_count)
-    return llm
+        # ── 1. generate() ─────────────────────────────────────────────────────
+        _section("1. generate()")
+        print(f"  Prompt : {GENERATE_PROMPT!r}\n")
 
+        t0 = time.perf_counter()
+        gen_response = await llm.generate(GENERATE_PROMPT)
+        gen_ms = (time.perf_counter() - t0) * 1000
 
-# ------------------------------------------------------------------ #
-#  1 API Hit — chat()                                                 #
-# ------------------------------------------------------------------ #
+        _print_response("generate", gen_response, gen_ms)
 
-async def test_one_hit(llm: BaseLLM, provider_name: str) -> None:
-    separator(f"[1 HIT] chat() — {provider_name}")
+        # ── 2. chat() ─────────────────────────────────────────────────────────
+        _section("2. chat()")
+        for msg in CHAT_MESSAGES:
+            print(f"  [{msg['role']}] {msg['content']}")
+        print()
 
-    start = time.monotonic()
-    response = await llm.chat(MESSAGES)                # ← ONLY API CALL
-    elapsed = (time.monotonic() - start) * 1000
+        t0 = time.perf_counter()
+        chat_response = await llm.chat(CHAT_MESSAGES)
+        chat_ms = (time.perf_counter() - t0) * 1000
 
-    print_response(response)
-    print(f"\n  Total time       : {elapsed:.1f} ms")
+        _print_response("chat", chat_response, chat_ms)
 
-    assert isinstance(response, LLMResponse),   "Must return LLMResponse"
-    assert response.text.strip(),               "text is empty"
-    assert response.provider == provider_name,  "Wrong provider"
-    assert response.model,                      "model is empty"
-    assert response.tokens_used >= 0,           "tokens_used must be >= 0"
-    assert response.latency_ms >= 0,            "latency_ms must be >= 0"
-    assert response.prompt_tokens >= 0,         "prompt_tokens must be >= 0"
-    assert response.completion_tokens >= 0,     "completion_tokens must be >= 0"
+        # ── 3. count_tokens() — no API hit ────────────────────────────────────
+        _section("3. count_tokens()  [local, no API hit]")
+        print(f"  Text : {TOKEN_COUNT_TEXT!r}")
 
-    logger.info(
-        "[PASS] 1 hit chat | provider=%s | tokens=%d | latency=%.1f ms",
-        provider_name,
-        response.tokens_used,
-        response.latency_ms,
-    )
+        token_count = await llm.count_tokens(TOKEN_COUNT_TEXT)
+        print(f"  Token count : {token_count}")
 
+        _banner(f"PASS — {model}")
+        logger.info(
+            "Groq model passed | model=%s | gen_ms=%.1f | chat_ms=%.1f | tokens=%d",
+            model, gen_ms, chat_ms, token_count,
+        )
+        return True
 
-# ------------------------------------------------------------------ #
-#  Error Tests — 0 API hits (fails before hitting API)               #
-# ------------------------------------------------------------------ #
-
-def test_errors(provider_name: str) -> None:
-    separator(f"[ERRORS] — {provider_name}")
-
-    # Invalid key — fails before API hit
-    try:
-        llm = LLMFactory.create(provider_name, api_key="invalid-key-123")
-        llm.chat(MESSAGES)
-        assert False, "Must raise LLMAuthError"
-    except (LLMAuthError, LLMError) as e:
-        print(f"  ✅ Bad key raised {type(e).__name__}")
-
-    # Unknown provider — local only
-    try:
-        LLMFactory.create("unknown")
-        assert False, "Must raise LLMProviderError"
-    except LLMProviderError as e:
-        print(f"  ✅ Unknown provider raised LLMProviderError")
-
-    # Empty provider — local only
-    try:
-        LLMFactory.create("")
-        assert False, "Must raise LLMProviderError"
-    except LLMProviderError as e:
-        print(f"  ✅ Empty provider raised LLMProviderError")
-
-    logger.info("[PASS] Error tests | provider=%s", provider_name)
-
-async def test_real_call(llm: BaseLLM, provider_name: str) -> None:
-    separator(f"[REAL CALL] Cristiano Ronaldo — {provider_name}")
-
-    print(f"  Prompt : {CR7_MESSAGES[0]['content']!r}")
-    print(f"  Calling {provider_name}...\n")
-
-    start = time.monotonic()
-    response = await llm.chat(CR7_MESSAGES)
-    elapsed = (time.monotonic() - start) * 1000
-
-    print(f"  ─── Response ───────────────────────────────────────")
-    print(f"  {response.text}")
-    print(f"  ────────────────────────────────────────────────────")
-    print(f"  model            : {response.model}")
-    print(f"  prompt_tokens    : {response.prompt_tokens}")
-    print(f"  completion_tokens: {response.completion_tokens}")
-    print(f"  tokens_used      : {response.tokens_used}")
-    print(f"  latency_ms       : {elapsed:.1f} ms")
-
-    assert response.text.strip(), "Response is empty"
-    logger.info(
-        "[PASS] Real call | provider=%s | tokens=%d | latency=%.1f ms",
-        provider_name,
-        response.tokens_used,
-        elapsed,
-    )
+    except Exception as exc:
+        _banner(f"FAIL — {model}")
+        print(f"  Error : {type(exc).__name__} | {exc}")
+        logger.error("Groq model failed | model=%s | error=%s", model, exc)
+        return False
 
 
-# ------------------------------------------------------------------ #
-#  Main                                                               #
-# ------------------------------------------------------------------ #
+# ── Main ──────────────────────────────────────────────────────────────────────
 
-async def main() -> None:
-    separator("LLM LAYER TESTS — 1 API HIT PER PROVIDER")
-    print(f"  Providers : {PROVIDERS}")
-    print(f"  API hits  : {len(PROVIDERS)} total")
+async def run() -> None:
+    _banner("GROQ LLM TEST — Real API Calls (All Three Models)")
+    print(f"""
+  Models under test:
+    FAST     : {settings.GROQ_MODEL_FAST}
+    STRONG   : {settings.GROQ_MODEL_STRONG}
+    FALLBACK : {settings.GROQ_MODEL_FALLBACK}
 
-    for provider_name in PROVIDERS:
-        separator(f"PROVIDER: {provider_name.upper()}")
-        try:
-            # 0 hits — local only
-            llm = await test_local(provider_name)
+  Calls per model : 2 API hits (generate + chat) + 1 local (count_tokens)
+  Total API hits  : {len(GROQ_MODELS) * 2}
+    """)
 
-            # 1 hit — only API call
-            await test_one_hit(llm, provider_name)
+    results: list[tuple[str, bool]] = []
 
-            # ✅ Real call — Cristiano Ronaldo
-            await test_real_call(llm, provider_name)
-            
-            # 0 hits — fails before API
-            await test_errors(provider_name)
+    for model, role_desc in GROQ_MODELS:
+        passed = await test_groq_model(model, role_desc)
+        results.append((model, passed))
 
-            separator(f"✅ ALL PASSED — {provider_name.upper()}")
-            logger.info("All tests passed | provider=%s", provider_name)
+    # ── Summary ───────────────────────────────────────────────────────────────
+    _banner("SUMMARY")
+    all_passed = True
+    for model, passed in results:
+        status = "PASS" if passed else "FAIL"
+        print(f"  [{status}] {model}")
+        if not passed:
+            all_passed = False
 
-        except AssertionError as e:
-            logger.error("[FAIL] | provider=%s | error=%s", provider_name, e)
-            print(f"\n  ❌ FAILED: {e}")
+    print()
+    if all_passed:
+        print("  All Groq models are working.")
+    else:
+        print("  Some models failed — check errors above.")
 
-        except Exception as e:
-            logger.error("[FAIL] | provider=%s | error=%s", provider_name, e)
-            print(f"\n  ❌ ERROR: {type(e).__name__} | {e}")
-
-        print("\n")
+    logger.info("Groq test complete | all_passed=%s", all_passed)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run())

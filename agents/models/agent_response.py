@@ -169,11 +169,13 @@ class AgentResponse(BaseModel):
             if sr.success:
                 all_sources.extend(sr.sources)
 
-        return RAGResponse.from_generation(
+        return RAGResponse(
             answer=self.answer,
             sources=all_sources,
             timings=self.timings,
             confidence=self.confidence,
+            cache_hit=False,
+            cache_layer=None,
             rag_variant="agent",
             context_tokens_used=0,
             model_name=self.model_name,

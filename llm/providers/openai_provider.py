@@ -1,279 +1,3 @@
-# import time
-# from typing import List, Optional
-# import tiktoken
-# from openai import AsyncOpenAI
-# from openai import (
-#     AuthenticationError,
-#     RateLimitError,
-#     APITimeoutError,
-#     BadRequestError,
-#     APIError,
-# )
-
-# from llm.contracts.base_llm import BaseLLM
-# from llm.models.llm_response import LLMResponse
-# from llm.exceptions.llm_exceptions import (
-#     LLMAuthError,
-#     LLMRateLimitError,
-#     LLMTimeoutError,
-#     LLMTokenLimitError,
-#     LLMProviderError,
-# )
-# from config.settings import settings
-# from utils.logger import get_logger
-
-# logger = get_logger(__name__)
-
-# class OpenAIProvider(BaseLLM):
-#     """
-#     OpenAI implementation of BaseLLM.
-
-#     Supports:
-#         - GPT-4o
-#         - GPT-4o Mini
-#         - Any OpenAI chat completion model
-
-#     Responsibilities:
-#         - Call OpenAI API
-#         - Translate OpenAI errors → LLMError hierarchy
-#         - Return standard LLMResponse always
-#     """
-#     def __init__(
-#         self,
-#         api_key: Optional[str] = None,
-#         model: Optional[str] = None,
-#         temperature: Optional[float] = None,
-#         max_tokens: Optional[int] = None,
-#         timeout: Optional[float] = None,
-#     ) -> None:
-        
-#         self._api_key = api_key or settings.openai_api_key
-#         self._model = model or settings.openai_model
-#         self._temperature = temperature if temperature is not None else settings.temperature
-#         self._max_tokens = max_tokens if max_tokens is not None else settings.max_tokens
-#         self._timeout = timeout if timeout is not None else settings.request_timeout
-
-#         # api_key validation 
-#         if not self._api_key:
-#             raise LLMAuthError("OpenAI API key is required.")
-
-#         #  Client initialization
-#         self._client = AsyncOpenAI(
-#             api_key=self._api_key,
-#             timeout=self._timeout,
-#         )
-
-#         # TikToken initialized for token counting 
-#         try:
-#             self._encoder = tiktoken.encoding_for_model(self._model)
-#         except KeyError:
-#             logger.warning(
-#                 "tiktoken has no encoding for model=%s, falling back to o200k_base",
-#                 self._model,
-#             )
-#             self._encoder = tiktoken.get_encoding("o200k_base")
-        
-#         logger.info(
-#             "OpenAIProvider initialized | model=%s | max_tokens=%s",
-#             self._model,
-#             self._max_tokens,
-#         )
-    
-#     @property
-#     def provider_name(self) -> str:
-#         return "openai"
-    
-#     @property
-#     def model_name(self) -> str:
-#         return self._model
-    
-#     # Abstract Methods
-#     async def generate(self, prompt: str, **kwargs) -> LLMResponse:
-#         """
-#         Single-turn text generation.
-#         Wraps prompt in user message and calls chat completion.
-
-#         Args:
-#             prompt  : Input text prompt.
-#             **kwargs: Override temperature, max_tokens per call.
-
-#         Returns:
-#             LLMResponse with generated text and token usage.
-#         """
-#         messages = self._build_messages(prompt)
-#         return await self._call_api(messages, **kwargs)
-    
-#     async def chat(self, messages: List[dict], **kwargs) -> LLMResponse:
-#         """
-#         Multi-turn conversation.
-
-#         Args:
-#             messages : List of dicts [{"role": "user", "content": "..."}]
-#             **kwargs : Override temperature, max_tokens per call.
-
-#         Returns:
-#             LLMResponse with generated text and token usage.
-#         """
-#         if not messages :
-#             raise ValueError("Messages list cannot be empty.")
-        
-#         return await self._call_api(messages, **kwargs)
-
-#     async def count_tokens(self, text: str) -> int:
-#         """
-#         Count tokens using tiktoken.
-#         Used by RLM to decide: direct call vs recursive chunking.
-
-#         Args:
-#             text: Input text to count tokens for.
-
-#         Returns:
-#             Token count as integer.
-#         """
-#         if not text:
-#             return 0
-        
-#         return len(self._encoder.encode(text))
-    
-#     async def is_available(self) -> bool:
-#         """
-#         Health check — sends minimal request to verify API is reachable.
-
-#         Returns:
-#             True if available, False otherwise.
-#         """
-#         try:
-#             await self._client.chat.completions.create(
-#                 model=self._model,
-#                 messages=[{"role": "user", "content": "ping"}],
-#                 max_tokens=1,
-#             )
-#             return True
-#         except Exception as e:
-#             logger.warning("OpenAI health check failed | error=%s", str(e))
-#             return False
-        
-#     # Private methods
-#     async def _call_api(self, messages: list[dict], **kwargs) -> LLMResponse:
-#         """
-#         Core API call with timing, error handling and response parsing.
-
-#         Args:
-#             messages : Formatted message list for OpenAI API.
-#             **kwargs : Per-call overrides for temperature and max_tokens.
-
-#         Returns:
-#             LLMResponse
-#         """
-#         temperature = kwargs.get("temperature", self._temperature)
-#         max_tokens = kwargs.get("max_tokens", self._max_tokens)
-
-#         start_time = time.monotonic()
-        
-#         try:
-#             response = await self._client.chat.completions.create(
-#                 model=self._model,
-#                 messages=messages,
-#                 temperature=temperature,
-#                 max_tokens=max_tokens,
-#             )
-#             latency_ms = (time.monotonic() - start_time) * 1000
-
-#             return self._parse_response(response, latency_ms)
-        
-#         except Exception as e:
-#             latency_ms = (time.monotonic() - start_time) * 1000
-#             logger.error(
-#                 "OpenAI API call failed | latency_ms=%.1f | error=%s",
-#                 latency_ms,
-#                 str(e),
-#             )
-#             # Translate to our error hierarchy
-#             self._handle_error(e)
-#             raise LLMProviderError("Unhandled error in OpenAI provider.")
-
-#     def _build_messages(self, prompt: str) -> list[dict]:
-#         """
-#         Wrap plain prompt into OpenAI message format.
-
-#         Args:
-#             prompt: Raw text prompt.
-
-#         Returns:
-#             List with single user message dict.
-#         """
-#         return [{"role": "user", "content": prompt}]
-    
-#     def _parse_response(self, response, latency_ms: float) -> LLMResponse:
-#         """
-#         Parse raw OpenAI response into standard LLMResponse.
-
-#         Args:
-#             response   : Raw OpenAI API response object.
-#             latency_ms : Time taken for the request.
-
-#         Returns:
-#             LLMResponse
-#         """
-#         choice = response.choices[0]
-#         usage = response.usage
-
-#         return LLMResponse(
-#             text=choice.message.content,
-#             model=response.model,
-#             provider=self.provider_name,
-#             prompt_tokens=usage.prompt_tokens,
-#             completion_tokens=usage.completion_tokens,
-#             tokens_used=usage.total_tokens,
-#             latency_ms=round(latency_ms, 2),
-#         )
-    
-#     def _handle_error(self, error: Exception) -> None:
-#         """
-#         Translate OpenAI SDK errors → our LLMError hierarchy.
-#         Pipeline catches our errors — never OpenAI SDK errors directly.
-
-#         Args:
-#             error: Raw OpenAI exception.
-
-#         Raises:
-#             LLMAuthError, LLMRateLimitError, LLMTimeoutError,
-#             LLMTokenLimitError, LLMProviderError
-#         """
-#         if isinstance(error, AuthenticationError):
-#             raise LLMAuthError(
-#                 f"OpenAI authentication failed. Check your API key. | {error}"
-#             ) from error
-
-#         if isinstance(error, RateLimitError):
-#             raise LLMRateLimitError(
-#                 f"OpenAI rate limit exceeded. Retry after delay. | {error}"
-#             ) from error
-
-#         if isinstance(error, APITimeoutError):
-#             raise LLMTimeoutError(
-#                 f"OpenAI request timed out after {self._timeout}s. | {error}"
-#             ) from error
-
-#         if isinstance(error, BadRequestError):
-#             # BadRequestError covers context length exceeded
-#             error_message = str(error).lower()
-#             if "context_length_exceeded" in error_message or "maximum context" in error_message:
-#                 raise LLMTokenLimitError(
-#                     f"Prompt exceeds OpenAI model context window. | {error}"
-#                 ) from error
-
-#         if isinstance(error, APIError):
-#             raise LLMProviderError(
-#                 f"OpenAI API error occurred. | {error}"
-#             ) from error
-
-#         # Unknown error — still wrap in our hierarchy
-#         raise LLMProviderError(
-#             f"Unexpected error from OpenAI provider. | {error}"
-#         ) from error
-
-
 """
 OpenAI implementation of BaseLLM.
 
@@ -342,6 +66,7 @@ class OpenAIProvider(BaseLLM):
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
+        base_url: Optional[str] = None,
     ) -> None:
         """Initialize OpenAI provider.
 
@@ -351,6 +76,8 @@ class OpenAIProvider(BaseLLM):
             temperature: Sampling temperature 0.0–2.0. Falls back to settings.
             max_tokens: Max tokens in response. Falls back to settings.
             timeout: Request timeout in seconds. Falls back to settings.
+            base_url: Optional API base URL. Used by OpenAI-compatible providers
+                (e.g. Groq). None uses the default OpenAI endpoint.
 
         Raises:
             LLMAuthError: If no API key is available from args or settings.
@@ -373,11 +100,11 @@ class OpenAIProvider(BaseLLM):
                 "Set OPENAI_API_KEY in .env or pass api_key argument."
             )
 
-        # Initialize async client
-        self._client = AsyncOpenAI(
-            api_key=self._api_key,
-            timeout=self._timeout,
-        )
+        # Initialize async client — base_url allows OpenAI-compatible providers
+        client_kwargs = {"api_key": self._api_key, "timeout": self._timeout}
+        if base_url is not None:
+            client_kwargs["base_url"] = base_url
+        self._client = AsyncOpenAI(**client_kwargs)
 
         # Initialize tiktoken encoder for local token counting
         try:

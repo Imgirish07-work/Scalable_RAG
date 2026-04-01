@@ -19,6 +19,7 @@ from llm.contracts.base_llm import BaseLLM
 from llm.exceptions.llm_exceptions import LLMProviderError
 from llm.providers.openai_provider import OpenAIProvider
 from llm.providers.gemini_provider import GeminiProvider
+from llm.providers.groq_provider import GroqProvider
 from config.settings import settings
 from utils.logger import get_logger
 
@@ -39,6 +40,7 @@ class LLMFactory:
     _registry: dict[str, type[BaseLLM]] = {
         "openai": OpenAIProvider,
         "gemini": GeminiProvider,
+        "groq": GroqProvider,
     }
 
     # Public methods
