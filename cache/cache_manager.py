@@ -838,6 +838,8 @@ class CacheManager:
             return tokens * self._settings.COST_PER_TOKEN_OPENAI
         elif response.provider == "gemini":
             return tokens * self._settings.COST_PER_TOKEN_GEMINI
+        elif response.provider == "groq":
+            return tokens * self._settings.COST_PER_TOKEN_GROQ
         return 0.0
 
     def _record_hit_metrics(self, result: CacheResult) -> None:
@@ -850,6 +852,8 @@ class CacheManager:
                 cost_saved = tokens_saved * self._settings.COST_PER_TOKEN_OPENAI
             elif result.response.provider == "gemini":
                 cost_saved = tokens_saved * self._settings.COST_PER_TOKEN_GEMINI
+            elif result.response.provider == "groq":
+                cost_saved = tokens_saved * self._settings.COST_PER_TOKEN_GROQ
 
         self._metrics.record_hit(
             layer=result.layer.value,

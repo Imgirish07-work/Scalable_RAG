@@ -1,70 +1,3 @@
-# from pydantic import BaseModel, Field, field_validator, model_validator
-
-# SUPPORTED_PROVIDERS = {"openai", "gemini"}
-
-# class LLMResponse(BaseModel):
-#     """
-#     Standard response returned by ALL providers.
-#     Pipeline only ever sees this — never raw provider responses.
-
-#     Validation Rules:
-#         - text and model     → cannot be empty or blank
-#         - provider           → must be in SUPPORTED_PROVIDERS
-#         - tokens_used        → must be >= 0
-#         - prompt_tokens      → must be >= 0
-#         - completion_tokens  → must be >= 0
-#         - latency_ms         → must be >= 0.0
-#         - tokens_used        → must equal prompt + completion tokens
-#     """
-
-#     text: str = Field(..., min_length=1, description="Generated text from LLM")
-#     model: str = Field(..., min_length=1, description="Model name e.g. gpt-4o-mini")
-#     provider: str = Field(..., description="Provider name e.g. openai or gemini")
-#     tokens_used: int = Field(default=0, ge=0, description="Total tokens consumed")
-#     prompt_tokens: int = Field(default=0, ge=0, description="Input tokens")
-#     completion_tokens: int = Field(default=0, ge=0, description="Output tokens")
-#     latency_ms: float = Field(default=0.0, ge=0.0, description="Response time in ms")
-#     cached: bool = Field(default=False, description="Was this served from cache?")
-#     metadata: dict = Field(default_factory=dict, description="Extra provider info")
-
-#     #  Field Validators
-#     @field_validator("provider")
-#     @classmethod
-#     def validate_provider(cls, value: str) -> str:
-#         """Provider must be in SUPPORTED_PROVIDERS."""
-#         cleaned = value.strip().lower()
-#         if cleaned not in SUPPORTED_PROVIDERS:
-#             raise ValueError(
-#                 f"Provider '{value}' not supported. "
-#                 f"Must be one of: {sorted(SUPPORTED_PROVIDERS)}"
-#             )
-#         return cleaned
-
-#     @field_validator("text", "model")
-#     @classmethod
-#     def validate_not_blank(cls, value: str) -> str:
-#         """Text and model cannot be blank or whitespace only."""
-#         if not value.strip():
-#             raise ValueError("Field cannot be blank or whitespace only.")
-#         return value.strip()
-
-
-#     #  Model Validator — Cross field validation
-#     @model_validator(mode="after")
-#     def validate_token_consistency(self) -> "LLMResponse":
-#         expected = self.prompt_tokens + self.completion_tokens
-#         if self.tokens_used < expected:
-#             raise ValueError(
-#                 f"tokens_used ({self.tokens_used}) cannot be less than "
-#                 f"prompt_tokens ({self.prompt_tokens}) + "
-#                 f"completion_tokens ({self.completion_tokens}) = {expected}"
-#             )
-#         return self
-
-
-#     model_config = {"frozen": True}
-
-
 """
 Standardized LLM response model.
 
@@ -83,7 +16,7 @@ Key design decisions:
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-SUPPORTED_PROVIDERS = {"openai", "gemini"}
+SUPPORTED_PROVIDERS = {"openai", "gemini", "groq"}
 
 # Normalized finish_reason values accepted across all providers
 VALID_FINISH_REASONS = {

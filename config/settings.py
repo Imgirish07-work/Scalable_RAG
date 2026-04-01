@@ -176,6 +176,10 @@ class Settings(BaseSettings):
     """Approximate cost per token for Gemini (2.5-flash).
     Used to estimate cost savings from cache hits."""
 
+    COST_PER_TOKEN_GROQ: float = 0.0
+    """Approximate cost per token for Groq (free tier — $0).
+    Used to estimate cost savings from cache hits."""
+
     # Rate Limiter
     LLM_RATE_LIMITER_ENABLED: bool = True
     LLM_RPM: int = 60
