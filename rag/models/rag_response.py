@@ -97,6 +97,14 @@ class RetrievedChunk(BaseModel):
         default_factory=dict,
         description="Additional metadata from chunker",
     )
+    # Internal pipeline field — excluded from API/cache serialization.
+    # Carries the pre-fetched Qdrant embedding vector so MMR can compute
+    # inter-chunk similarity without re-embedding (saves ~2-4s per query).
+    vector: list[float] | None = Field(
+        default=None,
+        exclude=True,
+        description="Pre-fetched embedding vector for MMR. Not in API output.",
+    )
 
     @field_validator("content")
     @classmethod
@@ -117,7 +125,12 @@ class RetrievedChunk(BaseModel):
         return value
 
     @classmethod
-    def from_document(cls, doc: Any, relevance_score: float = 0.0) -> RetrievedChunk:
+    def from_document(
+        cls,
+        doc: Any,
+        relevance_score: float = 0.0,
+        vector: list[float] | None = None,
+    ) -> "RetrievedChunk":
         """Convert a LangChain Document to a RetrievedChunk.
 
         Extracts known metadata fields into dedicated attributes.
@@ -126,16 +139,22 @@ class RetrievedChunk(BaseModel):
         Args:
             doc: LangChain Document with page_content and metadata.
             relevance_score: Similarity score from retrieval.
+            vector: Pre-fetched embedding vector from Qdrant (optional).
+                    Passed through to enable zero-cost MMR diversity scoring.
 
         Returns:
             RetrievedChunk instance.
         """
         meta = getattr(doc, "metadata", {}) or {}
 
-        # Extract known fields from metadata
+        # Extract known fields from metadata — "vector" excluded so it
+        # doesn't leak into the catch-all extra_metadata dict.
         known_fields = {
             "source", "source_file", "chunk_id",
             "section_heading", "page_number", "content_type",
+            "vector", "relevance_score", "original_content",
+            "embed_content", "ingested_at", "char_count",
+            "doc_id", "user_id", "chunk_index", "total_chunks",
         }
         extra_metadata = {
             k: v for k, v in meta.items() if k not in known_fields
@@ -150,6 +169,7 @@ class RetrievedChunk(BaseModel):
             page_number=meta.get("page_number"),
             content_type=meta.get("content_type"),
             metadata=extra_metadata,
+            vector=vector,
         )
 
 

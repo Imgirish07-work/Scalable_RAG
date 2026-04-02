@@ -89,11 +89,20 @@ class DenseRetriever(BaseRetriever):
         start = time.perf_counter()
         
         try:
-            docs = await self._store.similarity_search(
-                query=query,
-                k=top_k,
-                score_threshold=0.0,
-            )
+            # Use with-vectors variant so MMR can skip re-embedding entirely.
+            # Falls back gracefully to similarity_search if the method is
+            # not available (e.g. non-Qdrant store injected in tests).
+            if hasattr(self._store, "similarity_search_with_vectors"):
+                docs = await self._store.similarity_search_with_vectors(
+                    query=query,
+                    k=top_k,
+                )
+            else:
+                docs = await self._store.similarity_search(
+                    query=query,
+                    k=top_k,
+                    score_threshold=0.0,
+                )
             elapsed_ms = (time.perf_counter() - start) * 1000
 
             chunks = self._convert_documents(docs)

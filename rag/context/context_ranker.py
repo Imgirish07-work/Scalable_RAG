@@ -179,31 +179,48 @@ class ContextRanker:
                     This eliminates the query re-embedding entirely and
                     uses pre-existing Qdrant scores for the relevance term.
 
-        Falls back to no reranking if embeddings unavailable.
+        Falls back to no reranking if neither pre-fetched vectors nor
+        an embeddings_fn is available.
         """
-        if self._embeddings_fn is None:
-            logger.warning("MMR requested but no embeddings_fn provided, using none.")
+        has_vectors = bool(chunks) and chunks[0].vector is not None
+
+        if not has_vectors and self._embeddings_fn is None:
+            logger.warning(
+                "MMR requested but no pre-fetched vectors and no embeddings_fn. "
+                "Falling back to none."
+            )
             return self._rank_none(chunks)
 
         try:
-            embeddings_model = self._embeddings_fn()
-
-            # ── FIX: use relevance_score from Qdrant directly ──────────
+            # ── Relevance term: use Qdrant cosine-sim scores directly ───
             # relevance_score is already the cosine similarity between the
             # query vector and each chunk vector, computed during retrieval.
-            # No need to re-embed the query.
             relevance_scores = np.array(
                 [chunk.relevance_score for chunk in chunks], dtype=np.float32
             )
 
-            # ── Embed chunk texts for inter-chunk similarity only ───────
-            # We still need chunk-to-chunk similarity for the diversity term.
-            # This is now n texts instead of (n+1), and we skip the query.
-            chunk_texts = [chunk.content for chunk in chunks]
-            chunk_embeddings_raw = await asyncio.to_thread(
-                embeddings_model.embed_documents, chunk_texts
-            )
-            chunk_embeddings = np.array(chunk_embeddings_raw, dtype=np.float32)
+            if has_vectors:
+                # ── FAST PATH: use pre-fetched Qdrant vectors (0ms) ─────
+                # Vectors were returned by similarity_search_with_vectors()
+                # alongside the search results — no re-embedding needed.
+                chunk_embeddings = np.array(
+                    [chunk.vector for chunk in chunks], dtype=np.float32
+                )
+                logger.info(
+                    "MMR: using pre-fetched Qdrant vectors | chunks=%d | "
+                    "embedding=skipped",
+                    len(chunks),
+                )
+            else:
+                # ── FALLBACK: embed chunk texts (slower path) ────────────
+                # Used when chunks come from a non-Qdrant source or from
+                # code paths that don't carry pre-fetched vectors.
+                embeddings_model = self._embeddings_fn()
+                chunk_texts = [chunk.content for chunk in chunks]
+                chunk_embeddings_raw = await asyncio.to_thread(
+                    embeddings_model.embed_documents, chunk_texts
+                )
+                chunk_embeddings = np.array(chunk_embeddings_raw, dtype=np.float32)
 
             # Run MMR selection
             selected_indices = self._mmr_select(

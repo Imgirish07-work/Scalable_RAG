@@ -171,7 +171,10 @@ class BaseRetriever(ABC):
         """Convert LangChain Documents to RetrievedChunks.
 
         Extracts relevance_score from metadata if present (set by
-        QdrantStore after filtered search).
+        QdrantStore after filtered search). Also passes through the
+        pre-fetched embedding vector when available (set by
+        QdrantStore.similarity_search_with_vectors) so MMR can use
+        it directly without re-embedding.
 
         Args:
             docs: List of LangChain Document objects.
@@ -190,7 +193,12 @@ class BaseRetriever(ABC):
             else:
                 score = 0.0
 
-            chunk = RetrievedChunk.from_document(doc, relevance_score=score)
+            # Pass pre-fetched vector if present (None otherwise — MMR falls back)
+            vector = meta.get("vector")
+
+            chunk = RetrievedChunk.from_document(
+                doc, relevance_score=score, vector=vector
+            )
             chunks.append(chunk)
 
         return chunks

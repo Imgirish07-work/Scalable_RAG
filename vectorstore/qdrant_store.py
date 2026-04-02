@@ -752,6 +752,97 @@ class QdrantStore(BaseVectorStore):
             ]
         )
 
+    async def similarity_search_with_vectors(
+        self,
+        query: str,
+        k: int,
+        filter_user_id: Optional[str] = None,
+    ) -> List[Document]:
+        """Search returning top-k results WITH their stored embedding vectors.
+
+        Uses the raw QdrantClient.search(with_vectors=True) instead of the
+        LangChain wrapper, so each result carries its stored dense vector.
+        The vector is attached to metadata['vector'] on each Document and
+        used by ContextRanker._rank_mmr() for inter-chunk similarity —
+        eliminating the need to re-embed chunks on every query (~2-4s saved).
+
+        Same content and score behaviour as similarity_search():
+            - page_content is restored to original (not embed_content prefix)
+            - relevance_score is attached to metadata['relevance_score']
+
+        Args:
+            query: Search query text.
+            k: Number of results to return.
+            filter_user_id: Filter to specific user's documents.
+
+        Returns:
+            List of Documents with clean page_content, relevance_score,
+            and the dense embedding vector in metadata['vector'].
+
+        Raises:
+            Exception: If search fails.
+        """
+        if not query or not query.strip():
+            logger.warning("similarity_search_with_vectors received empty query")
+            return []
+        if k <= 0:
+            return []
+
+        try:
+            embeddings_model = get_embeddings()
+            query_vector = await asyncio.to_thread(
+                embeddings_model.embed_query, query
+            )
+
+            qdrant_filter = self._build_filter(filter_user_id)
+
+            # Raw Qdrant search — with_vectors=True returns the stored dense
+            # vector alongside each result. Uses query_points (Qdrant client
+            # v1.7+ API; replaces the deprecated client.search()).
+            response = await asyncio.to_thread(
+                self._client.query_points,
+                collection_name=self.collection_name,
+                query=query_vector,
+                using=self._DENSE_VECTOR_NAME,
+                limit=k,
+                with_vectors=True,
+                with_payload=True,
+                query_filter=qdrant_filter,
+            )
+
+            docs = []
+            for point in response.points:
+                payload = point.payload or {}
+                page_content = payload.get("page_content", "")
+                metadata = dict(payload.get("metadata", {}))
+
+                # Attach retrieval score (cosine similarity, 0.0-1.0)
+                metadata["relevance_score"] = round(float(point.score), 4)
+
+                # Extract the dense vector from the named-vector dict
+                raw_vec = point.vector
+                if isinstance(raw_vec, dict):
+                    metadata["vector"] = raw_vec.get(self._DENSE_VECTOR_NAME)
+                else:
+                    metadata["vector"] = raw_vec  # fallback for unnamed vectors
+
+                docs.append(Document(page_content=page_content, metadata=metadata))
+
+            # Restore original page_content (strips embed_content prefix)
+            docs = self._restore_original_content(docs)
+
+            logger.debug(
+                "similarity_search_with_vectors: query='%s', results=%d",
+                query[:50],
+                len(docs),
+            )
+
+            return docs
+
+        except Exception as e:
+            logger.exception("Error in similarity_search_with_vectors: %s", e)
+            raise
+
     # Admin operations
 
     async def delete_collection(self) -> None:
