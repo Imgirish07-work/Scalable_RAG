@@ -30,15 +30,17 @@ class Settings(BaseSettings):
     request_timeout: float = Field(default=30.0, env="REQUEST_TIMEOUT")
 
     # Embedding Model
-    # embedding_model: str = Field(default="BAAI/bge-m3", env="EMBEDDING_MODEL")
-    embedding_model        : str = Field(
-        default="BAAI/bge-small-en-v1.5",
+    embedding_model: str = Field(
+        default="BAAI/bge-base-en-v1.5",
         env="EMBEDDING_MODEL",
     )
     embedding_model_local_path: str = Field(
-        default=None,
+        default="models/bge-base-en-v1.5",
         env="EMBEDDING_MODEL_LOCAL_PATH",
     )
+    # ONNX Embeddings — faster CPU inference (uses onnx/model.onnx inside the model folder)
+    USE_ONNX_EMBEDDINGS: bool = Field(default=True, env="USE_ONNX_EMBEDDINGS")
+    EMBEDDING_BATCH_SIZE: int = Field(default=64, env="EMBEDDING_BATCH_SIZE")
     
     # Document cleaner settings
     min_chars_per_page : int = Field(default=50, env="MIN_CHARS_PER_PAGE")
@@ -68,8 +70,6 @@ class Settings(BaseSettings):
 
     # RAG Settings
     top_k_retrieval: int = Field(default=5, env="TOP_K_RETRIEVAL")
-    chunk_size: int = Field(default=1000, env="CHUNK_SIZE")
-    chunk_overlap: int = Field(default=200, env="CHUNK_OVERLAP")
 
     # Cache Settings
     cache_enabled: bool = Field(default=True, env="CACHE_ENABLED")

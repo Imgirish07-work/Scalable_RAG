@@ -20,7 +20,9 @@ from chunking.structure_preserver import StructurePreserver
 from chunking.chunker import Chunker
 from vectorstore.qdrant_store import QdrantStore
 from rag.retrieval.dense_retriever import DenseRetriever
+from llm.providers.groq_provider import GroqProvider
 from llm.providers.gemini_provider import GeminiProvider
+from llm.exceptions.llm_exceptions import LLMProviderError
 from rag.models.rag_request import RAGRequest, RAGConfig
 from rag.rag_factory import RAGFactory
 from cache.cache_manager import CacheManager
@@ -29,8 +31,8 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-PDF_PATH = "./data/sample_docs/redis_commands_reference.pdf"
-QUERY    = "what does redis-server.exe command do?"
+PDF_PATH = "./data/sample_docs/THE_CONSTITUTION_OF_INDIA.pdf"
+QUERY    = "what is article 14?"
 
 
 def _print_response(response, label: str) -> None:
@@ -79,7 +81,12 @@ async def run():
 
     # ── 4. RAG pipeline ───────────────────────────────────────────────────────
     retriever = DenseRetriever(store)
-    llm       = GeminiProvider()
+    try:
+        llm = GroqProvider()
+        logger.info("LLM: GroqProvider (llama-3.3-70b-versatile)")
+    except Exception as e:
+        logger.warning("Groq unavailable (%s) — falling back to Gemini", e)
+        llm = GeminiProvider()
 
     rag = RAGFactory.create(
         "simple",
@@ -96,8 +103,14 @@ async def run():
 
     # ── 5. Query 1 — cache MISS ───────────────────────────────────────────────
     logger.info("=== QUERY 1 (expect cache MISS) ===")
-    response1 = await rag.query(request)
-    _print_response(response1, "QUERY 1 — cache miss, calls Gemini")
+    try:
+        response1 = await rag.query(request)
+    except LLMProviderError as e:
+        logger.warning("Primary LLM (%s) failed during query (%s) — switching to Gemini", llm.provider_name, e)
+        llm = GeminiProvider()
+        rag._llm = llm
+        response1 = await rag.query(request)
+    _print_response(response1, f"QUERY 1 — cache miss, calls {llm.provider_name}")
 
     # ── 6. Query 2 — cache HIT ────────────────────────────────────────────────
     logger.info("=== QUERY 2 (expect cache HIT) ===")
