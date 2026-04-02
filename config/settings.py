@@ -71,6 +71,14 @@ class Settings(BaseSettings):
     # RAG Settings
     top_k_retrieval: int = Field(default=5, env="TOP_K_RETRIEVAL")
 
+    # Reranker Settings
+    RERANKER_ENABLED: bool = Field(default=False, env="RERANKER_ENABLED")
+    RERANKER_MODEL_PATH: str = Field(default="", env="RERANKER_MODEL_PATH")
+    RERANKER_BATCH_SIZE: int = Field(default=32, env="RERANKER_BATCH_SIZE")
+    # How many coarse candidates to fetch from Qdrant for the cross-encoder to score.
+    # Should be 2-3x top_k so the reranker has enough candidates to work with.
+    RERANKER_COARSE_TOP_K: int = Field(default=10, env="RERANKER_COARSE_TOP_K")
+
     # Cache Settings
     cache_enabled: bool = Field(default=True, env="CACHE_ENABLED")
     cache_directory: str = Field(default="./data/cache", env="CACHE_DIRECTORY")

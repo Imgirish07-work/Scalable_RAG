@@ -42,6 +42,7 @@ from rag.context.context_assembler import ContextAssembler
 from rag.context.context_ranker import ContextRanker
 from rag.models.rag_request import RAGRequest
 from rag.exceptions.rag_exceptions import RAGConfigError
+from vectorstore.reranker import get_reranker
 from config.settings import settings
 from utils.logger import get_logger
 
@@ -219,10 +220,14 @@ class RAGFactory:
         # Build retriever
         retriever = cls.create_retriever(store=store, mode=retrieval_mode)
 
-        # Build ranker
+        # Build ranker (inject reranker if enabled)
+        top_k = getattr(settings, "RAG_TOP_K", 5)
+        reranker = get_reranker() if rerank_strategy == "cross_encoder" else None
         ranker = ContextRanker(
             strategy=rerank_strategy,
             embeddings_fn=embeddings_fn,
+            reranker=reranker,
+            top_k=top_k,
         )
 
         # Build assembler
@@ -288,10 +293,13 @@ class RAGFactory:
             mode=config.retrieval_mode,
         )
 
-        # Build ranker from request config
+        # Build ranker from request config (inject reranker if enabled)
+        reranker = get_reranker() if config.rerank_strategy == "cross_encoder" else None
         ranker = ContextRanker(
             strategy=config.rerank_strategy,
             embeddings_fn=embeddings_fn,
+            reranker=reranker,
+            top_k=config.top_k,
         )
 
         # Build assembler from request config

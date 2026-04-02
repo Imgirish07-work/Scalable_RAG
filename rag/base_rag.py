@@ -54,6 +54,7 @@ from rag.retrieval.base_retriever import BaseRetriever
 from rag.context.context_assembler import ContextAssembler
 from rag.context.context_ranker import ContextRanker
 from vectorstore.embeddings import get_embeddings
+from vectorstore.reranker import get_reranker
 from rag.prompts.rag_prompt_templates import (
     build_rag_prompt,
     build_conversation_refinement_prompt,
@@ -117,7 +118,13 @@ class BaseRAG(ABC):
         self._retriever = retriever
         self._llm = llm
         self._cache = cache
-        self._ranker = ranker or ContextRanker(strategy="mmr", embeddings_fn=get_embeddings)
+        # Default ranker: inject reranker if available so per-request cross_encoder works
+        self._ranker = ranker or ContextRanker(
+            strategy="mmr",
+            embeddings_fn=get_embeddings,
+            reranker=get_reranker(),
+            top_k=5,
+        )
         self._assembler = assembler or ContextAssembler(llm=llm)
 
         logger.info(
@@ -215,17 +222,26 @@ class BaseRAG(ABC):
         processed_query = await self.pre_process(request)
 
         # ---- Step 3: Retrieve ----
+        # For cross_encoder: fetch RERANKER_COARSE_TOP_K candidates (e.g. 10) so
+        # the reranker has enough to score; otherwise fetch config.top_k directly.
+        active_strategy = config.rerank_strategy
+        if active_strategy == "cross_encoder" and self._ranker._reranker is not None:
+            from config.settings import settings as _s
+            retrieval_k = getattr(_s, "RERANKER_COARSE_TOP_K", config.top_k * 2)
+        else:
+            retrieval_k = config.top_k
+
         retrieval_start = time.perf_counter()
         chunks = await self.retrieve(
             query=processed_query,
-            top_k=config.top_k,
+            top_k=retrieval_k,
             filters=config.metadata_filters,
         )
         retrieval_ms = (time.perf_counter() - retrieval_start) * 1000
 
         # ---- Step 4: Rank ----
         ranking_start = time.perf_counter()
-        ranked_chunks = await self.rank(chunks, processed_query)
+        ranked_chunks = await self.rank(chunks, processed_query, strategy=active_strategy)
         ranking_ms = (time.perf_counter() - ranking_start) * 1000
 
         # ---- Step 5: Assemble context ----
@@ -352,22 +368,25 @@ class BaseRAG(ABC):
         self,
         chunks: list[RetrievedChunk],
         query: str,
+        strategy: str | None = None,
     ) -> list[RetrievedChunk]:
         """Rerank retrieved chunks.
 
-        Default behavior: delegate to the injected ContextRanker (MMR).
+        Default behavior: delegate to the injected ContextRanker.
 
         CorrectiveRAG may override this to add relevance evaluation
         before or after reranking.
 
         Args:
-            chunks: Retrieved chunks from retrieve().
-            query: Processed query string.
+            chunks:   Retrieved chunks from retrieve().
+            query:    Processed query string.
+            strategy: Per-request strategy override (e.g. 'cross_encoder').
+                      Passed through to ContextRanker.rank().
 
         Returns:
             Reranked list of RetrievedChunk.
         """
-        return await self._ranker.rank(chunks, query)
+        return await self._ranker.rank(chunks, query, strategy=strategy)
 
     async def assemble_context(
         self,

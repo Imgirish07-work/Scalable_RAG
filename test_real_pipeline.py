@@ -98,7 +98,7 @@ async def run():
     request = RAGRequest(
         query=QUERY,
         collection_name="redis_docs",
-        config=RAGConfig(top_k=5, rerank_strategy="mmr"),
+        config=RAGConfig(top_k=5, rerank_strategy="cross_encoder"),
     )
 
     # ── 5. Query 1 — cache MISS ───────────────────────────────────────────────
