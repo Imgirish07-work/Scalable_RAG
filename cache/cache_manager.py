@@ -883,6 +883,7 @@ class CacheManager:
             temperature=0.0,
             token_cost_estimate=self._estimate_cost(result.response),
             sources=result.sources,
+            confidence_value=result.confidence_value,
         )
 
     def _get_active_backend_names(self) -> list[str]:

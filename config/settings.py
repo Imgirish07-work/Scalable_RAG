@@ -26,7 +26,7 @@ class Settings(BaseSettings):
 
     # LLM Parameters
     temperature: float = Field(default=0.7, env="TEMPERATURE")
-    max_tokens: int = Field(default=1024, env="MAX_TOKENS")
+    max_tokens: int = Field(default=2048, env="MAX_TOKENS")
     request_timeout: float = Field(default=30.0, env="REQUEST_TIMEOUT")
 
     # Embedding Model

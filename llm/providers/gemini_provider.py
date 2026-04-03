@@ -294,6 +294,10 @@ class GeminiProvider(BaseLLM):
         config_kwargs = dict(
             temperature=temperature,
             max_output_tokens=max_tokens,
+            # AFC adds ~200ms overhead and is irrelevant for RAG generation
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
         )
         if response_mime_type:
             config_kwargs["response_mime_type"] = response_mime_type

@@ -101,6 +101,7 @@ class BaseRAG(ABC):
         cache: object | None = None,
         ranker: ContextRanker | None = None,
         assembler: ContextAssembler | None = None,
+        fallback_llm: BaseLLM | None = None,
     ) -> None:
         """Initialize BaseRAG with all dependencies.
 
@@ -117,6 +118,7 @@ class BaseRAG(ABC):
         """
         self._retriever = retriever
         self._llm = llm
+        self._fallback_llm = fallback_llm
         self._cache = cache
         # Default ranker: inject reranker if available so per-request cross_encoder works
         self._ranker = ranker or ContextRanker(
@@ -129,10 +131,11 @@ class BaseRAG(ABC):
 
         logger.info(
             "BaseRAG initialized | variant=%s | retriever=%s | "
-            "llm=%s | cache=%s",
+            "llm=%s | fallback_llm=%s | cache=%s",
             self.variant_name,
             self._retriever.retriever_type,
             self._llm.provider_name,
+            self._fallback_llm.provider_name if self._fallback_llm else "none",
             "enabled" if self._cache else "disabled",
         )
 
@@ -524,11 +527,12 @@ class BaseRAG(ABC):
         if request.config.system_prompt:
             system_prompt = request.config.system_prompt
 
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
         try:
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
             response = await self._llm.chat(
                 messages,
                 temperature=request.config.temperature,
@@ -551,9 +555,40 @@ class BaseRAG(ABC):
             raise
 
         except Exception as exc:
-            # Don't wrap LLM-layer errors (LLMAuthError, etc.) — let them
-            # propagate as-is for provider-specific handling
-            from llm.exceptions.llm_exceptions import LLMError
+            from llm.exceptions.llm_exceptions import LLMError, LLMProviderError
+            # Primary LLM failed with a provider-level error (network, timeout, etc.).
+            # If a fallback LLM is configured, retry generation ONLY — no re-retrieval.
+            # This saves ~3-4s vs re-running the full pipeline from the caller.
+            if isinstance(exc, LLMProviderError) and self._fallback_llm is not None:
+                logger.warning(
+                    "Primary LLM failed, retrying generation with fallback | "
+                    "primary=%s | fallback=%s | error=%s",
+                    self._llm.provider_name,
+                    self._fallback_llm.provider_name,
+                    str(exc),
+                )
+                try:
+                    response = await self._fallback_llm.chat(
+                        messages,
+                        temperature=request.config.temperature,
+                    )
+                    if not response.text or not response.text.strip():
+                        raise RAGGenerationError(
+                            "Fallback LLM returned empty response.",
+                            details={"request_id": request.request_id},
+                        )
+                    # Swap active LLM so cache key and model_name are correct
+                    self._llm = self._fallback_llm
+                    return response
+                except RAGGenerationError:
+                    raise
+                except Exception as fallback_exc:
+                    raise RAGGenerationError(
+                        f"Both primary and fallback LLM failed: {fallback_exc}",
+                        details={"request_id": request.request_id},
+                    ) from fallback_exc
+
+            # Non-provider errors or no fallback — propagate as-is
             if isinstance(exc, LLMError):
                 raise
 

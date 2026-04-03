@@ -103,16 +103,19 @@ async def run():
     retriever = DenseRetriever(store)
     try:
         llm = GroqProvider()
-        logger.info("LLM: GroqProvider (%s)", llm.model_name)
+        fallback_llm = GeminiProvider()
+        logger.info("LLM: GroqProvider (%s) | fallback: GeminiProvider", llm.model_name)
     except Exception as e:
-        logger.warning("Groq unavailable (%s) — falling back to Gemini", e)
+        logger.warning("Groq unavailable (%s) — using Gemini as primary", e)
         llm = GeminiProvider()
+        fallback_llm = None
 
     rag = RAGFactory.create(
         "simple",
         retriever=retriever,
         llm=llm,
         cache=cache,
+        fallback_llm=fallback_llm,
     )
 
     # ── 5. Run each query: first call (miss) then second call (hit) ───────────
@@ -124,13 +127,7 @@ async def run():
         )
 
         logger.info("=== QUERY %d/%d (first call): %s ===", q_idx, len(QUERIES), query_text)
-        try:
-            resp_miss = await rag.query(request)
-        except LLMProviderError as e:
-            logger.warning("Primary LLM failed (%s) — switching to Gemini", e)
-            llm = GeminiProvider()
-            rag._llm = llm
-            resp_miss = await rag.query(request)
+        resp_miss = await rag.query(request)
         _print_response(resp_miss, q_idx * 2 - 1)
 
         logger.info("=== QUERY %d/%d (second call): %s ===", q_idx, len(QUERIES), query_text)
