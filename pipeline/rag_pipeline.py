@@ -31,7 +31,6 @@ from llm.exceptions.llm_exceptions import (
     LLMTimeoutError,
 )
 from llm.llm_factory import LLMFactory
-from llm.rate_limiter import LLMRateLimiter, RateLimiterConfig, get_rate_limit_config
 from pipeline.exceptions.pipeline_exceptions import (
     PipelineFallbackExhaustedError,
     PipelineIngestionError,
@@ -128,7 +127,10 @@ class RAGPipeline:
         init_start = time.perf_counter()
 
         try:
-            # step 1 — LLM providers
+            # step 1 — LLM providers.
+            # create_from_settings() returns a rate-limited provider automatically
+            # (LLMRateLimiter wrapping is inside LLMFactory — no manual wrapping
+            # needed here, and no risk of bypassing limits in other call sites).
             if self._llm is None:
                 self._llm = LLMFactory.create_from_settings()
                 logger.info(
@@ -136,32 +138,8 @@ class RAGPipeline:
                     self._llm.provider_name, self._llm.model_name,
                 )
 
-            # step 1b — wrap primary LLM with per-model rate limiter (if enabled)
-            if settings.LLM_RATE_LIMITER_ENABLED:
-                self._llm = LLMRateLimiter(
-                    provider=self._llm,
-                    config=get_rate_limit_config(
-                        model_name=self._llm.model_name,
-                        max_concurrent=settings.LLM_MAX_CONCURRENT,
-                        burst_multiplier=settings.LLM_BURST_MULTIPLIER,
-                    ),
-                )
-                logger.info("Primary LLM wrapped with rate limiter")
-
             if self._fallback_llm is None:
                 self._fallback_llm = self._try_create_fallback_llm()
-
-            # step 1c — wrap fallback LLM with its own per-model rate limiter
-            if self._fallback_llm is not None and settings.LLM_RATE_LIMITER_ENABLED:
-                self._fallback_llm = LLMRateLimiter(
-                    provider=self._fallback_llm,
-                    config=get_rate_limit_config(
-                        model_name=self._fallback_llm.model_name,
-                        max_concurrent=settings.LLM_MAX_CONCURRENT,
-                        burst_multiplier=settings.LLM_BURST_MULTIPLIER,
-                    ),
-                )
-                logger.info("Fallback LLM wrapped with rate limiter")
 
             # step 2 — vector store
             if self._store is None:
@@ -812,7 +790,7 @@ class RAGPipeline:
         fallback_provider = "openai" if primary == "gemini" else "gemini"
 
         try:
-            fallback = LLMFactory.create(provider=fallback_provider)
+            fallback = LLMFactory.create_rate_limited(provider_name=fallback_provider)
             logger.info(
                 "Fallback LLM created: %s/%s",
                 fallback.provider_name, fallback.model_name,

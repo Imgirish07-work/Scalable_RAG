@@ -100,12 +100,14 @@ class Settings(BaseSettings):
     # a transparent "no relevant context" message instead of hallucinating.
     # Range: 0.0-1.0 (sigmoid). 0.1 rejects near-zero-confidence retrievals.
     RERANKER_SCORE_THRESHOLD: float = Field(default=0.1, env="RERANKER_SCORE_THRESHOLD")
-    # Per-chunk cross-encoder score threshold.
-    # Chunks scoring below this are dropped even if they are within top_k.
-    # 0.0 = disabled (keep all chunks — backward-compatible default).
-    # 0.3 = recommended: drops noise while keeping most useful context.
-    # Range: 0.0-1.0 (sigmoid). Tune up if irrelevant chunks are present in answers.
-    RERANKER_MIN_CHUNK_SCORE: float = Field(default=0.0, env="RERANKER_MIN_CHUNK_SCORE")
+    # Relative score filtering — production-grade, adapts to each query's distribution.
+    # A chunk is kept only if: score >= top_score * RATIO  AND  score >= MIN_ABS_FLOOR
+    # RATIO=0.4 means a chunk must score at least 40% of the best chunk's score.
+    # Example: top=0.984 → threshold=0.394. top=0.200 → threshold=0.100 (floor kicks in).
+    RERANKER_SCORE_RATIO: float = Field(default=0.4, env="RERANKER_SCORE_RATIO")
+    # Absolute floor — safety net when all chunks score low (poor retrieval).
+    # Prevents keeping chunks that score above ratio but are still near-zero quality.
+    RERANKER_MIN_ABS_FLOOR: float = Field(default=0.1, env="RERANKER_MIN_ABS_FLOOR")
 
     # Cache Settings
     cache_enabled: bool = Field(default=True, env="CACHE_ENABLED")

@@ -147,25 +147,34 @@ class CrossEncoderReranker:
             reverse=True,
         )
 
-        # Per-chunk score threshold — drop chunks the cross-encoder considers
-        # low-confidence even if they are within top_k.
-        # RERANKER_MIN_CHUNK_SCORE=0.0 disables filtering (default, keep all).
-        # RERANKER_MIN_CHUNK_SCORE=0.3 drops chunks the cross-encoder scores
-        # below 0.3 — avoids including weakly-relevant noise in context.
-        # Always keeps at least the top chunk so context is never empty here
-        # (pipeline-level RERANKER_SCORE_THRESHOLD handles the zero-results case).
-        min_score = settings.RERANKER_MIN_CHUNK_SCORE
+        # ── Relative score filtering ────────────────────────────────────────
+        # Production-grade pattern: threshold adapts to each query's score
+        # distribution instead of using a fixed absolute value.
+        #
+        # Rule: keep chunk if score >= max(top_score × RATIO, MIN_ABS_FLOOR)
+        #   RATIO=0.4  → chunk must reach 40% of the best chunk's score
+        #   MIN_ABS_FLOOR=0.1 → safety net when all chunks score low
+        #
+        # Examples:
+        #   top=0.984, ratio=0.4 → threshold=0.394  (drops 0.231 ✓)
+        #   top=0.200, ratio=0.4 → threshold=0.100  (floor overrides 0.08)
+        #   top=0.000, ratio=0.4 → threshold=0.100  (all filtered, keep top-1)
+        #
+        # Always keeps the top-1 chunk so context is never empty here.
+        # Pipeline-level RERANKER_SCORE_THRESHOLD handles the "even top-1 is
+        # irrelevant" case upstream in base_rag.py.
+        top_score = scored[0][0] if scored else 0.0
         candidates = scored[:top_k]
 
-        if min_score > 0.0:
-            filtered = [(s, c) for s, c in candidates if s >= min_score]
-            if not filtered:
-                # All chunks below threshold — keep top chunk, let pipeline gate decide
-                filtered = [candidates[0]]
-            dropped = len(candidates) - len(filtered)
-        else:
-            filtered = candidates
-            dropped = 0
+        dynamic_threshold = max(
+            top_score * settings.RERANKER_SCORE_RATIO,
+            settings.RERANKER_MIN_ABS_FLOOR,
+        )
+
+        filtered = [(s, c) for s, c in candidates if s >= dynamic_threshold]
+        if not filtered:
+            filtered = [candidates[0]]
+        dropped = len(candidates) - len(filtered)
 
         # Stamp each returned chunk with its cross-encoder score so the
         # pipeline can detect low-confidence retrievals upstream (base_rag.py).
@@ -176,18 +185,18 @@ class CrossEncoderReranker:
             for score, chunk in filtered
         ]
 
-        top_score = scored[0][0] if scored else 0.0
         bottom_score = filtered[-1][0] if filtered else 0.0
 
         logger.info(
             "CrossEncoder rerank complete | backend=%s | candidates=%d | "
             "top_k=%d | returned=%d | filtered_low=%d | "
-            "top_score=%.3f | bottom_score=%.3f",
+            "threshold=%.3f | top_score=%.3f | bottom_score=%.3f",
             self._backend,
             len(chunks),
             top_k,
             len(result),
             dropped,
+            dynamic_threshold,
             top_score,
             bottom_score,
         )

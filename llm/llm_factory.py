@@ -20,6 +20,7 @@ from llm.exceptions.llm_exceptions import LLMProviderError
 from llm.providers.openai_provider import OpenAIProvider
 from llm.providers.gemini_provider import GeminiProvider
 from llm.providers.groq_provider import GroqProvider
+from llm.rate_limiter import LLMRateLimiter, get_rate_limit_config
 from config.settings import settings
 from utils.logger import get_logger
 
@@ -90,14 +91,64 @@ class LLMFactory:
         return provider_class(**kwargs)
 
     @classmethod
-    def create_from_settings(cls) -> BaseLLM:
-        """Create provider using default_provider from settings.
+    def create_rate_limited(
+        cls,
+        provider_name: str,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> BaseLLM:
+        """Create provider and wrap with per-model rate limiter.
 
-        Reads the provider name from .env / settings automatically.
-        Use this in pipeline code — no hardcoded provider names.
+        Single call that handles both creation and rate limiting — prevents
+        any code path from accidentally using an unthrottled raw provider.
+
+        Rate limiting is skipped when LLM_RATE_LIMITER_ENABLED=False (tests,
+        local dev) but active by default in all other contexts.
+
+        Args:
+            provider_name: Provider name e.g. 'groq', 'gemini', 'openai'.
+            api_key: Optional API key override.
+            model: Optional model name override.
+            temperature: Optional temperature override.
+            max_tokens: Optional max tokens override.
+            timeout: Optional request timeout override.
 
         Returns:
-            BaseLLM instance configured from settings.
+            LLMRateLimiter-wrapped BaseLLM when enabled, raw provider otherwise.
+        """
+        provider = cls.create(
+            provider_name=provider_name,
+            api_key=api_key,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+
+        if not settings.LLM_RATE_LIMITER_ENABLED:
+            return provider
+
+        return LLMRateLimiter(
+            provider=provider,
+            config=get_rate_limit_config(
+                model_name=provider.model_name,
+                max_concurrent=settings.LLM_MAX_CONCURRENT,
+                burst_multiplier=settings.LLM_BURST_MULTIPLIER,
+            ),
+        )
+
+    @classmethod
+    def create_from_settings(cls) -> BaseLLM:
+        """Create rate-limited provider from default_provider setting.
+
+        Always returns a rate-limited provider when LLM_RATE_LIMITER_ENABLED
+        is True — no manual wrapping needed at the call site.
+
+        Returns:
+            Rate-limited BaseLLM configured from settings.
 
         Raises:
             LLMProviderError: If default_provider in settings is not registered.
@@ -109,7 +160,7 @@ class LLMFactory:
             provider_name,
         )
 
-        return cls.create(provider_name)
+        return cls.create_rate_limited(provider_name)
 
     @classmethod
     def available_providers(cls) -> list[str]:
