@@ -104,7 +104,7 @@ class Settings(BaseSettings):
     # A chunk is kept only if: score >= top_score * RATIO  AND  score >= MIN_ABS_FLOOR
     # RATIO=0.4 means a chunk must score at least 40% of the best chunk's score.
     # Example: top=0.984 → threshold=0.394. top=0.200 → threshold=0.100 (floor kicks in).
-    RERANKER_SCORE_RATIO: float = Field(default=0.4, env="RERANKER_SCORE_RATIO")
+    RERANKER_SCORE_RATIO: float = Field(default=0.6, env="RERANKER_SCORE_RATIO")
     # Absolute floor — safety net when all chunks score low (poor retrieval).
     # Prevents keeping chunks that score above ratio but are still near-zero quality.
     RERANKER_MIN_ABS_FLOOR: float = Field(default=0.1, env="RERANKER_MIN_ABS_FLOOR")

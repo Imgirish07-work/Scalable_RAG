@@ -20,8 +20,7 @@ from chunking.structure_preserver import StructurePreserver
 from chunking.chunker import Chunker
 from vectorstore.qdrant_store import QdrantStore
 from rag.retrieval.hybrid_retriever import HybridRetriever
-from llm.providers.groq_provider import GroqProvider
-from llm.providers.gemini_provider import GeminiProvider
+from llm.llm_factory import LLMFactory
 from llm.exceptions.llm_exceptions import LLMProviderError
 from rag.models.rag_request import RAGRequest, RAGConfig
 from rag.rag_factory import RAGFactory
@@ -102,12 +101,12 @@ async def run():
     # ── 4. RAG pipeline ───────────────────────────────────────────────────────
     retriever = HybridRetriever(store)
     try:
-        llm = GroqProvider()
-        fallback_llm = GeminiProvider()
-        logger.info("LLM: GroqProvider (%s) | fallback: GeminiProvider", llm.model_name)
+        llm = LLMFactory.create_rate_limited("groq")
+        fallback_llm = LLMFactory.create_rate_limited("gemini")
+        logger.info("LLM: %s | fallback: %s", llm.model_name, fallback_llm.model_name)
     except Exception as e:
         logger.warning("Groq unavailable (%s) — using Gemini as primary", e)
-        llm = GeminiProvider()
+        llm = LLMFactory.create_rate_limited("gemini")
         fallback_llm = None
 
     rag = RAGFactory.create(
