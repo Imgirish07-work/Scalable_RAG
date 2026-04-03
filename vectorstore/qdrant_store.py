@@ -45,6 +45,11 @@ from qdrant_client.models import (
     MatchValue,
     PayloadSchemaType,
     Prefetch,
+    QuantizationSearchParams,
+    ScalarQuantization,
+    ScalarQuantizationConfig,
+    ScalarType,
+    SearchParams,
     SparseVector,
     SparseVectorParams,
     VectorParams,
@@ -194,6 +199,8 @@ class QdrantStore(BaseVectorStore):
                 )
                 # Warn about potential schema mismatch
                 self._validate_collection_config()
+                # Apply SQ to existing collection if not yet configured
+                self._ensure_quantization()
                 return
 
             # Build vector configurations based on search mode
@@ -209,11 +216,23 @@ class QdrantStore(BaseVectorStore):
             if self.search_mode in ("sparse", "hybrid"):
                 sparse_vectors_config[self._SPARSE_VECTOR_NAME] = SparseVectorParams()
 
-            # Create collection
+            # Create collection with Scalar Quantization (int8).
+            # SQ compresses float32 → int8 (4× less RAM, 2-3× faster search).
+            # quantile=0.99 clips the top 1% of values to reduce outlier impact.
+            # always_ram=True keeps quantized vectors in RAM for lowest latency.
+            # rescore=True (at search time) re-ranks top-k using original float32
+            # vectors — recovers the ~1% recall loss from quantization.
             self._client.create_collection(
                 collection_name=self.collection_name,
                 vectors_config=vectors_config or None,
                 sparse_vectors_config=sparse_vectors_config or None,
+                quantization_config=ScalarQuantization(
+                    scalar=ScalarQuantizationConfig(
+                        type=ScalarType.INT8,
+                        quantile=0.99,
+                        always_ram=True,
+                    )
+                ),
             )
 
             logger.info(
@@ -270,6 +289,47 @@ class QdrantStore(BaseVectorStore):
             logger.debug(
                 "Could not validate collection config for '%s'",
                 self.collection_name,
+            )
+
+    def _ensure_quantization(self) -> None:
+        """Apply Scalar Quantization (int8) to an existing collection if not configured.
+
+        Called once per startup when the collection already exists.
+        Qdrant re-quantizes in the background — no downtime, no data loss.
+        Safe to call multiple times (idempotent: skips if SQ already set).
+
+        Sync — runs inside asyncio.to_thread() via _create_collection_if_missing().
+        """
+        try:
+            info = self._client.get_collection(self.collection_name)
+            if info.config.quantization_config is not None:
+                logger.debug(
+                    "Quantization already configured on '%s' — skipping update",
+                    self.collection_name,
+                )
+                return
+
+            self._client.update_collection(
+                collection_name=self.collection_name,
+                quantization_config=ScalarQuantization(
+                    scalar=ScalarQuantizationConfig(
+                        type=ScalarType.INT8,
+                        quantile=0.99,
+                        always_ram=True,
+                    )
+                ),
+            )
+            logger.info(
+                "Scalar Quantization (int8, quantile=0.99, always_ram=True) "
+                "applied to existing collection '%s' — re-quantization runs in background",
+                self.collection_name,
+            )
+        except Exception:
+            # Best-effort — quantization is an optimization, not required for correctness
+            logger.warning(
+                "Could not apply quantization to '%s' — search continues unquantized",
+                self.collection_name,
+                exc_info=True,
             )
 
     # Vector store construction
@@ -871,6 +931,8 @@ class QdrantStore(BaseVectorStore):
             # Raw Qdrant search — with_vectors=True returns the stored dense
             # vector alongside each result. Uses query_points (Qdrant client
             # v1.7+ API; replaces the deprecated client.search()).
+            # rescore=True: after int8 ANN search, Qdrant re-scores the top-k
+            # candidates using original float32 vectors — recovers SQ recall loss.
             response = await asyncio.to_thread(
                 self._client.query_points,
                 collection_name=self.collection_name,
@@ -880,6 +942,9 @@ class QdrantStore(BaseVectorStore):
                 with_vectors=True,
                 with_payload=True,
                 query_filter=qdrant_filter,
+                search_params=SearchParams(
+                    quantization=QuantizationSearchParams(rescore=True)
+                ),
             )
 
             docs = []
@@ -968,11 +1033,17 @@ class QdrantStore(BaseVectorStore):
                 self._client.query_points,
                 collection_name=self.collection_name,
                 prefetch=[
+                    # Dense leg: rescore=True re-ranks ANN candidates with float32
+                    # after int8 SQ search — recovers recall loss before RRF fusion.
                     Prefetch(
                         query=query_vector,
                         using=self._DENSE_VECTOR_NAME,
                         limit=coarse_k,
+                        params=SearchParams(
+                            quantization=QuantizationSearchParams(rescore=True)
+                        ),
                     ),
+                    # Sparse leg: SPLADE vectors are not quantized — no params needed.
                     Prefetch(
                         query=SparseVector(
                             indices=sparse_vector.indices,
