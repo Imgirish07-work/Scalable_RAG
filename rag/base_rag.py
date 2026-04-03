@@ -734,7 +734,18 @@ class BaseRAG(ABC):
         if not used_chunks:
             return ConfidenceScore(value=0.0, method=method)
 
-        avg_score = sum(c.relevance_score for c in used_chunks) / len(used_chunks)
+        # Average the top-⌈k/2⌉ scores instead of all k.
+        # Full average is skewed by low-scoring tail chunks, which is
+        # especially pronounced with hybrid RRF where scores have a wide
+        # spread (e.g. 1.0, 0.58, 0.58, 0.34, 0.23 → avg=0.55 despite
+        # a perfect top match). Top-half average gives a fairer signal
+        # for both dense (cosine) and hybrid (RRF rank-based) scoring.
+        import math
+        scores = sorted(
+            (c.relevance_score for c in used_chunks), reverse=True
+        )
+        top_n = max(1, math.ceil(len(scores) / 2))
+        avg_score = sum(scores[:top_n]) / top_n
 
         # Clamp to valid range
         avg_score = max(0.0, min(1.0, avg_score))

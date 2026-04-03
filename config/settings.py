@@ -54,7 +54,11 @@ class Settings(BaseSettings):
     #   https://huggingface.co/Qdrant/Splade_PP_en_v1/tree/main
     # Place in models/splade-en-v1/ and set this to that directory path.
     SPLADE_LOCAL_PATH: str = Field(default="", env="SPLADE_LOCAL_PATH")
-    
+    # ONNX Runtime intra-op threads for SPLADE inference.
+    # Controls CPU cores used per SPLADE batch — default ORT behaviour is 1 thread.
+    # i5-1345U (2P+8E): 6 is optimal. Set 0 to use all logical cores.
+    SPLADE_INTRA_OP_THREADS: int = Field(default=6, env="SPLADE_INTRA_OP_THREADS")
+
     # Document cleaner settings
     min_chars_per_page : int = Field(default=50, env="MIN_CHARS_PER_PAGE")
     prefer_pdfplumber : bool = Field(default=False, env="PREFER_PDFPLUMBER")
