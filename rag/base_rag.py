@@ -244,6 +244,73 @@ class BaseRAG(ABC):
         ranked_chunks = await self.rank(chunks, processed_query, strategy=active_strategy)
         ranking_ms = (time.perf_counter() - ranking_start) * 1000
 
+        # ---- Step 4b: Reranker threshold guard ----
+        # If all cross-encoder scores are near-zero, the reranker found nothing
+        # relevant. Assembling context from irrelevant chunks causes hallucination.
+        # Return a transparent "no context" response instead.
+        if ranked_chunks:
+            reranker_scores = [
+                c.reranker_score for c in ranked_chunks if c.reranker_score is not None
+            ]
+            if reranker_scores:
+                from config.settings import settings as _s
+                threshold = getattr(_s, "RERANKER_SCORE_THRESHOLD", 0.1)
+                top_reranker_score = max(reranker_scores)
+                if top_reranker_score < threshold:
+                    total_ms = (time.perf_counter() - total_start) * 1000
+                    logger.warning(
+                        "Reranker threshold not met | top_score=%.4f | "
+                        "threshold=%.2f | returning low-confidence response",
+                        top_reranker_score,
+                        threshold,
+                    )
+                    # Unblock any coalesced requests waiting on this key.
+                    # The normal path calls resolve_in_flight inside _try_cache_write.
+                    # The early-return path skips that, leaving the event unset and
+                    # causing the next caller to wait the full 10s coalescing timeout.
+                    if self._cache:
+                        try:
+                            await self._cache.resolve_in_flight(
+                                query=request.query,
+                                model_name=self._llm.model_name,
+                                temperature=request.config.temperature,
+                                system_prompt=request.config.system_prompt or "",
+                            )
+                        except Exception:
+                            pass
+
+                    no_context_answer = (
+                        "I couldn't find sufficiently relevant information in the "
+                        "provided documents to answer this question confidently. "
+                        "Please try rephrasing your query or check that the relevant "
+                        "document has been indexed."
+                    )
+                    from llm.models.llm_response import LLMResponse as _LLMResponse
+                    stub_llm_response = _LLMResponse(
+                        text=no_context_answer,
+                        model=self._llm.model_name,
+                        provider=self._llm.provider_name,
+                        finish_reason="stop",
+                        prompt_tokens=0,
+                        completion_tokens=len(no_context_answer.split()),
+                        tokens_used=len(no_context_answer.split()),
+                        latency_ms=0.0,
+                    )
+                    return RAGResponse.from_generation(
+                        answer=no_context_answer,
+                        llm_response=stub_llm_response,
+                        sources=[],
+                        timings=RAGTimings(
+                            retrieval_ms=round(retrieval_ms, 2),
+                            ranking_ms=round(ranking_ms, 2),
+                            total_ms=round(total_ms, 2),
+                        ),
+                        confidence=ConfidenceScore(value=top_reranker_score, method="reranker"),
+                        request_id=request.request_id,
+                        rag_variant=self.variant_name,
+                        low_confidence=True,
+                    )
+
         # ---- Step 5: Assemble context ----
         context_str, updated_chunks, context_tokens = await self.assemble_context(
             ranked_chunks
@@ -286,7 +353,7 @@ class BaseRAG(ABC):
 
         # ---- Step 8: Cache write ----
         if self._cache:
-            await self._try_cache_write(request, llm_response, sources)
+            await self._try_cache_write(request, llm_response, sources, confidence)
 
         logger.info(
             "RAG query complete | variant=%s | request_id=%s | "
@@ -540,6 +607,7 @@ class BaseRAG(ABC):
                     cache_layer=result.layer,
                     lookup_latency_ms=result.lookup_latency_ms,
                     sources=cached_sources,
+                    confidence_value=result.confidence_value,
                 )
 
         except Exception as exc:
@@ -557,6 +625,7 @@ class BaseRAG(ABC):
         request: RAGRequest,
         llm_response: LLMResponse,
         sources: list[RetrievedChunk] = [],
+        confidence: ConfidenceScore | None = None,
     ) -> None:
         """Attempt to write to cache. Errors are caught and logged.
 
@@ -577,6 +646,7 @@ class BaseRAG(ABC):
                 response=llm_response,
                 system_prompt=request.config.system_prompt or "",
                 sources=[chunk.model_dump() for chunk in sources],
+                confidence_value=confidence.value if confidence is not None else 0.0,
             )
             await self._cache.resolve_in_flight(
                 query=request.query,

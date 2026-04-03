@@ -31,22 +31,42 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-PDF_PATH = "./data/sample_docs/THE_CONSTITUTION_OF_INDIA.pdf"
-QUERY    = "what is article 14?"
+PDF_PATH = "./data/sample_docs/Attention is all you need.pdf"
+QUERIES  = [
+    "what is the transformer architecture?",
+    "how does multi-head attention work?",
+    "what are the results on WMT translation tasks?",
+]
 
 
-def _print_response(response, label: str) -> None:
+def _print_response(response, query_num: int) -> None:
+    # Build the label from the actual response — not from pre-run assumptions.
+    if response.cache_hit:
+        execution_path = f"cache HIT ({response.cache_layer})"
+        model_label = f"[cached] {response.model_name}"
+    elif response.timings.generation_ms == 0.0 and response.low_confidence:
+        execution_path = "low-confidence guard (no LLM call)"
+        model_label = response.model_name
+    else:
+        execution_path = f"cache MISS — called {response.model_name}"
+        model_label = response.model_name
+
     print(f"\n{'=' * 60}")
-    print(f"[ {label} ]")
+    print(f"[ QUERY {query_num} — {execution_path} ]")
     print(f"CACHE HIT  : {response.cache_hit} | layer={response.cache_layer}")
+    if response.low_confidence:
+        print("LOW CONFIDENCE: retrieval threshold not met — answer may be empty")
     print(f"ANSWER:\n{response.answer}")
     print("\nSOURCES:")
     for chunk in response.sources:
         print(f"  [{chunk.source_file}] score={chunk.relevance_score:.2f}")
         print(f"    {chunk.content[:150]}...")
-    print(f"\nCONFIDENCE : {response.confidence.value:.2f}")
-    print(f"LATENCY    : {response.timings.total_ms:.1f} ms")
-    print(f"MODEL      : {response.model_name}")
+    print(f"\nCONFIDENCE : {response.confidence.value:.4f} (method={response.confidence.method})")
+    print(f"LATENCY    : {response.timings.total_ms:.1f} ms  "
+          f"[retrieval={response.timings.retrieval_ms:.0f}ms | "
+          f"ranking={response.timings.ranking_ms:.0f}ms | "
+          f"generation={response.timings.generation_ms:.0f}ms]")
+    print(f"MODEL      : {model_label}")
     print("=" * 60 + "\n")
 
 
@@ -66,7 +86,7 @@ async def run():
 
     # ── 2. Vector store ───────────────────────────────────────────────────────
     store = QdrantStore(
-        collection_name="redis_docs",
+        collection_name="attention_paper",
         in_memory=False,
         search_mode="dense",
     )
@@ -83,7 +103,7 @@ async def run():
     retriever = DenseRetriever(store)
     try:
         llm = GroqProvider()
-        logger.info("LLM: GroqProvider (llama-3.3-70b-versatile)")
+        logger.info("LLM: GroqProvider (%s)", llm.model_name)
     except Exception as e:
         logger.warning("Groq unavailable (%s) — falling back to Gemini", e)
         llm = GeminiProvider()
@@ -95,27 +115,27 @@ async def run():
         cache=cache,
     )
 
-    request = RAGRequest(
-        query=QUERY,
-        collection_name="redis_docs",
-        config=RAGConfig(top_k=5, rerank_strategy="cross_encoder"),
-    )
+    # ── 5. Run each query: first call (miss) then second call (hit) ───────────
+    for q_idx, query_text in enumerate(QUERIES, start=1):
+        request = RAGRequest(
+            query=query_text,
+            collection_name="attention_paper",
+            config=RAGConfig(top_k=5, rerank_strategy="cross_encoder"),
+        )
 
-    # ── 5. Query 1 — cache MISS ───────────────────────────────────────────────
-    logger.info("=== QUERY 1 (expect cache MISS) ===")
-    try:
-        response1 = await rag.query(request)
-    except LLMProviderError as e:
-        logger.warning("Primary LLM (%s) failed during query (%s) — switching to Gemini", llm.provider_name, e)
-        llm = GeminiProvider()
-        rag._llm = llm
-        response1 = await rag.query(request)
-    _print_response(response1, f"QUERY 1 — cache miss, calls {llm.provider_name}")
+        logger.info("=== QUERY %d/%d (first call): %s ===", q_idx, len(QUERIES), query_text)
+        try:
+            resp_miss = await rag.query(request)
+        except LLMProviderError as e:
+            logger.warning("Primary LLM failed (%s) — switching to Gemini", e)
+            llm = GeminiProvider()
+            rag._llm = llm
+            resp_miss = await rag.query(request)
+        _print_response(resp_miss, q_idx * 2 - 1)
 
-    # ── 6. Query 2 — cache HIT ────────────────────────────────────────────────
-    logger.info("=== QUERY 2 (expect cache HIT) ===")
-    response2 = await rag.query(request)
-    _print_response(response2, "QUERY 2 — should be cache HIT")
+        logger.info("=== QUERY %d/%d (second call): %s ===", q_idx, len(QUERIES), query_text)
+        resp_hit = await rag.query(request)
+        _print_response(resp_hit, q_idx * 2)
 
 
 if __name__ == "__main__":

@@ -80,6 +80,13 @@ class CacheEntry(BaseModel):
         ge=0.0,
         description="Estimated cost in USD saved per cache hit",
     )
+    confidence_value: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Retrieval confidence score at time of generation (0.0-1.0). "
+                    "Stored so cache hits return the original confidence instead of 1.0.",
+    )
 
     @model_validator(mode="after")
     def validate_expiry_after_creation(self) -> "CacheEntry":

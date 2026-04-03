@@ -97,6 +97,13 @@ class CacheResult(BaseModel):
         default_factory=list,
         description="Serialized RetrievedChunk dicts, populated on cache hit",
     )
+    confidence_value: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Retrieval confidence stored at write time. Replaces the "
+                    "hardcoded 1.0 that was returned on every cache hit.",
+    )
 
     @staticmethod
     def miss(latency_ms: float =0.0) -> "CacheResult":
@@ -114,6 +121,7 @@ class CacheResult(BaseModel):
         cache_age_seconds: float = 0.0,
         similarity_score: float = 0.0,
         semantic_tier: SemanticTier = SemanticTier.MISS,
+        confidence_value: float = 0.0,
     ) -> "CacheResult":
         """Factory for a cache hit with full metadata."""
         return CacheResult(
@@ -127,4 +135,5 @@ class CacheResult(BaseModel):
             cache_age_seconds=cache_age_seconds,
             similarity_score=similarity_score,
             semantic_tier=semantic_tier,
+            confidence_value=confidence_value,
         )

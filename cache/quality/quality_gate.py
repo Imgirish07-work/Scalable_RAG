@@ -25,6 +25,26 @@ from llm.models.llm_response import LLMResponse
 
 logger = get_logger(__name__)
 
+# Phrases that indicate the LLM could not answer from the provided context.
+# Responses containing any of these (case-insensitive) must not be cached —
+# they are document-specific failures that will poison future cache hits.
+_NEGATIVE_PATTERNS: list[str] = [
+    "i don't have enough information",
+    "i do not have enough information",
+    "not mentioned in the provided",
+    "not found in the provided",
+    "cannot answer based on",
+    "not covered in the provided",
+    "the provided documents do not",
+    "the document does not contain",
+    "no information available",
+    "insufficient information",
+    "not available in the context",
+    "context does not contain",
+    "i cannot find",
+    "unable to find",
+]
+
 
 class QualityGate:
     """Validates LLM responses before cache entry.
@@ -84,6 +104,16 @@ class QualityGate:
             )
             logger.debug("Quality gate: %s", reason)
             return False, reason
+
+        # Negative response pattern check — block polite refusals from being cached.
+        # A "I don't have enough information" response is query-specific and will
+        # poison every future cache hit for this query until TTL expires.
+        lowered = response.text.lower()
+        for pattern in _NEGATIVE_PATTERNS:
+            if pattern in lowered:
+                reason = f"negative response pattern detected: '{pattern}'"
+                logger.info("Quality gate rejected (cache poison prevention): %s", reason)
+                return False, reason
 
         return True, None
 

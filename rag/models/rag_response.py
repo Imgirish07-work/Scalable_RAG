@@ -105,6 +105,15 @@ class RetrievedChunk(BaseModel):
         exclude=True,
         description="Pre-fetched embedding vector for MMR. Not in API output.",
     )
+    # Internal pipeline field — excluded from API/cache serialization.
+    # Cross-encoder score from the reranker (sigmoid 0.0-1.0). Used by
+    # base_rag.query() to detect low-confidence retrievals before assembling
+    # context. None when reranker was not used (dense/mmr-only paths).
+    reranker_score: float | None = Field(
+        default=None,
+        exclude=True,
+        description="Cross-encoder score from reranker. Not in API output.",
+    )
 
     @field_validator("content")
     @classmethod
@@ -152,7 +161,7 @@ class RetrievedChunk(BaseModel):
         known_fields = {
             "source", "source_file", "chunk_id",
             "section_heading", "page_number", "content_type",
-            "vector", "relevance_score", "original_content",
+            "vector", "reranker_score", "relevance_score", "original_content",
             "embed_content", "ingested_at", "char_count",
             "doc_id", "user_id", "chunk_index", "total_chunks",
         }
@@ -376,6 +385,7 @@ class RAGResponse(BaseModel):
         cache_layer: str,
         lookup_latency_ms: float = 0.0,
         sources: list = [],
+        confidence_value: float = 0.0,
     ) -> RAGResponse:
         """Build RAGResponse from a cached LLMResponse.
 
@@ -397,7 +407,7 @@ class RAGResponse(BaseModel):
             answer=cached_response.text,
             sources=sources,
             timings=RAGTimings(total_ms=lookup_latency_ms),
-            confidence=ConfidenceScore(value=1.0, method="cache"),
+            confidence=ConfidenceScore(value=confidence_value, method="cache"),
             cache_hit=True,
             cache_layer=cache_layer,
             rag_variant=rag_variant,

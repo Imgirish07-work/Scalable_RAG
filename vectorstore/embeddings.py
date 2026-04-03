@@ -195,6 +195,7 @@ def _get_onnx_embeddings(model_path: str) -> ONNXEmbeddings:
 
 # Public API
 
+@lru_cache(maxsize=1)
 def get_embeddings() -> Embeddings:
     """
     Return a cached embeddings instance.

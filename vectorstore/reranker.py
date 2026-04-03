@@ -108,18 +108,25 @@ class CrossEncoderReranker:
             reverse=True,
         )
 
-        # Return top_k — keep original relevance_score (Qdrant cosine similarity)
-        # so confidence calculation and MMR diversity scoring stay valid.
-        # The cross-encoder score is used only for ordering.
-        result = [chunk for _, chunk in scored[:top_k]]
+        # Stamp each returned chunk with its cross-encoder score so the
+        # pipeline can detect low-confidence retrievals upstream (base_rag.py).
+        # Keep original relevance_score (Qdrant cosine similarity) — it is used
+        # for confidence calculation and MMR diversity scoring.
+        result = [
+            chunk.model_copy(update={"reranker_score": score})
+            for score, chunk in scored[:top_k]
+        ]
+
+        top_score = scored[0][0] if scored else 0.0
+        bottom_score = scored[min(top_k - 1, len(scored) - 1)][0] if scored else 0.0
 
         logger.info(
             "CrossEncoder rerank complete | candidates=%d | top_k=%d | "
             "top_score=%.3f | bottom_score=%.3f",
             len(chunks),
             top_k,
-            scored[0][0] if scored else 0.0,
-            scored[min(top_k - 1, len(scored) - 1)][0] if scored else 0.0,
+            top_score,
+            bottom_score,
         )
 
         return result

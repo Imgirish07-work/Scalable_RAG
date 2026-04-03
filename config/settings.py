@@ -78,6 +78,11 @@ class Settings(BaseSettings):
     # How many coarse candidates to fetch from Qdrant for the cross-encoder to score.
     # Should be 2-3x top_k so the reranker has enough candidates to work with.
     RERANKER_COARSE_TOP_K: int = Field(default=10, env="RERANKER_COARSE_TOP_K")
+    # Minimum cross-encoder score to consider a retrieval useful.
+    # If the top chunk scores below this after reranking, the pipeline returns
+    # a transparent "no relevant context" message instead of hallucinating.
+    # Range: 0.0-1.0 (sigmoid). 0.1 rejects near-zero-confidence retrievals.
+    RERANKER_SCORE_THRESHOLD: float = Field(default=0.1, env="RERANKER_SCORE_THRESHOLD")
 
     # Cache Settings
     cache_enabled: bool = Field(default=True, env="CACHE_ENABLED")

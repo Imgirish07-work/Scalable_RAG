@@ -329,6 +329,7 @@ class CacheManager:
                 cache_key=key,
                 sources=entry.sources,
                 cache_age_seconds=entry.age_seconds,
+                confidence_value=entry.confidence_value,
             )
         except CacheSerializationError:
             logger.warning("L1 corrupt entry removed: key=%s", key[:16] + "...")
@@ -371,6 +372,7 @@ class CacheManager:
                 cache_key=key,
                 sources=entry.sources,
                 cache_age_seconds=entry.age_seconds,
+                confidence_value=entry.confidence_value,
             )
         except CacheSerializationError:
             logger.warning("L2 corrupt entry removed: key=%s", key[:16] + "...")
@@ -506,6 +508,7 @@ class CacheManager:
         system_prompt: str = "",
         ttl_seconds: Optional[int] = None,
         sources: list = [],
+        confidence_value: float = 0.0,
     ) -> bool:
         """Cache an LLM response.
 
@@ -569,6 +572,7 @@ class CacheManager:
                 temperature=temperature,
                 token_cost_estimate=self._estimate_cost(response),
                 sources=sources,
+                confidence_value=confidence_value,
             )
 
             raw = self._serializer.serialize(entry)
