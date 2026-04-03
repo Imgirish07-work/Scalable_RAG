@@ -1012,16 +1012,14 @@ class QdrantStore(BaseVectorStore):
             return []
 
         try:
-            # Dense query vector
+            # Dense + sparse embeddings computed in parallel — independent ops,
+            # no reason to wait for one before starting the other.
             embeddings_model = get_embeddings()
-            query_vector = await asyncio.to_thread(
-                embeddings_model.embed_query, query
-            )
-
-            # Sparse query vector from SPLADE/BM25
             sparse_model = self._get_sparse_embeddings()
-            sparse_vector = await asyncio.to_thread(
-                sparse_model.embed_query, query
+
+            query_vector, sparse_vector = await asyncio.gather(
+                asyncio.to_thread(embeddings_model.embed_query, query),
+                asyncio.to_thread(sparse_model.embed_query, query),
             )
 
             qdrant_filter = self._build_filter(filter_user_id)
