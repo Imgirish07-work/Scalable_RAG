@@ -147,24 +147,47 @@ class CrossEncoderReranker:
             reverse=True,
         )
 
+        # Per-chunk score threshold — drop chunks the cross-encoder considers
+        # low-confidence even if they are within top_k.
+        # RERANKER_MIN_CHUNK_SCORE=0.0 disables filtering (default, keep all).
+        # RERANKER_MIN_CHUNK_SCORE=0.3 drops chunks the cross-encoder scores
+        # below 0.3 — avoids including weakly-relevant noise in context.
+        # Always keeps at least the top chunk so context is never empty here
+        # (pipeline-level RERANKER_SCORE_THRESHOLD handles the zero-results case).
+        min_score = settings.RERANKER_MIN_CHUNK_SCORE
+        candidates = scored[:top_k]
+
+        if min_score > 0.0:
+            filtered = [(s, c) for s, c in candidates if s >= min_score]
+            if not filtered:
+                # All chunks below threshold — keep top chunk, let pipeline gate decide
+                filtered = [candidates[0]]
+            dropped = len(candidates) - len(filtered)
+        else:
+            filtered = candidates
+            dropped = 0
+
         # Stamp each returned chunk with its cross-encoder score so the
         # pipeline can detect low-confidence retrievals upstream (base_rag.py).
         # Keep original relevance_score (Qdrant cosine similarity) — it is used
         # for confidence calculation and MMR diversity scoring.
         result = [
             chunk.model_copy(update={"reranker_score": score})
-            for score, chunk in scored[:top_k]
+            for score, chunk in filtered
         ]
 
         top_score = scored[0][0] if scored else 0.0
-        bottom_score = scored[min(top_k - 1, len(scored) - 1)][0] if scored else 0.0
+        bottom_score = filtered[-1][0] if filtered else 0.0
 
         logger.info(
-            "CrossEncoder rerank complete | backend=%s | candidates=%d | top_k=%d | "
+            "CrossEncoder rerank complete | backend=%s | candidates=%d | "
+            "top_k=%d | returned=%d | filtered_low=%d | "
             "top_score=%.3f | bottom_score=%.3f",
             self._backend,
             len(chunks),
             top_k,
+            len(result),
+            dropped,
             top_score,
             bottom_score,
         )

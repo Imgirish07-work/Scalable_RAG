@@ -100,6 +100,12 @@ class Settings(BaseSettings):
     # a transparent "no relevant context" message instead of hallucinating.
     # Range: 0.0-1.0 (sigmoid). 0.1 rejects near-zero-confidence retrievals.
     RERANKER_SCORE_THRESHOLD: float = Field(default=0.1, env="RERANKER_SCORE_THRESHOLD")
+    # Per-chunk cross-encoder score threshold.
+    # Chunks scoring below this are dropped even if they are within top_k.
+    # 0.0 = disabled (keep all chunks — backward-compatible default).
+    # 0.3 = recommended: drops noise while keeping most useful context.
+    # Range: 0.0-1.0 (sigmoid). Tune up if irrelevant chunks are present in answers.
+    RERANKER_MIN_CHUNK_SCORE: float = Field(default=0.0, env="RERANKER_MIN_CHUNK_SCORE")
 
     # Cache Settings
     cache_enabled: bool = Field(default=True, env="CACHE_ENABLED")
@@ -211,11 +217,12 @@ class Settings(BaseSettings):
     Used to estimate cost savings from cache hits."""
 
     # Rate Limiter
+    # RPM and RPD are NOT configured here — they are looked up per-model from
+    # llm/rate_limiter/model_limits.py so the correct provider limits are
+    # always applied regardless of which model is active.
     LLM_RATE_LIMITER_ENABLED: bool = True
-    LLM_RPM: int = 60
-    LLM_RPD: int = 1500
-    LLM_MAX_CONCURRENT: int = 5
-    LLM_BURST_MULTIPLIER: float = 1.0
+    LLM_MAX_CONCURRENT: int = 5       # semaphore — max in-flight requests
+    LLM_BURST_MULTIPLIER: float = 1.0  # 1.0 = no burst above sustained RPM
 
     # Cost Optimization
     use_cheap_model_threshold: int = Field(default=500, env="USE_CHEAP_MODEL_THRESHOLD")
