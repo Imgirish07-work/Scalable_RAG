@@ -19,7 +19,7 @@ from chunking.document_cleaner import DocumentCleaner
 from chunking.structure_preserver import StructurePreserver
 from chunking.chunker import Chunker
 from vectorstore.qdrant_store import QdrantStore
-from rag.retrieval.dense_retriever import DenseRetriever
+from rag.retrieval.hybrid_retriever import HybridRetriever
 from llm.providers.groq_provider import GroqProvider
 from llm.providers.gemini_provider import GeminiProvider
 from llm.exceptions.llm_exceptions import LLMProviderError
@@ -88,7 +88,7 @@ async def run():
     store = QdrantStore(
         collection_name="attention_paper",
         in_memory=False,
-        search_mode="dense",
+        search_mode="hybrid",
     )
     await store.initialize()
 
@@ -100,7 +100,7 @@ async def run():
     await cache.initialize()
 
     # ── 4. RAG pipeline ───────────────────────────────────────────────────────
-    retriever = DenseRetriever(store)
+    retriever = HybridRetriever(store)
     try:
         llm = GroqProvider()
         fallback_llm = GeminiProvider()

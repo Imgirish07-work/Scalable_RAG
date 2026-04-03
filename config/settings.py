@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     # ONNX Embeddings — faster CPU inference (uses onnx/model.onnx inside the model folder)
     USE_ONNX_EMBEDDINGS: bool = Field(default=True, env="USE_ONNX_EMBEDDINGS")
     EMBEDDING_BATCH_SIZE: int = Field(default=64, env="EMBEDDING_BATCH_SIZE")
+
+    # SPLADE sparse embedding model local path
+    # When set, fastembed skips HuggingFace download entirely (corporate network fix).
+    # Download model.onnx + tokenizer files from:
+    #   https://huggingface.co/Qdrant/Splade_PP_en_v1/tree/main
+    # Place in models/splade-en-v1/ and set this to that directory path.
+    SPLADE_LOCAL_PATH: str = Field(default="", env="SPLADE_LOCAL_PATH")
     
     # Document cleaner settings
     min_chars_per_page : int = Field(default=50, env="MIN_CHARS_PER_PAGE")
@@ -167,7 +174,7 @@ class Settings(BaseSettings):
     RAG_TOP_K: int = 5
     RAG_MAX_CONTEXT_TOKENS: int = 3072
     RAG_RERANK_STRATEGY: str = "mmr"
-    RAG_RETRIEVAL_MODE: str = "dense"
+    RAG_RETRIEVAL_MODE: str = "hybrid"
     RAG_CONFIDENCE_METHOD: str = "retrieval"
 
     # CorrectiveRAG specific

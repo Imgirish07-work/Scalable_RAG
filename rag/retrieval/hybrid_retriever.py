@@ -170,20 +170,17 @@ class HybridRetriever(BaseRetriever):
             List of LangChain Documents, or None if hybrid is unavailable.
         """
 
-        if not hasattr(self._store, "hybrid_search"):
+        if not hasattr(self._store, "hybrid_search_with_vectors"):
             logger.warning(
-                "QdrantStore does not have hybrid_search method, "
+                "QdrantStore does not have hybrid_search_with_vectors method, "
                 "falling back to dense"
             )
             return None
 
         try:
-            docs = await self._store.hybrid_search(
+            docs = await self._store.hybrid_search_with_vectors(
                 query=query,
                 k=top_k,
-                filter=qdrant_filter,
-                dense_weight=self._dense_weight,
-                sparse_weight=self._sparse_weight,
             )
             return docs
         except Exception as e:
@@ -214,10 +211,9 @@ class HybridRetriever(BaseRetriever):
         """
 
         try:
-            docs = await self._store.similarity_search(
+            docs = await self._store.similarity_search_with_vectors(
                 query=query,
                 k=top_k,
-                filter=qdrant_filter,
             )
             logger.info(
                 "Dense fallback succeeded | results=%d",

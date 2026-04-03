@@ -288,7 +288,8 @@ class GeminiProvider(BaseLLM):
         temperature = kwargs.get("temperature", self._temperature)
         max_tokens = kwargs.get("max_tokens", self._max_tokens)
         response_mime_type = kwargs.get("response_mime_type")
-        thinking_budget = kwargs.get("thinking_budget")
+        # Default 0 = thinking disabled.
+        thinking_budget = kwargs.get("thinking_budget", 0)
 
         # Rebuild config only if overrides differ from defaults
         config_kwargs = dict(
@@ -298,13 +299,11 @@ class GeminiProvider(BaseLLM):
             automatic_function_calling=types.AutomaticFunctionCallingConfig(
                 disable=True
             ),
+            # Disable thinking by default — saves 8-11s per call for RAG queries
+            thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
         )
         if response_mime_type:
             config_kwargs["response_mime_type"] = response_mime_type
-        if thinking_budget is not None:
-            config_kwargs["thinking_config"] = types.ThinkingConfig(
-                thinking_budget=thinking_budget,
-            )
 
         generation_config = types.GenerateContentConfig(**config_kwargs)
 

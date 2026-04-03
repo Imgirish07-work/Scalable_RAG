@@ -337,9 +337,11 @@ class Chunker:
             too short   → token_count < min_chunk_tokens (default 20)
             boilerplate → standalone page numbers, copyright lines
 
-        Oversized chunks (> chunk_size) are kept with a warning.
-        Dropping them causes silent data loss — the embedding model
-        truncates gracefully, which is better than losing content.
+        Oversized chunks (> chunk_size) are re-split with the standard
+        recursive splitter before being kept. This recovers chunks that
+        the list/table splitters couldn't break (single item > chunk_size).
+        If re-splitting produces no improvement, the original is kept with
+        a warning to avoid silent data loss.
 
         Args:
             chunks: List of raw chunks from splitting.
@@ -366,19 +368,37 @@ class Chunker:
                 logger.debug("Filtered: too short (%d tokens)", token_count)
                 continue
 
-            # Warn but keep oversized chunks (data loss prevention)
-            if token_count > self._chunk_size:
-                logger.warning(
-                    "Oversized chunk kept (%d > %d tokens): source=%s",
-                    token_count,
-                    self._chunk_size,
-                    chunk.metadata.get("source", "?"),
-                )
-
             # Skip boilerplate content
             if _BOILERPLATE.match(content):
                 logger.debug("Filtered: boilerplate '%s'", content[:40])
                 continue
+
+            # Oversized: attempt re-split with standard recursive splitter
+            if token_count > self._chunk_size:
+                sub_chunks = self._splitter.split_documents([chunk])
+                if len(sub_chunks) > 1:
+                    # Re-split worked — apply basic quality filter to sub-chunks
+                    for sub in sub_chunks:
+                        sub_content = sub.page_content.strip()
+                        sub_tokens = self._count_tokens(sub_content)
+                        if (sub_content
+                                and sub_tokens >= self._min_chunk_tokens
+                                and not _BOILERPLATE.match(sub_content)):
+                            filtered.append(sub)
+                    logger.info(
+                        "Oversized chunk (%d tokens) re-split → %d sub-chunks: source=%s",
+                        token_count,
+                        len(sub_chunks),
+                        chunk.metadata.get("source", "?"),
+                    )
+                    continue
+                # Re-split ineffective (single indivisible block) — keep as-is
+                logger.warning(
+                    "Oversized chunk kept (%d > %d tokens) — re-split ineffective: source=%s",
+                    token_count,
+                    self._chunk_size,
+                    chunk.metadata.get("source", "?"),
+                )
 
             filtered.append(chunk)
 

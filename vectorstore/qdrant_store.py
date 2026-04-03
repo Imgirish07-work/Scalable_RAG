@@ -39,9 +39,13 @@ from qdrant_client.models import (
     Distance,
     Filter,
     FieldCondition,
+    Fusion,
+    FusionQuery,
     MatchAny,
     MatchValue,
     PayloadSchemaType,
+    Prefetch,
+    SparseVector,
     SparseVectorParams,
     VectorParams,
 )
@@ -345,9 +349,22 @@ class QdrantStore(BaseVectorStore):
         """
         if self._sparse_embeddings_instance is None:
             try:
-                logger.info("Initializing sparse embedding model: %s", self._SPARSE_MODEL)
+                kwargs: dict = {}
+                local_path = settings.SPLADE_LOCAL_PATH
+                if local_path:
+                    kwargs["specific_model_path"] = local_path
+                    logger.info(
+                        "Loading SPLADE from local path (skipping download): %s",
+                        local_path,
+                    )
+                else:
+                    logger.info(
+                        "Initializing sparse embedding model (requires network): %s",
+                        self._SPARSE_MODEL,
+                    )
                 self._sparse_embeddings_instance = FastEmbedSparse(
                     model_name=self._SPARSE_MODEL,
+                    **kwargs,
                 )
                 logger.info("Sparse embedding model initialized successfully")
             except Exception as e:
@@ -841,6 +858,111 @@ class QdrantStore(BaseVectorStore):
 
         except Exception as e:
             logger.exception("Error in similarity_search_with_vectors: %s", e)
+            raise
+
+    async def hybrid_search_with_vectors(
+        self,
+        query: str,
+        k: int,
+        filter_user_id: Optional[str] = None,
+    ) -> List[Document]:
+        """Hybrid RRF search returning top-k results WITH dense embedding vectors.
+
+        Uses Qdrant's native prefetch + RRF fusion in a single query call —
+        dense and sparse searches run in parallel inside Qdrant, results are
+        fused via Reciprocal Rank Fusion, and dense vectors are returned
+        alongside payloads for MMR diversity scoring.
+
+        Args:
+            query: Search query text.
+            k: Number of results to return.
+            filter_user_id: Filter to specific user's documents.
+
+        Returns:
+            List of Documents with clean page_content, relevance_score,
+            and dense embedding vector in metadata['vector'].
+
+        Raises:
+            Exception: If hybrid search fails.
+        """
+        if not query or not query.strip():
+            logger.warning("hybrid_search_with_vectors received empty query")
+            return []
+        if k <= 0:
+            return []
+
+        try:
+            # Dense query vector
+            embeddings_model = get_embeddings()
+            query_vector = await asyncio.to_thread(
+                embeddings_model.embed_query, query
+            )
+
+            # Sparse query vector from SPLADE/BM25
+            sparse_model = self._get_sparse_embeddings()
+            sparse_vector = await asyncio.to_thread(
+                sparse_model.embed_query, query
+            )
+
+            qdrant_filter = self._build_filter(filter_user_id)
+
+            # Fetch more candidates for each leg so RRF has enough to fuse
+            coarse_k = max(k * 3, 20)
+
+            response = await asyncio.to_thread(
+                self._client.query_points,
+                collection_name=self.collection_name,
+                prefetch=[
+                    Prefetch(
+                        query=query_vector,
+                        using=self._DENSE_VECTOR_NAME,
+                        limit=coarse_k,
+                    ),
+                    Prefetch(
+                        query=SparseVector(
+                            indices=sparse_vector.indices,
+                            values=sparse_vector.values,
+                        ),
+                        using=self._SPARSE_VECTOR_NAME,
+                        limit=coarse_k,
+                    ),
+                ],
+                query=FusionQuery(fusion=Fusion.RRF),
+                limit=k,
+                with_vectors=True,
+                with_payload=True,
+                query_filter=qdrant_filter,
+            )
+
+            docs = []
+            for point in response.points:
+                payload = point.payload or {}
+                page_content = payload.get("page_content", "")
+                metadata = dict(payload.get("metadata", {}))
+
+                metadata["relevance_score"] = round(float(point.score), 4)
+
+                # Extract dense vector for MMR inter-chunk diversity scoring
+                raw_vec = point.vector
+                if isinstance(raw_vec, dict):
+                    metadata["vector"] = raw_vec.get(self._DENSE_VECTOR_NAME)
+                else:
+                    metadata["vector"] = raw_vec
+
+                docs.append(Document(page_content=page_content, metadata=metadata))
+
+            docs = self._restore_original_content(docs)
+
+            logger.debug(
+                "hybrid_search_with_vectors: query='%s', results=%d",
+                query[:50],
+                len(docs),
+            )
+
+            return docs
+
+        except Exception as e:
+            logger.exception("Error in hybrid_search_with_vectors: %s", e)
             raise
 
     # Admin operations

@@ -56,23 +56,62 @@ class CrossEncoderReranker:
     pairs using a sequence classification forward pass. Scores are
     sigmoid-normalized to 0.0-1.0 range so they are comparable to
     the cosine similarity scores from Qdrant retrieval.
+
+    Inference backend (auto-detected at init):
+        1. ONNX Runtime — if onnx/model.onnx exists inside model_path (~3-6x faster).
+        2. PyTorch     — fallback when ONNX file is absent.
     """
 
     def __init__(self, model_path: str, batch_size: int = 32) -> None:
-        import torch
-        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        from transformers import AutoTokenizer
 
         self._batch_size = batch_size
-        self._device = "cpu"
 
         logger.info(f"Loading cross-encoder reranker from: {model_path}")
 
         self._tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+        onnx_path = Path(model_path)/"onnx" /"model.onnx"
+        if onnx_path.exists():
+            self._load_onnx(str(onnx_path))
+        else:
+            logger.warning(
+                "ONNX model not found at '%s' — falling back to PyTorch.", onnx_path
+            )
+            self._load_pytorch(model_path)
+
+        logger.info("CrossEncoderReranker loaded successfully.")
+
+    def _load_onnx(self, onnx_path: str) -> None:
+        import onnxruntime as ort
+
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        self._session = ort.InferenceSession(
+            onnx_path,
+            sess_options=sess_options,
+            providers=["CPUExecutionProvider"],
+        )
+        self._input_names = {inp.name for inp in self._session.get_inputs()}
+        self._output_name = self._session.get_outputs()[0].name
+        self._backend = "onnx"
+
+        logger.info(
+            "ONNX cross-encoder loaded | inputs=%s | output=%s",
+            self._input_names,
+            self._output_name,
+        )
+
+    def _load_pytorch(self, model_path: str) -> None:
+        import torch
+        from transformers import AutoModelForSequenceClassification
+
         self._model = AutoModelForSequenceClassification.from_pretrained(model_path)
         self._model.eval()
         self._torch = torch
-
-        logger.info("CrossEncoderReranker loaded successfully.")
+        self._backend = "pytorch"
+        logger.info("PyTorch cross-encoder loaded.")
 
     def rerank(
         self,
@@ -121,8 +160,9 @@ class CrossEncoderReranker:
         bottom_score = scored[min(top_k - 1, len(scored) - 1)][0] if scored else 0.0
 
         logger.info(
-            "CrossEncoder rerank complete | candidates=%d | top_k=%d | "
+            "CrossEncoder rerank complete | backend=%s | candidates=%d | top_k=%d | "
             "top_score=%.3f | bottom_score=%.3f",
+            self._backend,
             len(chunks),
             top_k,
             top_score,
@@ -137,6 +177,7 @@ class CrossEncoderReranker:
 
         Processes in batches to avoid OOM on long chunk lists.
         Applies sigmoid to convert raw logits to 0.0-1.0 range.
+        Dispatches to ONNX or PyTorch backend based on what was loaded.
 
         Args:
             pairs: List of [query, chunk_text] pairs.
@@ -144,6 +185,44 @@ class CrossEncoderReranker:
         Returns:
             List of float scores in the same order as pairs.
         """
+        if self._backend == "onnx":
+            return self._score_pairs_onnx(pairs)
+        return self._score_pairs_pytorch(pairs)
+
+    def _score_pairs_onnx(self, pairs: list[list[str]]) -> list[float]:
+        import numpy as np
+
+        all_scores: list[float] = []
+
+        for i in range(0, len(pairs), self._batch_size):
+            batch = pairs[i : i + self._batch_size]
+
+            encoded = self._tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="np",
+            )
+
+            feed = {k: v for k, v in encoded.items() if k in self._input_names}
+            outputs = self._session.run([self._output_name], feed)
+
+            logits = outputs[0].squeeze(-1)          # (batch,) or scalar
+            if logits.ndim == 0:
+                logits = logits[np.newaxis]           # ensure 1-D
+
+            # Sigmoid → 0.0-1.0
+            scores = (1.0 / (1.0 + np.exp(-logits))).tolist()
+
+            if isinstance(scores, float):
+                scores = [scores]
+
+            all_scores.extend(scores)
+
+        return all_scores
+
+    def _score_pairs_pytorch(self, pairs: list[list[str]]) -> list[float]:
         import torch
 
         all_scores: list[float] = []
@@ -162,7 +241,6 @@ class CrossEncoderReranker:
 
                 logits = self._model(**encoded).logits.squeeze(-1)
 
-                # Sigmoid → 0.0-1.0, comparable to cosine similarity scores
                 normalized = torch.sigmoid(logits).tolist()
 
                 if isinstance(normalized, float):
