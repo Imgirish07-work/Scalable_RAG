@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     USE_ONNX_EMBEDDINGS: bool = Field(default=True, env="USE_ONNX_EMBEDDINGS")
     EMBEDDING_BATCH_SIZE: int = Field(default=64, env="EMBEDDING_BATCH_SIZE")
 
+    # Ingestion batching — how many chunks to embed + upsert per Qdrant call.
+    # Dense embedding (ONNX) has its own inner batch of EMBEDDING_BATCH_SIZE.
+    # This outer batch controls memory pressure and enables progress logging.
+    # Rule of thumb: 100 for cloud Qdrant, 200-500 for local Qdrant.
+    INGESTION_BATCH_SIZE: int = Field(default=100, env="INGESTION_BATCH_SIZE")
+
     # SPLADE sparse embedding model local path
     # When set, fastembed skips HuggingFace download entirely (corporate network fix).
     # Download model.onnx + tokenizer files from:

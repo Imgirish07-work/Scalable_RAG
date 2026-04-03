@@ -376,7 +376,7 @@ class QdrantStore(BaseVectorStore):
     # Write — add documents
 
     async def add_documents(self, documents: List[Document]) -> List[str]:
-        """Embed and store documents in Qdrant.
+        """Embed and store documents in Qdrant with outer batch processing.
 
         Embedding strategy:
             Uses metadata['embed_content'] if available — this contains
@@ -386,14 +386,21 @@ class QdrantStore(BaseVectorStore):
             Original page_content is preserved in metadata['original_content']
             so similarity_search() can restore it for LLM consumption.
 
+        Batching strategy:
+            Dedup runs once upfront (single Qdrant scroll — efficient).
+            New docs are then split into INGESTION_BATCH_SIZE outer batches.
+            Each batch: embed (dense inner batch=EMBEDDING_BATCH_SIZE,
+            sparse inner batch=256) → upsert → log progress.
+            Batches already committed survive a failure in a later batch.
+
         Args:
             documents: List of Documents from Chunker.
 
         Returns:
-            List of assigned Qdrant point IDs.
+            List of assigned Qdrant point IDs (from all committed batches).
 
         Raises:
-            Exception: If embedding or storage fails.
+            Exception: If embedding or storage fails for any batch.
         """
         if not documents:
             logger.warning("add_documents received empty list")
@@ -404,7 +411,7 @@ class QdrantStore(BaseVectorStore):
             # then dedup, then swap to embed_content. Do NOT reorder these calls.
             enriched_docs = self._enrich_metadata(documents)
 
-            # Dedup — skip chunks already stored in Qdrant, saves all embedding work
+            # Dedup — one Qdrant scroll across all docs at once (cheapest approach)
             new_docs, skipped = await self._filter_existing_documents(enriched_docs)
 
             if not new_docs:
@@ -416,14 +423,61 @@ class QdrantStore(BaseVectorStore):
 
             embed_docs = self._prepare_for_embedding(new_docs)
 
-            # LangChain embeds page_content and stores everything
-            ids = await asyncio.to_thread(self._store.add_documents, embed_docs)
+            # ── Outer batch loop ─────────────────────────────────────────────
+            batch_size  = settings.INGESTION_BATCH_SIZE
+            total       = len(embed_docs)
+            all_ids: List[str] = []
+            failed_batches = 0
 
             logger.info(
-                "QdrantStore stored %d new chunks, %d duplicates skipped",
-                len(ids), skipped,
+                "Ingestion started: total=%d new chunks, batch_size=%d, "
+                "batches=%d, dedup_skipped=%d",
+                total,
+                batch_size,
+                -(-total // batch_size),   # ceiling division
+                skipped,
             )
-            return ids
+
+            for batch_start in range(0, total, batch_size):
+                batch      = embed_docs[batch_start : batch_start + batch_size]
+                batch_num  = batch_start // batch_size + 1
+                batch_end  = min(batch_start + batch_size, total)
+
+                try:
+                    batch_ids = await asyncio.to_thread(
+                        self._store.add_documents, batch
+                    )
+                    all_ids.extend(batch_ids)
+                    logger.info(
+                        "Ingestion batch %d/%d complete: chunks=%d/%d "
+                        "| committed=%d | remaining=%d",
+                        batch_num,
+                        -(-total // batch_size),
+                        batch_end,
+                        total,
+                        len(all_ids),
+                        total - batch_end,
+                    )
+                except Exception as batch_err:
+                    failed_batches += 1
+                    logger.error(
+                        "Ingestion batch %d/%d FAILED (chunks %d-%d): %s "
+                        "— %d chunks already committed are preserved.",
+                        batch_num,
+                        -(-total // batch_size),
+                        batch_start + 1,
+                        batch_end,
+                        batch_err,
+                        len(all_ids),
+                    )
+                    raise
+
+            logger.info(
+                "QdrantStore ingestion complete: stored=%d, dedup_skipped=%d",
+                len(all_ids),
+                skipped,
+            )
+            return all_ids
 
         except Exception as e:
             logger.exception("Error in add_documents: %s", e)
