@@ -545,6 +545,44 @@ class RedisCacheBackend(BaseCacheBackend):
             self._breaker.record_failure()
             return False
 
+    async def scan_recent_keys(self, limit: int = 100) -> list[str]:
+        """Return up to `limit` bare keys (without prefix) from Redis.
+
+        Used by CacheManager at startup to promote recent L2 entries
+        into L1 so the first queries after a restart get L1 speed.
+
+        Uses SCAN (non-blocking) instead of KEYS (blocks Redis).
+        Returns bare keys so the caller can pass them directly to get().
+
+        Args:
+            limit: Maximum number of keys to return.
+
+        Returns:
+            List of bare cache keys (prefix stripped). Empty on error.
+        """
+        if not self._initialized or self._client is None:
+            return []
+        if not self._breaker.allow_request():
+            return []
+
+        try:
+            keys: list[str] = []
+            async for full_key in self._client.scan_iter(
+                match=f"{self._prefix}*",
+                count=limit,
+            ):
+                bare = full_key[len(self._prefix):]
+                keys.append(bare)
+                if len(keys) >= limit:
+                    break
+            self._breaker.record_success()
+            logger.debug("scan_recent_keys: found %d keys (limit=%d)", len(keys), limit)
+            return keys
+        except Exception as e:
+            self._breaker.record_failure()
+            logger.warning("scan_recent_keys failed: %s", e)
+            return []
+
     async def close(self) -> None:
         """Graceful shutdown — close connection pool."""
         if self._client is not None:

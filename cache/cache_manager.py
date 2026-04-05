@@ -146,6 +146,10 @@ class CacheManager:
 
         await self._initialize_semantic()
 
+        # Promote recent L2 entries into L1 so the first queries after
+        # a restart get sub-millisecond L1 hits instead of Redis round-trips.
+        await self._promote_l2_to_l1()
+
         self._initialized = True
 
         strategy_name = "hybrid (exact + semantic)" if self._semantic_strategy else "exact"
@@ -222,6 +226,62 @@ class CacheManager:
                 "Semantic strategy init failed — falling back to exact-only: %s", e
             )
             self._semantic_strategy = None
+
+    async def _promote_l2_to_l1(self, limit: int = 100) -> None:
+        """Warm L1 from L2 at startup to eliminate post-restart cold cache.
+
+        Scans up to `limit` Redis keys, deserializes each entry, skips
+        expired ones, and writes the rest into L1 with remaining TTL.
+
+        Zero LLM cost — purely a Redis scan + memory write.
+        Non-fatal: any failure logs a warning and L1 starts cold instead.
+
+        Args:
+            limit: Max keys to promote. 100 covers typical workloads
+                   without making boot noticeably slower (~100-300ms).
+        """
+        if self._l2 is None:
+            return
+
+        try:
+            keys = await self._l2.scan_recent_keys(limit=limit)
+            if not keys:
+                logger.debug("L2→L1 promotion: L2 is empty, nothing to promote")
+                return
+
+            promoted = 0
+            skipped_expired = 0
+
+            for key in keys:
+                try:
+                    raw = await self._l2.get(key)
+                    if raw is None:
+                        continue
+
+                    entry = self._serializer.deserialize(raw)
+                    if entry.is_expired:
+                        skipped_expired += 1
+                        continue
+
+                    remaining_ttl = max(1, int(entry.ttl_seconds - entry.age_seconds))
+                    await self._l1.set(key, raw, remaining_ttl)
+                    promoted += 1
+
+                except Exception:
+                    continue  # corrupt entry — skip silently
+
+            logger.info(
+                "L2→L1 promotion complete: promoted=%d, expired_skipped=%d, scanned=%d",
+                promoted,
+                skipped_expired,
+                len(keys),
+            )
+
+        except Exception:
+            logger.warning(
+                "L2→L1 promotion failed — L1 starts cold",
+                exc_info=True,
+            )
 
     # Read path
     async def get(

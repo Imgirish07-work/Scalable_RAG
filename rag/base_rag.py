@@ -577,8 +577,6 @@ class BaseRAG(ABC):
                             "Fallback LLM returned empty response.",
                             details={"request_id": request.request_id},
                         )
-                    # Swap active LLM so cache key and model_name are correct
-                    self._llm = self._fallback_llm
                     return response
                 except RAGGenerationError:
                     raise

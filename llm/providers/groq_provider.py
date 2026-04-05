@@ -62,12 +62,16 @@ class GroqProvider(OpenAIProvider):
                 "Set GROQ_API_KEY in .env or pass api_key argument."
             )
 
+        # Use Groq-specific timeout — shorter than the global request_timeout
+        # so Zscaler-blocked requests fail fast and fall back to Gemini quickly.
+        resolved_timeout = timeout if timeout is not None else settings.GROQ_TIMEOUT
+
         super().__init__(
             api_key=resolved_key,
             model=model or settings.GROQ_MODEL_STRONG,
             temperature=temperature,
             max_tokens=max_tokens,
-            timeout=timeout,
+            timeout=resolved_timeout,
             base_url=_GROQ_BASE_URL,
         )
 

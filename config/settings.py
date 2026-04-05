@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     temperature: float = Field(default=0.7, env="TEMPERATURE")
     max_tokens: int = Field(default=2048, env="MAX_TOKENS")
     request_timeout: float = Field(default=30.0, env="REQUEST_TIMEOUT")
+    # Groq-specific timeout — shorter because Groq is blocked by Zscaler on corporate
+    # networks and should fail fast to trigger Gemini fallback without long delays.
+    GROQ_TIMEOUT: float = Field(default=5.0, env="GROQ_TIMEOUT")
 
     # Embedding Model
     embedding_model: str = Field(

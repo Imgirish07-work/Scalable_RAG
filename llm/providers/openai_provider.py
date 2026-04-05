@@ -271,15 +271,22 @@ class OpenAIProvider(BaseLLM):
 
         except Exception as exc:
             latency_ms = (time.monotonic() - start_time) * 1000
+            err_str = str(exc)
+            # Zscaler/proxy block pages return full HTML in the exception body.
+            # Log a clean message instead of dumping thousands of lines of HTML.
+            if "<html" in err_str.lower() or "<!doctype" in err_str.lower():
+                err_display = "blocked by corporate proxy/firewall (HTML response received)"
+            else:
+                err_display = err_str[:200]
             logger.error(
                 "OpenAI API call failed | latency_ms=%.1f | error=%s",
                 latency_ms,
-                str(exc),
+                err_display,
             )
             self._handle_error(exc)
             # _handle_error always raises, but this satisfies the type checker
             raise LLMProviderError(
-                f"Unhandled error in OpenAI provider. | {exc}"
+                f"Unhandled error in OpenAI provider. | {err_display}"
             )
 
     def _build_messages(self, prompt: str) -> list[dict]:
@@ -361,11 +368,19 @@ class OpenAIProvider(BaseLLM):
                 ) from error
 
         if isinstance(error, APIError):
+            err_str = str(error)
+            if "<html" in err_str.lower() or "<!doctype" in err_str.lower():
+                err_detail = "blocked by corporate proxy/firewall (HTML response received)"
+            else:
+                err_detail = err_str[:200]
             raise LLMProviderError(
-                f"OpenAI API error occurred. | {error}"
+                f"OpenAI API error occurred. | {err_detail}"
             ) from error
 
         # Unknown error — still wrap in our hierarchy
+        err_str = str(error)
+        if "<html" in err_str.lower() or "<!doctype" in err_str.lower():
+            err_str = "blocked by corporate proxy/firewall (HTML response received)"
         raise LLMProviderError(
-            f"Unexpected error from OpenAI provider. | {error}"
+            f"Unexpected error from OpenAI provider. | {err_str[:200]}"
         ) from error

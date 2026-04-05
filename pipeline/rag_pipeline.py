@@ -162,6 +162,10 @@ class RAGPipeline:
                 details={"error_type": type(exc).__name__, "error": str(exc)},
             ) from exc
 
+        # step 4 — warm-up: force all heavy models to load now so the
+        # first real user query pays zero cold-start penalty.
+        await self._run_warmup()
+
         elapsed = (time.perf_counter() - init_start) * 1000
         self._initialized = True
         logger.info("Pipeline initialized in %.1fms", elapsed)
@@ -190,6 +194,67 @@ class RAGPipeline:
 
         self._initialized = False
         logger.info("Pipeline shutdown complete")
+
+    async def _run_warmup(self) -> None:
+        """Force all heavy models to load before the first real query.
+
+        Runs four warm-up tasks in parallel so the total boot cost is
+        max(all four), not sum(all four). Each task is silenced with
+        return_exceptions=True — a warm-up failure never crashes the
+        pipeline; it just logs a warning and the first real query pays
+        that cold-start penalty instead.
+
+        What each task fixes:
+            embedding  — BGE ONNX model load + JIT kernel compile (3-8s)
+            splade     — SPLADE sparse model load via FastEmbed (1-3s)
+            qdrant     — HNSW graph segments loaded into RAM (200-500ms)
+            llm        — TCP + TLS handshake to provider API (500-1500ms)
+        """
+        warmup_start = time.perf_counter()
+        logger.info("Pipeline warm-up starting...")
+
+        async def _warmup_embeddings() -> None:
+            model = get_embeddings()
+            await asyncio.to_thread(model.embed_query, "warmup")
+            logger.debug("Warm-up: embedding model ready")
+
+        async def _warmup_splade() -> None:
+            if self._store and hasattr(self._store, "_get_sparse_embeddings"):
+                sparse = self._store._get_sparse_embeddings()
+                await asyncio.to_thread(sparse.embed, ["warmup"])
+                logger.debug("Warm-up: SPLADE model ready")
+
+        async def _warmup_qdrant() -> None:
+            if self._store:
+                try:
+                    await self._store.similarity_search_with_vectors("warmup", k=1)
+                    logger.debug("Warm-up: Qdrant HNSW index ready")
+                except Exception:
+                    pass  # empty collection is fine — HNSW still loads
+
+        async def _warmup_llm() -> None:
+            if self._llm:
+                try:
+                    await self._llm.generate("Reply with: OK", max_tokens=2)
+                    logger.debug("Warm-up: LLM connection pool ready")
+                except Exception:
+                    pass  # non-critical — connection opens on first real query
+
+        results = await asyncio.gather(
+            _warmup_embeddings(),
+            _warmup_splade(),
+            _warmup_qdrant(),
+            _warmup_llm(),
+            return_exceptions=True,
+        )
+
+        warmup_names = ["embedding", "splade", "qdrant", "llm"]
+        for name, result in zip(warmup_names, results):
+            if isinstance(result, Exception):
+                logger.warning("Warm-up failed for %s: %s", name, result)
+
+        elapsed = (time.perf_counter() - warmup_start) * 1000
+        logger.info("Pipeline warm-up complete in %.1fms", elapsed)
 
     async def health_check(self) -> PipelineHealthStatus:
         """Check health of all subsystems.
@@ -415,6 +480,20 @@ class RAGPipeline:
             )
             await ingest_store.initialize()
             point_ids = await ingest_store.add_documents(chunks)
+
+            # Post-ingest HNSW warmup — forces Qdrant to load the freshly
+            # built HNSW graph segments into RAM right now, so the first
+            # real query against this collection pays zero cold-start penalty.
+            # BGE and SPLADE are already hot (used above to encode chunks),
+            # so this one dummy search costs only the Qdrant RTT (~110ms).
+            if point_ids:  # only worth warming if new data was actually stored
+                try:
+                    await ingest_store.similarity_search_with_vectors("warmup", k=1)
+                    logger.debug(
+                        "Post-ingest HNSW warmup complete for collection='%s'", collection,
+                    )
+                except Exception:
+                    pass  # non-fatal — first query pays cold-start instead
 
             elapsed = (time.perf_counter() - ingest_start) * 1000
             stored = len(point_ids)

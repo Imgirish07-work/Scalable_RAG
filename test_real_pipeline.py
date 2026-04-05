@@ -94,6 +94,15 @@ async def run():
     ids = await store.add_documents(chunks)
     logger.info("Ingested %d chunks into Qdrant", len(ids))
 
+    # Post-ingest HNSW warmup — loads HNSW graph into RAM so Q1 pays no cold-start.
+    # Skipped when all chunks were duplicates (ids is empty) since data was already warm.
+    if ids:
+        try:
+            await store.similarity_search_with_vectors("warmup", k=1)
+            logger.info("Post-ingest HNSW warmup complete")
+        except Exception:
+            pass
+
     # ── 3. Cache ──────────────────────────────────────────────────────────────
     cache = CacheManager(settings)
     await cache.initialize()
@@ -108,6 +117,32 @@ async def run():
         logger.warning("Groq unavailable (%s) — using Gemini as primary", e)
         llm = LLMFactory.create_rate_limited("gemini")
         fallback_llm = None
+
+    # LLM pre-warm — opens TCP+TLS connection now so Q1 doesn't pay the cold-start penalty.
+    # This test builds components directly (no RAGPipeline.initialize()), so _run_warmup()
+    # never fires — we must warm up manually here.
+    async def _pre_warm_llm(provider, name):
+        try:
+            await provider.generate("Reply with: OK", max_tokens=2)
+            logger.info("LLM pre-warm complete: %s", name)
+        except Exception as exc:
+            err = str(exc)
+            if "<html" in err.lower() or "<!doctype" in err.lower():
+                # Zscaler/proxy intercepted the request and returned an HTML block page.
+                # Log a clean message — the full HTML body is not useful here.
+                logger.warning(
+                    "LLM pre-warm skipped (%s): blocked by corporate proxy/firewall "
+                    "(request to provider API was intercepted)", name,
+                )
+            else:
+                logger.warning("LLM pre-warm failed (%s): %s", name, err[:200])
+
+    # Only pre-warm the fallback (Gemini) — Groq is blocked by Zscaler on the
+    # corporate network so warming it would always fail and log a warning.
+    # Groq will attempt its own connection on the first real query and fall
+    # back to Gemini (already warm) if it fails.
+    if fallback_llm:
+        await _pre_warm_llm(fallback_llm, fallback_llm.model_name)
 
     rag = RAGFactory.create(
         "simple",
