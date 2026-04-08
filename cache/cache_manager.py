@@ -582,9 +582,11 @@ class CacheManager:
                 strategy=CacheStrategy.SEMANTIC,
                 latency_ms=latency,
                 cache_key=semantic_key,
+                sources=entry.sources,
                 cache_age_seconds=entry.age_seconds,
                 similarity_score=match.similarity_score,
                 semantic_tier=semantic_tier,
+                confidence_value=entry.confidence_value,
             )
 
         except CacheSerializationError:
