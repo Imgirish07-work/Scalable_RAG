@@ -87,6 +87,7 @@ class CrossEncoderReranker:
 
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.intra_op_num_threads = settings.RERANKER_INTRA_OP_THREADS
 
         self._session = ort.InferenceSession(
             onnx_path,
@@ -136,13 +137,20 @@ class CrossEncoderReranker:
 
         top_k = min(top_k, len(chunks))
 
+        # Pre-filter: drop bottom candidates by RRF rank before cross-encoding.
+        # Chunks arrive sorted by hybrid retrieval score (highest first).
+        # Bottom-N by hybrid rank have never been rescued by the cross-encoder
+        # in practice — both dense and sparse retrieval found them weak.
+        prefilter_n = min(settings.RERANKER_PREFILTER_TOP_N, len(chunks))
+        candidates = chunks[:prefilter_n]
+
         # Build (query, chunk_text) pairs for the cross-encoder
-        pairs = [[query, chunk.content] for chunk in chunks]
+        pairs = [[query, chunk.content] for chunk in candidates]
         scores = self._score_pairs(pairs)
 
         # Pair each chunk with its score, sort descending
         scored = sorted(
-            zip(scores, chunks),
+            zip(scores, candidates),
             key=lambda x: x[0],
             reverse=True,
         )
@@ -164,17 +172,17 @@ class CrossEncoderReranker:
         # Pipeline-level RERANKER_SCORE_THRESHOLD handles the "even top-1 is
         # irrelevant" case upstream in base_rag.py.
         top_score = scored[0][0] if scored else 0.0
-        candidates = scored[:top_k]
+        top_scored = scored[:top_k]
 
         dynamic_threshold = max(
             top_score * settings.RERANKER_SCORE_RATIO,
             settings.RERANKER_MIN_ABS_FLOOR,
         )
 
-        filtered = [(s, c) for s, c in candidates if s >= dynamic_threshold]
+        filtered = [(s, c) for s, c in top_scored if s >= dynamic_threshold]
         if not filtered:
-            filtered = [candidates[0]]
-        dropped = len(candidates) - len(filtered)
+            filtered = [top_scored[0]]
+        dropped = len(top_scored) - len(filtered)
 
         # Stamp each returned chunk with its cross-encoder score so the
         # pipeline can detect low-confidence retrievals upstream (base_rag.py).
@@ -188,11 +196,12 @@ class CrossEncoderReranker:
         bottom_score = filtered[-1][0] if filtered else 0.0
 
         logger.info(
-            "CrossEncoder rerank complete | backend=%s | candidates=%d | "
-            "top_k=%d | returned=%d | filtered_low=%d | "
+            "CrossEncoder rerank complete | backend=%s | fetched=%d | "
+            "prefiltered=%d | top_k=%d | returned=%d | filtered_low=%d | "
             "threshold=%.3f | top_score=%.3f | bottom_score=%.3f",
             self._backend,
             len(chunks),
+            len(candidates),
             top_k,
             len(result),
             dropped,

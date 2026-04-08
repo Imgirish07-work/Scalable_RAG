@@ -107,10 +107,19 @@ class Settings(BaseSettings):
     # A chunk is kept only if: score >= top_score * RATIO  AND  score >= MIN_ABS_FLOOR
     # RATIO=0.4 means a chunk must score at least 40% of the best chunk's score.
     # Example: top=0.984 → threshold=0.394. top=0.200 → threshold=0.100 (floor kicks in).
-    RERANKER_SCORE_RATIO: float = Field(default=0.6, env="RERANKER_SCORE_RATIO")
+    RERANKER_SCORE_RATIO: float = Field(default=0.7, env="RERANKER_SCORE_RATIO")
     # Absolute floor — safety net when all chunks score low (poor retrieval).
     # Prevents keeping chunks that score above ratio but are still near-zero quality.
     RERANKER_MIN_ABS_FLOOR: float = Field(default=0.1, env="RERANKER_MIN_ABS_FLOOR")
+    # Pre-filter: keep only top-N candidates by RRF rank before cross-encoding.
+    # Drops bottom (RERANKER_COARSE_TOP_K - RERANKER_PREFILTER_TOP_N) chunks that
+    # ranked last in both dense + sparse retrieval — cross-encoder has never rescued
+    # these in practice. Saves N forward passes. Set equal to RERANKER_COARSE_TOP_K
+    # to disable pre-filtering.
+    RERANKER_PREFILTER_TOP_N: int = Field(default=8, env="RERANKER_PREFILTER_TOP_N")
+    # ONNX Runtime intra-op thread count for the cross-encoder session.
+    # 0 = let ORT decide (usually 1). 4-6 optimal for i5/i7 CPUs.
+    RERANKER_INTRA_OP_THREADS: int = Field(default=4, env="RERANKER_INTRA_OP_THREADS")
 
     # Cache Settings
     cache_enabled: bool = Field(default=True, env="CACHE_ENABLED")

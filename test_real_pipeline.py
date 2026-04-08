@@ -31,12 +31,20 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 PDF_PATH = "./data/sample_docs/Attention is all you need.pdf"
-QUERIES  = [
-    "what is the transformer architecture?",
-    "how does multi-head attention work?",
-    "what are the results on WMT translation tasks?",
-]
+# Run 1: originals — populate cache with query_text stored
+# Run 2: paraphrases — should hit semantic cache on startup
+# QUERIES = [
+#     "what is the transformer architecture?",
+#     "how does multi-head attention work?",
+#     "what are the results on WMT translation tasks?",
+# ]
 
+# Paraphrases — testing semantic cache cross-restart (Run 2):
+QUERIES = [
+    "explain the transformer model architecture",
+    "describe how multi-headed attention works",
+    "what BLEU scores did the transformer get on WMT?",
+]
 
 def _print_response(response, query_num: int) -> None:
     # Build the label from the actual response — not from pre-run assumptions.

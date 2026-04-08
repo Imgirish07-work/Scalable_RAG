@@ -76,6 +76,17 @@ class Chunker:
             separators=["\nclass ", "\ndef ", "\nasync def ", "\n\n", "\n", " ", ""],
         )
 
+        # Re-split splitter — zero overlap to prevent duplicate content in sub-chunks.
+        # Used ONLY in _filter_chunks() when an oversized chunk needs splitting.
+        # Must NOT use self._splitter (overlap=100) there — adjacent sub-chunks would
+        # share 100 tokens, causing the LLM to see the same content twice.
+        self._resplit_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+            encoding_name="cl100k_base",
+            chunk_size=self._chunk_size,
+            chunk_overlap=0,
+            separators=["\n\n", "\n", ". ", " ", ""],
+        )
+
         # RLM splitter for recursive processing (Strategy D)
         self._rlm_splitter = RecursiveCharacterTextSplitter(
             chunk_size=settings.max_tokens_per_chunk,
@@ -373,9 +384,11 @@ class Chunker:
                 logger.debug("Filtered: boilerplate '%s'", content[:40])
                 continue
 
-            # Oversized: attempt re-split with standard recursive splitter
+            # Oversized: attempt re-split with zero-overlap splitter.
+            # _resplit_splitter uses chunk_overlap=0 — prevents adjacent sub-chunks
+            # sharing content that would make the LLM see the same text twice.
             if token_count > self._chunk_size:
-                sub_chunks = self._splitter.split_documents([chunk])
+                sub_chunks = self._resplit_splitter.split_documents([chunk])
                 if len(sub_chunks) > 1:
                     # Re-split worked — apply basic quality filter to sub-chunks
                     for sub in sub_chunks:

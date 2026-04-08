@@ -67,6 +67,7 @@ class OpenAIProvider(BaseLLM):
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
         base_url: Optional[str] = None,
+        max_retries: Optional[int] = None,
     ) -> None:
         """Initialize OpenAI provider.
 
@@ -78,6 +79,9 @@ class OpenAIProvider(BaseLLM):
             timeout: Request timeout in seconds. Falls back to settings.
             base_url: Optional API base URL. Used by OpenAI-compatible providers
                 (e.g. Groq). None uses the default OpenAI endpoint.
+            max_retries: Max automatic retries on transient errors. Defaults to
+                the httpx client default (2). Pass 1 for fast-fail providers like
+                Groq where retries burn through a tight per-request timeout budget.
 
         Raises:
             LLMAuthError: If no API key is available from args or settings.
@@ -104,6 +108,8 @@ class OpenAIProvider(BaseLLM):
         client_kwargs = {"api_key": self._api_key, "timeout": self._timeout}
         if base_url is not None:
             client_kwargs["base_url"] = base_url
+        if max_retries is not None:
+            client_kwargs["max_retries"] = max_retries
         self._client = AsyncOpenAI(**client_kwargs)
 
         # Initialize tiktoken encoder for local token counting

@@ -150,6 +150,10 @@ class CacheManager:
         # a restart get sub-millisecond L1 hits instead of Redis round-trips.
         await self._promote_l2_to_l1()
 
+        # Seed semantic Qdrant from L2 entries so paraphrase queries hit
+        # the semantic cache immediately after restart (not just within session).
+        await self._seed_semantic_from_l2()
+
         self._initialized = True
 
         strategy_name = "hybrid (exact + semantic)" if self._semantic_strategy else "exact"
@@ -207,16 +211,15 @@ class CacheManager:
             threshold_high = getattr(
                 self._settings, "CACHE_SEMANTIC_THRESHOLD_HIGH", 0.93
             )
-            qdrant_url = getattr(self._settings, "QDRANT_URL", "")
-            qdrant_api_key = getattr(self._settings, "QDRANT_API_KEY", "")
-
+            # Always use in-memory Qdrant for the semantic cache.
+            # QDRANT_URL is the RAG document corpus (cloud, ~200ms RTT) — it must
+            # NOT be reused here. The semantic cache stores query→key mappings only
+            # (small, ephemeral, ~KB each). In-memory is faster and correct.
             self._semantic_strategy = SemanticCacheStrategy(
                 collection_name=collection,
                 threshold_direct=threshold_direct,
                 threshold_high=threshold_high,
-                qdrant_url=qdrant_url,
-                qdrant_api_key=qdrant_api_key,
-                use_memory=not bool(qdrant_url),
+                use_memory=True,
             )
             await self._semantic_strategy.initialize()
             logger.info("Semantic strategy initialized: collection='%s'", collection)
@@ -282,6 +285,57 @@ class CacheManager:
                 "L2→L1 promotion failed — L1 starts cold",
                 exc_info=True,
             )
+
+    async def _seed_semantic_from_l2(self) -> None:
+        """Seed semantic Qdrant from L2 entries after restart.
+
+        Re-embeds query_text from each non-expired L2 entry using BGE and
+        upserts the vectors into the in-memory Qdrant collection, so that
+        paraphrase queries can hit the semantic cache immediately rather than
+        only within the session that originally cached the answer.
+
+        Silently skips entries that pre-date the query_text field (None).
+        """
+        if self._semantic_strategy is None or self._l2 is None:
+            return
+
+        try:
+            keys = await self._l2.scan_recent_keys(limit=100)
+            if not keys:
+                return
+
+            seeded = 0
+            skipped = 0
+            for key in keys:
+                try:
+                    raw = await self._l2.get(key)
+                    if raw is None:
+                        continue
+                    entry = self._serializer.deserialize(raw)
+                    if entry.is_expired or entry.query_text is None:
+                        skipped += 1
+                        continue
+                    await self._semantic_strategy.index_entry(
+                        query=entry.query_text,
+                        cache_key=entry.cache_key,
+                        model_name=entry.model_name,
+                        temperature=entry.temperature,
+                    )
+                    seeded += 1
+                except Exception as exc:
+                    logger.debug(
+                        "Semantic seeding: skipped key=%s | %s", key[:16], exc
+                    )
+                    continue  # corrupt or incompatible entry — skip silently
+
+            logger.info(
+                "Semantic Qdrant seeded from L2: seeded=%d, skipped=%d (no query_text)",
+                seeded,
+                skipped,
+            )
+
+        except Exception:
+            logger.warning("Semantic seeding failed — semantic cache starts cold", exc_info=True)
 
     # Read path
     async def get(
@@ -624,6 +678,7 @@ class CacheManager:
                 response=response,
                 cache_key=key,
                 query_hash=self._exact_strategy.get_query_hash(query),
+                query_text=self._normalizer.normalize(query),
                 created_at=now,
                 expires_at=now + timedelta(seconds=ttl),
                 ttl_seconds=ttl,

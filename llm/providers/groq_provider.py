@@ -73,6 +73,7 @@ class GroqProvider(OpenAIProvider):
             max_tokens=max_tokens,
             timeout=resolved_timeout,
             base_url=_GROQ_BASE_URL,
+            max_retries=1,  # 1 retry = 2 attempts max (default=2 → 3 attempts × 5s = 16.5s)
         )
 
         logger.info(

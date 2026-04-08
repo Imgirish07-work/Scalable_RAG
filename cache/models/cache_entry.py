@@ -14,7 +14,7 @@ Sync — pure Pydantic data class, no I/O."""
 
 
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel, Field, model_validator
 from llm import LLMResponse
 
@@ -41,6 +41,11 @@ class CacheEntry(BaseModel):
         ...,
         min_length=1,
         description="SHA-256 of normalized query for dedup matching",
+    )
+
+    query_text: Optional[str] = Field(
+        default=None,
+        description="Normalized query text — used to reseed semantic Qdrant on restart",
     )
 
     created_at: datetime = Field(
