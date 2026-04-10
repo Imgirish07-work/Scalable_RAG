@@ -20,6 +20,50 @@ if settings.embedding_model_local_path:
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
+
+def _resolve_providers() -> list:
+    """
+    Detect GPU availability once at module load and return the ONNX Runtime
+    execution provider list in priority order.
+
+    ONNX Runtime iterates providers left-to-right and uses the first one that
+    is both installed and functional — CPUExecutionProvider is always the
+    safe fallback.
+
+    GPU options:
+        gpu_mem_limit          — caps VRAM at 2 GB; leaves headroom for SPLADE.
+        arena_extend_strategy  — pre-allocates in power-of-two chunks (fewer
+                                 small allocations → lower latency variance).
+        cudnn_conv_algo_search — EXHAUSTIVE finds the fastest cuDNN kernel on
+                                 first run and caches it for subsequent calls.
+        do_copy_in_default_stream — keeps host↔device transfers on the default
+                                    CUDA stream to avoid sync overhead.
+    """
+    import onnxruntime as ort
+
+    if "CUDAExecutionProvider" not in ort.get_available_providers():
+        logger.info("ONNX Runtime: CPUExecutionProvider (no CUDA GPU detected)")
+        return ["CPUExecutionProvider"]
+
+    logger.info("ONNX Runtime: CUDAExecutionProvider selected — GPU inference enabled")
+    return [
+        (
+            "CUDAExecutionProvider",
+            {
+                "device_id": 0,
+                "gpu_mem_limit": 2 * 1024 ** 3,
+                "arena_extend_strategy": "kNextPowerOfTwo",
+                "cudnn_conv_algo_search": "EXHAUSTIVE",
+                "do_copy_in_default_stream": True,
+            },
+        ),
+        "CPUExecutionProvider",
+    ]
+
+
+# Resolved once per process — shared by every ONNX InferenceSession in this pipeline.
+_ONNX_PROVIDERS: list = _resolve_providers()
+
 # Dimension map — avoids recomputing on every collection creation
 _EMBEDDING_DIM_MAP: dict[str, int] = {
     "BAAI/bge-small-en-v1.5"                 : 384,
@@ -93,7 +137,7 @@ class ONNXEmbeddings(Embeddings):
         self._session = ort.InferenceSession(
             onnx_path,
             sess_options=sess_options,
-            providers=["CPUExecutionProvider"],
+            providers=_ONNX_PROVIDERS,
         )
         self._tokenizer = AutoTokenizer.from_pretrained(model_path)
 
@@ -103,7 +147,8 @@ class ONNXEmbeddings(Embeddings):
 
         logger.info(
             f"ONNX model loaded successfully. "
-            f"Inputs: {self._input_names} | Output: {self._output_name}"
+            f"Inputs: {self._input_names} | Output: {self._output_name} | "
+            f"Provider: {self._session.get_providers()[0]}"
         )
 
 

@@ -58,7 +58,7 @@ from qdrant_client.models import (
 from config.settings import settings
 from utils.helpers import hash_text
 from utils.logger import get_logger
-from vectorstore.embeddings import get_embedding_dimension, get_embeddings
+from vectorstore.embeddings import get_embedding_dimension, get_embeddings, _ONNX_PROVIDERS
 from vectorstore.base_store import BaseVectorStore
 
 logger = get_logger(__name__)
@@ -449,6 +449,7 @@ class QdrantStore(BaseVectorStore):
                 self._sparse_embeddings_instance = FastEmbedSparse(
                     model_name=self._SPARSE_MODEL,
                     threads=settings.SPLADE_INTRA_OP_THREADS,
+                    providers=_ONNX_PROVIDERS,
                     **kwargs,
                 )
                 logger.info("Sparse embedding model initialized successfully")
