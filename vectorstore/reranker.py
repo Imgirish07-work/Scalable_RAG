@@ -5,7 +5,7 @@ Design:
     - Takes coarse retrieval results (top 10) and reranks them using a
       cross-encoder model that reads query + chunk together via full attention.
     - Returns the top_k highest-scoring chunks with updated relevance scores.
-    - Runs entirely locally on CPU — no API calls, no extra cost.
+    - Runs entirely locally (GPU if available, CPU fallback) — no API calls, no extra cost.
 
 Why cross-encoder beats bi-encoder for reranking:
     - Bi-encoder (BGE): embeds query and chunk independently, compares vectors.
@@ -30,6 +30,7 @@ from typing import List
 from rag.models.rag_response import RetrievedChunk
 from config.settings import settings
 from utils.logger import get_logger
+from vectorstore.embeddings import _ONNX_PROVIDERS
 
 logger = get_logger(__name__)
 
@@ -92,27 +93,30 @@ class CrossEncoderReranker:
         self._session = ort.InferenceSession(
             onnx_path,
             sess_options=sess_options,
-            providers=["CPUExecutionProvider"],
+            providers=_ONNX_PROVIDERS,
         )
         self._input_names = {inp.name for inp in self._session.get_inputs()}
         self._output_name = self._session.get_outputs()[0].name
         self._backend = "onnx"
 
         logger.info(
-            "ONNX cross-encoder loaded | inputs=%s | output=%s",
+            "ONNX cross-encoder loaded | inputs=%s | output=%s | provider=%s",
             self._input_names,
             self._output_name,
+            self._session.get_providers()[0],
         )
 
     def _load_pytorch(self, model_path: str) -> None:
         import torch
         from transformers import AutoModelForSequenceClassification
 
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
         self._model = AutoModelForSequenceClassification.from_pretrained(model_path)
         self._model.eval()
+        self._model.to(self._device)
         self._torch = torch
         self._backend = "pytorch"
-        logger.info("PyTorch cross-encoder loaded.")
+        logger.info("PyTorch cross-encoder loaded | device=%s", self._device)
 
     def rerank(
         self,
@@ -279,6 +283,7 @@ class CrossEncoderReranker:
                     max_length=512,
                     return_tensors="pt",
                 )
+                encoded = {k: v.to(self._device) for k, v in encoded.items()}
 
                 logits = self._model(**encoded).logits.squeeze(-1)
 
