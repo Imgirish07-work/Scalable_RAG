@@ -449,6 +449,7 @@ class QdrantStore(BaseVectorStore):
                     )
                 self._sparse_embeddings_instance = FastEmbedSparse(
                     model_name=self._SPARSE_MODEL,
+                    batch_size=settings.SPLADE_BATCH_SIZE,
                     threads=settings.SPLADE_INTRA_OP_THREADS,
                     providers=_ONNX_PROVIDERS,
                     **kwargs,

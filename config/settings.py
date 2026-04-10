@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     # Controls CPU cores used per SPLADE batch — default ORT behaviour is 1 thread.
     # i5-1345U (2P+8E): 6 is optimal. Set 0 to use all logical cores.
     SPLADE_INTRA_OP_THREADS: int = Field(default=6, env="SPLADE_INTRA_OP_THREADS")
+    # SPLADE ONNX batch size — controls texts per single ONNX forward pass.
+    # MLM head output shape: (batch, seq_len, vocab_size) = (batch, 512, 30522).
+    #   batch=100 → 6.27 GB — exceeds 4 GB VRAM → silent CPU fallback (~53s/batch)
+    #   batch=16  → 1.00 GB — fits in 4 GB VRAM → full GPU execution (~2-4s/batch)
+    # Increase to 32 on GPUs with 8+ GB VRAM.
+    SPLADE_BATCH_SIZE: int = Field(default=16, env="SPLADE_BATCH_SIZE")
 
     # Document cleaner settings
     min_chars_per_page : int = Field(default=50, env="MIN_CHARS_PER_PAGE")
