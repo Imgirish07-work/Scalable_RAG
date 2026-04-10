@@ -31,13 +31,21 @@ def _resolve_providers() -> list:
     safe fallback.
 
     GPU options:
-        gpu_mem_limit          — caps VRAM at 2 GB; leaves headroom for SPLADE.
-        arena_extend_strategy  — pre-allocates in power-of-two chunks (fewer
-                                 small allocations → lower latency variance).
-        cudnn_conv_algo_search — EXHAUSTIVE finds the fastest cuDNN kernel on
-                                 first run and caches it for subsequent calls.
-        do_copy_in_default_stream — keeps host↔device transfers on the default
-                                    CUDA stream to avoid sync overhead.
+        arena_extend_strategy  — grows the BFC Arena in power-of-two chunks,
+                                 reducing allocation fragmentation and latency
+                                 variance under sustained inference load.
+        cudnn_conv_algo_search — EXHAUSTIVE benchmarks every cuDNN kernel on
+                                 first use and caches the fastest one; pays a
+                                 one-time cost at startup for lower per-call
+                                 latency afterwards.
+        do_copy_in_default_stream — pins host↔device transfers to the default
+                                    CUDA stream, avoiding cross-stream sync
+                                    overhead.
+
+    Note: gpu_mem_limit is intentionally omitted (ONNX Runtime default = 0,
+    meaning no cap). A fixed cap causes OOM when the BERT attention matrix
+    (batch × heads × seq² × 4 bytes) plus cuDNN workspace exceeds the limit.
+    ONNX Runtime's BFC Arena manages VRAM on demand up to physical capacity.
     """
     import onnxruntime as ort
 
@@ -51,7 +59,6 @@ def _resolve_providers() -> list:
             "CUDAExecutionProvider",
             {
                 "device_id": 0,
-                "gpu_mem_limit": 2 * 1024 ** 3,
                 "arena_extend_strategy": "kNextPowerOfTwo",
                 "cudnn_conv_algo_search": "EXHAUSTIVE",
                 "do_copy_in_default_stream": True,
