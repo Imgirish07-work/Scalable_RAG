@@ -452,7 +452,19 @@ class QdrantStore(BaseVectorStore):
                     providers=_ONNX_PROVIDERS,
                     **kwargs,
                 )
-                logger.info("Sparse embedding model initialized successfully")
+
+                # Log which ONNX execution provider SPLADE is actually using.
+                # FastEmbedSparse._model → SparseTextEmbedding.model → SpladePP.model → ort.InferenceSession
+                try:
+                    splade_session = self._sparse_embeddings_instance._model.model.model
+                    active_providers = splade_session.get_providers()
+                    logger.info(
+                        "SPLADE sparse model loaded | requested=%s | active=%s",
+                        [p if isinstance(p, str) else p[0] for p in _ONNX_PROVIDERS],
+                        active_providers,
+                    )
+                except Exception:
+                    logger.info("Sparse embedding model initialized successfully")
             except Exception as e:
                 logger.exception("Error initializing sparse embeddings: %s", e)
                 raise
