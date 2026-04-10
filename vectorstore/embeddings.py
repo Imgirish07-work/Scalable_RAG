@@ -34,10 +34,13 @@ def _resolve_providers() -> list:
         arena_extend_strategy  — grows the BFC Arena in power-of-two chunks,
                                  reducing allocation fragmentation and latency
                                  variance under sustained inference load.
-        cudnn_conv_algo_search — EXHAUSTIVE benchmarks every cuDNN kernel on
-                                 first use and caches the fastest one; pays a
-                                 one-time cost at startup for lower per-call
-                                 latency afterwards.
+        cudnn_conv_algo_search — HEURISTIC selects the cuDNN convolution kernel
+                                 via heuristics with no benchmarking overhead.
+                                 EXHAUSTIVE was avoided because NLP batches have
+                                 variable sequence lengths (different padding per
+                                 batch) → each unique (batch, seq_len) shape
+                                 triggers a fresh 40-50s benchmark, making
+                                 ingestion slower than CPU.
         do_copy_in_default_stream — pins host↔device transfers to the default
                                     CUDA stream, avoiding cross-stream sync
                                     overhead.
@@ -60,7 +63,7 @@ def _resolve_providers() -> list:
             {
                 "device_id": 0,
                 "arena_extend_strategy": "kNextPowerOfTwo",
-                "cudnn_conv_algo_search": "EXHAUSTIVE",
+                "cudnn_conv_algo_search": "HEURISTIC",
                 "do_copy_in_default_stream": True,
             },
         ),
