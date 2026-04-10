@@ -489,8 +489,8 @@ class QdrantStore(BaseVectorStore):
         Batching strategy:
             Dedup runs once upfront (single Qdrant scroll — efficient).
             New docs are then split into INGESTION_BATCH_SIZE outer batches.
-            Each batch: embed (dense inner batch=EMBEDDING_BATCH_SIZE,
-            sparse inner batch=256) → upsert → log progress.
+            Each batch: LangChain sub-batches into SPLADE_BATCH_SIZE chunks
+            so the SPLADE MLM tensor fits within VRAM → upsert → log progress.
             Batches already committed survive a failure in a later batch.
 
         Args:
@@ -544,42 +544,31 @@ class QdrantStore(BaseVectorStore):
                 batch_end  = min(batch_start + batch_size, total)
 
                 try:
-                    # Pre-time embedding to isolate embed vs upsert latency.
-                    # Runs before add_documents so LangChain's internal call
-                    # benefits from ONNX session warm cache on re-use.
-                    _texts = [d.page_content for d in batch]
                     _t0 = time.perf_counter()
-                    await asyncio.to_thread(
-                        get_embeddings().embed_documents, _texts
+                    # Pass batch_size=SPLADE_BATCH_SIZE so LangChain's internal
+                    # _generate_rest_batches sends at most SPLADE_BATCH_SIZE texts
+                    # per embed_documents call.  This keeps the SPLADE MLM output
+                    # tensor within VRAM:
+                    #   SPLADE_BATCH_SIZE=16 → (16, 512, 30522)×4B = 1.0 GB < 4 GB VRAM
+                    #   default 64           → (64, 512, 30522)×4B = 4.0 GB — borderline
+                    #   INGESTION_BATCH_SIZE=100 → 6.27 GB — exceeds VRAM, silent CPU fallback
+                    batch_ids = await asyncio.to_thread(
+                        self._store.add_documents,
+                        batch,
+                        batch_size=settings.SPLADE_BATCH_SIZE,
                     )
                     _t1 = time.perf_counter()
-                    await asyncio.to_thread(
-                        self._get_sparse_embeddings().embed_documents, _texts
-                    )
-                    _t2 = time.perf_counter()
-                    logger.debug(
-                        "Batch %d embed timing: dense=%.2fs | sparse=%.2fs",
-                        batch_num, _t1 - _t0, _t2 - _t1,
-                    )
-
-                    _t3 = time.perf_counter()
-                    batch_ids = await asyncio.to_thread(
-                        self._store.add_documents, batch
-                    )
-                    _t4 = time.perf_counter()
                     all_ids.extend(batch_ids)
                     logger.info(
                         "Ingestion batch %d/%d complete: chunks=%d/%d "
-                        "| committed=%d | remaining=%d"
-                        " | embed=%.1fs | upsert=%.1fs",
+                        "| committed=%d | remaining=%d | elapsed=%.1fs",
                         batch_num,
                         -(-total // batch_size),
                         batch_end,
                         total,
                         len(all_ids),
                         total - batch_end,
-                        _t2 - _t0,         # total embed time (dense + sparse)
-                        _t4 - _t3,         # upsert time (LangChain re-embeds + upsert)
+                        _t1 - _t0,
                     )
                 except Exception as batch_err:
                     failed_batches += 1
