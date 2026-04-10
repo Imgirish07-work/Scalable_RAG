@@ -164,8 +164,12 @@ class ContextAssembler:
             tokens_used += total_addition
             included_count += 1
 
-            # Create new chunk with used_in_context=True
-            # RetrievedChunk is frozen, so we rebuild with updated flag
+            # Create new chunk with used_in_context=True.
+            # RetrievedChunk is frozen, so we rebuild with the updated flag.
+            # vector and reranker_score are internal pipeline fields (exclude=True
+            # on the model) — they must be forwarded explicitly so that:
+            #   - MMR in a second-pass rank() can still use pre-fetched vectors
+            #   - _compute_confidence() in base_rag can use reranker scores
             updated_chunk = RetrievedChunk(
                 content=chunk.content,
                 source_file=chunk.source_file,
@@ -176,6 +180,8 @@ class ContextAssembler:
                 content_type=chunk.content_type,
                 used_in_context=True,
                 metadata=chunk.metadata,
+                vector=chunk.vector,
+                reranker_score=chunk.reranker_score,
             )
             updated_chunks.append(updated_chunk)
 

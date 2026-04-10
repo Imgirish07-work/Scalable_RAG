@@ -38,15 +38,55 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _resolve_reranker_path() -> str:
-    """Resolve local reranker model path relative to project root."""
-    local_path = settings.RERANKER_MODEL_PATH
-    if local_path:
-        absolute = (_PROJECT_ROOT / local_path).resolve()
-        if absolute.is_dir():
-            logger.info(f"Using local reranker model from: {absolute}")
-            return str(absolute)
-        logger.warning(f"Reranker path '{absolute}' not found.")
-    return local_path or ""
+    """Resolve the reranker model path to use at runtime.
+
+    Selection priority:
+        1. CUDA-native export (RERANKER_MODEL_PATH_CUDA) — when CUDA is
+           available and the directory exists. No Memcpy nodes, ~3x faster.
+        2. Standard export (RERANKER_MODEL_PATH) — device-agnostic fallback.
+           Works on both GPU (with Memcpy overhead) and CPU-only machines.
+
+    Returns:
+        Absolute path string to the selected model directory, or empty
+        string if neither path resolves to an existing directory.
+    """
+    import torch
+
+    cuda_available = torch.cuda.is_available()
+
+    # Attempt CUDA-native path first when GPU is present
+    if cuda_available and settings.RERANKER_MODEL_PATH_CUDA:
+        cuda_absolute = (_PROJECT_ROOT / settings.RERANKER_MODEL_PATH_CUDA).resolve()
+        if cuda_absolute.is_dir():
+            logger.info(
+                "Reranker: CUDA-native model selected | path=%s", cuda_absolute
+            )
+            return str(cuda_absolute)
+        logger.warning(
+            "Reranker: CUDA path configured but not found — "
+            "falling back to standard model | path=%s",
+            cuda_absolute,
+        )
+
+    # Standard path — works on CPU and GPU (with Memcpy if GPU)
+    standard_path = settings.RERANKER_MODEL_PATH
+    if standard_path:
+        standard_absolute = (_PROJECT_ROOT / standard_path).resolve()
+        if standard_absolute.is_dir():
+            if cuda_available:
+                logger.info(
+                    "Reranker: standard model selected (CUDA available but "
+                    "no CUDA export found) | path=%s", standard_absolute
+                )
+            else:
+                logger.info(
+                    "Reranker: standard model selected (CPU mode) | path=%s",
+                    standard_absolute,
+                )
+            return str(standard_absolute)
+        logger.warning("Reranker: standard path not found | path=%s", standard_absolute)
+
+    return ""
 
 
 class CrossEncoderReranker:
@@ -72,12 +112,22 @@ class CrossEncoderReranker:
 
         self._tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-        onnx_path = Path(model_path)/"onnx" /"model.onnx"
-        if onnx_path.exists():
+        # Check two ONNX locations:
+        #   1. {model_path}/onnx/model.onnx — original convention (model dir with
+        #      ONNX in a subdirectory, as used by the standard model export).
+        #   2. {model_path}/model.onnx — optimum-cli direct export convention
+        #      (used when exporting with --device cuda to a dedicated directory).
+        _root = Path(model_path)
+        onnx_path = next(
+            (p for p in (_root / "onnx" / "model.onnx", _root / "model.onnx")
+             if p.exists()),
+            None,
+        )
+        if onnx_path is not None:
             self._load_onnx(str(onnx_path))
         else:
             logger.warning(
-                "ONNX model not found at '%s' — falling back to PyTorch.", onnx_path
+                "ONNX model not found in '%s' — falling back to PyTorch.", model_path
             )
             self._load_pytorch(model_path)
 

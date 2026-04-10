@@ -104,6 +104,11 @@ class Settings(BaseSettings):
     # Reranker Settings
     RERANKER_ENABLED: bool = Field(default=False, env="RERANKER_ENABLED")
     RERANKER_MODEL_PATH: str = Field(default="", env="RERANKER_MODEL_PATH")
+    # CUDA-native ONNX export — no Memcpy nodes, ~3x faster than standard export.
+    # Generate with: optimum-cli export onnx --device cuda --optimize O3
+    # Auto-selected when CUDA is available and this path exists.
+    # Falls back to RERANKER_MODEL_PATH on CPU-only machines.
+    RERANKER_MODEL_PATH_CUDA: str = Field(default="", env="RERANKER_MODEL_PATH_CUDA")
     RERANKER_BATCH_SIZE: int = Field(default=32, env="RERANKER_BATCH_SIZE")
     # How many coarse candidates to fetch from Qdrant for the cross-encoder to score.
     # Should be 2-3x top_k so the reranker has enough candidates to work with.
