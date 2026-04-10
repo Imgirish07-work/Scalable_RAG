@@ -269,7 +269,7 @@ class DocumentCleaner:
 
             # Skip empty pages
             if not cleaned_text:
-                logger.warning(
+                logger.info(
                     "Page empty after cleaning — skipping: source=%s, page=%s",
                     doc.metadata.get("source", "unknown"),
                     doc.metadata.get("page", "?"),
@@ -278,7 +278,7 @@ class DocumentCleaner:
 
             # Skip pages below minimum length
             if len(cleaned_text) < self._min_chars_per_page:
-                logger.warning(
+                logger.info(
                     "Page too short (%d chars) — skipping: source=%s, page=%s",
                     len(cleaned_text),
                     doc.metadata.get("source", "unknown"),

@@ -43,6 +43,7 @@ from abc import ABC, abstractmethod
 
 from llm.contracts.base_llm import BaseLLM
 from llm.models.llm_response import LLMResponse
+from llm.provider_health import provider_health
 from rag.models.rag_request import RAGRequest
 from rag.models.rag_response import (
     RAGResponse,
@@ -533,10 +534,31 @@ class BaseRAG(ABC):
         ]
 
         try:
-            response = await self._llm.chat(
-                messages,
-                temperature=request.config.temperature,
+            from llm.exceptions.llm_exceptions import LLMError, LLMProviderError
+
+            # Skip primary LLM if it is in cooldown (e.g. blocked by Zscaler).
+            # Routes directly to fallback without paying the timeout penalty.
+            _skip_primary = (
+                not provider_health.is_available(self._llm.provider_name)
+                and self._fallback_llm is not None
             )
+            if _skip_primary:
+                logger.info(
+                    "Primary LLM '%s' in cooldown — routing directly to fallback '%s'",
+                    self._llm.provider_name,
+                    self._fallback_llm.provider_name,
+                )
+                response = await self._fallback_llm.chat(
+                    messages,
+                    temperature=request.config.temperature,
+                )
+            else:
+                response = await self._llm.chat(
+                    messages,
+                    temperature=request.config.temperature,
+                )
+                # Successful call — clear any prior failure state immediately.
+                provider_health.mark_recovered(self._llm.provider_name)
 
             if not response.text or not response.text.strip():
                 raise RAGGenerationError(
@@ -555,11 +577,12 @@ class BaseRAG(ABC):
             raise
 
         except Exception as exc:
-            from llm.exceptions.llm_exceptions import LLMError, LLMProviderError
             # Primary LLM failed with a provider-level error (network, timeout, etc.).
+            # Mark it as unavailable so subsequent queries skip straight to fallback.
             # If a fallback LLM is configured, retry generation ONLY — no re-retrieval.
             # This saves ~3-4s vs re-running the full pipeline from the caller.
             if isinstance(exc, LLMProviderError) and self._fallback_llm is not None:
+                provider_health.mark_failed(self._llm.provider_name)
                 logger.warning(
                     "Primary LLM failed, retrying generation with fallback | "
                     "primary=%s | fallback=%s | error=%s",
@@ -732,16 +755,25 @@ class BaseRAG(ABC):
         if not used_chunks:
             return ConfidenceScore(value=0.0, method=method)
 
-        # Average the top-⌈k/2⌉ scores instead of all k.
-        # Full average is skewed by low-scoring tail chunks, which is
-        # especially pronounced with hybrid RRF where scores have a wide
-        # spread (e.g. 1.0, 0.58, 0.58, 0.34, 0.23 → avg=0.55 despite
-        # a perfect top match). Top-half average gives a fairer signal
-        # for both dense (cosine) and hybrid (RRF rank-based) scoring.
         import math
-        scores = sorted(
-            (c.relevance_score for c in used_chunks), reverse=True
-        )
+
+        # Prefer reranker scores when available — the cross-encoder reads
+        # (query, chunk) jointly via full attention, making it a direct
+        # semantic relevance signal rather than a vector distance proxy.
+        # Fall back to cosine/RRF relevance scores when reranker didn't run.
+        reranker_scores = [
+            c.reranker_score for c in used_chunks if c.reranker_score is not None
+        ]
+        if reranker_scores:
+            scores = sorted(reranker_scores, reverse=True)
+            method = "reranker"
+        else:
+            # Average the top-⌈k/2⌉ scores — avoids skew from low-scoring tail
+            # chunks (especially pronounced with hybrid RRF scoring).
+            scores = sorted(
+                (c.relevance_score for c in used_chunks), reverse=True
+            )
+
         top_n = max(1, math.ceil(len(scores) / 2))
         avg_score = sum(scores[:top_n]) / top_n
 
