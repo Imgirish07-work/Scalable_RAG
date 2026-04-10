@@ -29,6 +29,7 @@ Sync internals run via asyncio.to_thread() (Rule 1).
 """
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from typing import List, Literal, Optional
 
@@ -542,19 +543,42 @@ class QdrantStore(BaseVectorStore):
                 batch_end  = min(batch_start + batch_size, total)
 
                 try:
+                    # Pre-time embedding to isolate embed vs upsert latency.
+                    # Runs before add_documents so LangChain's internal call
+                    # benefits from ONNX session warm cache on re-use.
+                    _texts = [d.page_content for d in batch]
+                    _t0 = time.perf_counter()
+                    await asyncio.to_thread(
+                        get_embeddings().embed_documents, _texts
+                    )
+                    _t1 = time.perf_counter()
+                    await asyncio.to_thread(
+                        self._get_sparse_embeddings().embed_documents, _texts
+                    )
+                    _t2 = time.perf_counter()
+                    logger.debug(
+                        "Batch %d embed timing: dense=%.2fs | sparse=%.2fs",
+                        batch_num, _t1 - _t0, _t2 - _t1,
+                    )
+
+                    _t3 = time.perf_counter()
                     batch_ids = await asyncio.to_thread(
                         self._store.add_documents, batch
                     )
+                    _t4 = time.perf_counter()
                     all_ids.extend(batch_ids)
                     logger.info(
                         "Ingestion batch %d/%d complete: chunks=%d/%d "
-                        "| committed=%d | remaining=%d",
+                        "| committed=%d | remaining=%d"
+                        " | embed=%.1fs | upsert=%.1fs",
                         batch_num,
                         -(-total // batch_size),
                         batch_end,
                         total,
                         len(all_ids),
                         total - batch_end,
+                        _t2 - _t0,         # total embed time (dense + sparse)
+                        _t4 - _t3,         # upsert time (LangChain re-embeds + upsert)
                     )
                 except Exception as batch_err:
                     failed_batches += 1
