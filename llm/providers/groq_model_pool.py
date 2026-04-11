@@ -7,7 +7,13 @@ Design:
     GroqProvider — the RAG pipeline, BaseRAG, and agents all interact with
     BaseLLM and never know they are talking to a pool.
 
-    On every generate() / chat() call the pool:
+    All generate() / chat() calls are funnelled through a bounded asyncio.Queue.
+    A fixed pool of _NUM_WORKERS worker coroutines drain the queue one item at
+    a time. This caps in-flight concurrency and prevents the burst-429 race
+    condition where multiple callers simultaneously route to the same model
+    before any response headers have been received.
+
+    On every dispatched call the pool:
 
         1. Detects the call role (FAST or STRONG) from the max_tokens kwarg:
                max_tokens ≤ 512  → FAST   (eval, rewrite, classify)
@@ -32,6 +38,11 @@ Design:
                b. Immediately re-routes to the next available model and retries.
                c. If ALL models are exhausted, raises LLMRateLimitError to the caller.
 
+        6. On HTTP 404 "model not found" (LLMProviderError):
+               Puts the inaccessible model in a 24-hour cooldown so it is
+               permanently skipped for the session, then retries with the next
+               available model. Does NOT propagate to BaseRAG — the pool stays up.
+
     Header extraction:
         The OpenAI SDK does not expose raw headers on the parsed response object.
         We use the undocumented `.response` / `._response` attribute on
@@ -52,19 +63,21 @@ Design:
 Chain of Responsibility:
     LLMFactory.create_groq_pool() instantiates GroqModelPool →
     returned as BaseLLM to RAGPipeline → BaseRAG calls generate() / chat() →
-    GroqModelPool routes to ModelRouter → dispatches to GroqProvider._call_api()
-    → parses headers → updates RateLimitTracker.
+    GroqModelPool enqueues request → worker pulls from queue → _dispatch() →
+    ModelRouter → GroqProvider → parses headers → updates RateLimitTracker.
 
 Dependencies:
-    asyncio, typing (stdlib), openai (RateLimitError),
-    llm.contracts.base_llm, llm.providers.groq_provider,
+    asyncio, re, time, typing (stdlib), dataclasses (stdlib),
+    openai (RateLimitError), llm.contracts.base_llm, llm.providers.groq_provider,
     llm.providers.model_router, llm.rate_limiter.rate_limit_tracker,
     llm.models.llm_response, llm.exceptions.llm_exceptions,
     config.settings, utils.logger.
 """
 
+import asyncio
 import re
 import time
+from dataclasses import dataclass
 from typing import List, Optional
 
 from openai import RateLimitError
@@ -80,19 +93,51 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Role threshold — max_tokens at or below this value → FAST call
+# Pool configuration constants
+
+# max_tokens at or below this value → FAST call; above → STRONG call
 _FAST_MAX_TOKENS_THRESHOLD: int = 512
 
-# Pool model lists — mirrors the lists in ModelRouter.
-# Kept here to know which GroqProvider instances to pre-warm.
+# Number of concurrent worker coroutines draining the request queue.
+# Higher values increase throughput but also increase burst risk.
+# 3 is a safe default for Groq's 30 RPM per-model limit.
+_NUM_WORKERS: int = 3
+
+# Maximum number of requests that can wait in the queue.
+# Callers receive LLMRateLimitError immediately when the queue is full.
+_QUEUE_MAX_SIZE: int = 50
+
+# All models for which GroqProvider instances are pre-created.
+# Mirrors the union of FAST + STRONG pool lists in ModelRouter.
+# To add a model: register it in model_limits.py AND add it here.
 _ALL_POOL_MODELS: list[str] = [
-    "llama-3.1-8b-instant",
-    "moonshotai/kimi-k2",
-    "llama-3.3-70b-versatile",
-    "qwen/qwen3-32b",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "llama-3.1-8b-instant",                       # FAST primary
+    "moonshotai/kimi-k2-instruct",                # STRONG priority-1 (unlisted; 404-safe)
+    "llama-3.3-70b-versatile",                    # STRONG priority-2
+    "qwen/qwen3-32b",                             # FAST overflow / STRONG priority-3
+    "meta-llama/llama-4-scout-17b-16e-instruct",  # STRONG priority-4
 ]
 
+# Queue item dataclass
+
+
+@dataclass
+class _RequestItem:
+    """A single queued LLM call with its associated completion future.
+
+    Attributes:
+        messages: OpenAI-formatted message list.
+        kwargs:   Per-call overrides (temperature, max_tokens, etc.).
+        future:   asyncio.Future that the worker resolves when the call
+                  completes. The caller awaits this future.
+    """
+
+    messages: list[dict]
+    kwargs: dict
+    future: asyncio.Future  # always passed explicitly by _enqueue; no default
+
+
+# GroqModelPool
 
 class GroqModelPool(BaseLLM):
     """Multi-model Groq pool that routes every call to the best available model.
@@ -102,10 +147,13 @@ class GroqModelPool(BaseLLM):
     a BaseLLM reference without any changes.
 
     Attributes:
-        _providers:     Dict mapping model_id → GroqProvider instance.
-        _router:        ModelRouter for pool selection decisions.
-        _tracker:       Shared RateLimitTracker for state reads/writes.
-        _active_model:  model_id of the last successfully dispatched model.
+        _providers:         Dict mapping model_id → GroqProvider instance.
+        _router:            ModelRouter for pool selection decisions.
+        _tracker:           Shared RateLimitTracker for state reads/writes.
+        _active_model:      model_id of the last successfully dispatched model.
+        _queue:             Bounded asyncio.Queue holding pending _RequestItems.
+        _workers:           List of asyncio.Tasks running _worker() coroutines.
+        _workers_started:   Flag — True once worker tasks have been created.
     """
 
     def __init__(
@@ -117,6 +165,10 @@ class GroqModelPool(BaseLLM):
         router: Optional[ModelRouter] = None,
     ) -> None:
         """Create one GroqProvider per pool model and initialize the router.
+
+        Worker tasks are NOT started here — they are created lazily on the
+        first call to generate() / chat() so that asyncio.create_task() is
+        always called from within a running event loop.
 
         Args:
             api_key:     Groq API key. Falls back to settings.groq_api_key.
@@ -145,9 +197,16 @@ class GroqModelPool(BaseLLM):
         # properties. Starts with the top-priority STRONG model.
         self._active_model: str = settings.GROQ_MODEL_STRONG
 
+        # Queue + worker state — workers are started lazily on first call
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_MAX_SIZE)
+        self._workers: list[asyncio.Task] = []
+        self._workers_started: bool = False
+
         logger.info(
-            "GroqModelPool initialized | models=%s",
+            "GroqModelPool initialized | models=%s | workers=%d | queue_max=%d",
             list(self._providers.keys()),
+            _NUM_WORKERS,
+            _QUEUE_MAX_SIZE,
         )
 
     # BaseLLM properties
@@ -184,11 +243,12 @@ class GroqModelPool(BaseLLM):
             LLMResponse from the selected model.
 
         Raises:
-            LLMRateLimitError: If all models in both pools are exhausted.
+            LLMRateLimitError: If all models in both pools are exhausted, or
+                               the request queue is full.
             LLMProviderError:  For any non-recoverable provider error.
         """
         messages = [{"role": "user", "content": prompt}]
-        return await self._dispatch(messages, **kwargs)
+        return await self._enqueue(messages, **kwargs)
 
     async def chat(self, messages: List[dict], **kwargs) -> LLMResponse:
         """Multi-turn conversation routed to the best available pool model.
@@ -205,12 +265,13 @@ class GroqModelPool(BaseLLM):
 
         Raises:
             ValueError:        If messages list is empty.
-            LLMRateLimitError: If all models in both pools are exhausted.
+            LLMRateLimitError: If all models in both pools are exhausted, or
+                               the request queue is full.
             LLMProviderError:  For any non-recoverable provider error.
         """
         if not messages:
             raise ValueError("Messages list cannot be empty.")
-        return await self._dispatch(messages, **kwargs)
+        return await self._enqueue(messages, **kwargs)
 
     async def count_tokens(self, text: str) -> int:
         """Count tokens for the given text using the active model's encoder.
@@ -252,15 +313,105 @@ class GroqModelPool(BaseLLM):
         logger.warning("GroqModelPool health check failed — all models unreachable")
         return False
 
+    # Queue + worker internals
+
+    async def _ensure_workers_started(self) -> None:
+        """Lazily start the worker tasks on the first LLM call.
+
+        We cannot create asyncio.Tasks in __init__ because the event loop may
+        not yet be running. Starting workers on first use guarantees
+        asyncio.create_task() is always called from within a running loop.
+        """
+        if self._workers_started:
+            return
+
+        self._workers_started = True
+        for worker_id in range(_NUM_WORKERS):
+            task = asyncio.create_task(
+                self._worker(worker_id=worker_id),
+                name=f"groq-pool-worker-{worker_id}",
+            )
+            self._workers.append(task)
+
+        logger.info("GroqModelPool: started %d queue workers", _NUM_WORKERS)
+
+    async def _enqueue(self, messages: list[dict], **kwargs) -> LLMResponse:
+        """Enqueue a request and wait for a worker to fulfill it.
+
+        Creates an asyncio.Future, wraps it in a _RequestItem, puts the item
+        on the bounded queue, and suspends the caller until a worker resolves
+        the future. This is the single entry point for all LLM calls in the
+        pool — it replaces a direct call to _dispatch().
+
+        Args:
+            messages: OpenAI-formatted message list.
+            **kwargs: Per-call overrides.
+
+        Returns:
+            LLMResponse from the dispatched model.
+
+        Raises:
+            LLMRateLimitError: Queue full (system overloaded) or all models
+                               exhausted (propagated from worker).
+            LLMProviderError:  Non-recoverable provider error (propagated from
+                               worker).
+        """
+        await self._ensure_workers_started()
+
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        item = _RequestItem(messages=messages, kwargs=kwargs, future=future)
+
+        try:
+            self._queue.put_nowait(item)
+        except asyncio.QueueFull:
+            raise LLMRateLimitError(
+                f"GroqModelPool request queue is full (max={_QUEUE_MAX_SIZE}). "
+                "The system is overloaded — try again shortly."
+            )
+
+        return await future
+
+    async def _worker(self, worker_id: int) -> None:
+        """Persistent worker coroutine that processes requests from the queue.
+
+        Each worker pulls one _RequestItem at a time, calls _dispatch() to
+        route and execute the call, and resolves the item's future with
+        either the result or the exception. Workers run indefinitely until
+        the asyncio task is cancelled (e.g., at process shutdown).
+
+        By capping in-flight calls to _NUM_WORKERS, we prevent the burst-429
+        race condition where many concurrent callers all see stale remaining_rpm
+        and all route to the same model simultaneously.
+
+        Args:
+            worker_id: Integer identifier for this worker (used in logging only).
+        """
+        logger.debug("GroqModelPool worker %d started", worker_id)
+
+        while True:
+            item: _RequestItem = await self._queue.get()
+            try:
+                response = await self._dispatch(item.messages, **item.kwargs)
+                item.future.set_result(response)
+            except Exception as exc:
+                # Surface all exceptions to the caller via the future — workers
+                # must never crash; they catch everything and keep running.
+                if not item.future.done():
+                    item.future.set_exception(exc)
+            finally:
+                self._queue.task_done()
+
     # Private dispatch loop
 
     async def _dispatch(self, messages: list[dict], **kwargs) -> LLMResponse:
-        """Core dispatch loop — route, call, handle 429, retry or escalate.
+        """Core dispatch loop — route, call, handle errors, retry or escalate.
 
         Determines the call role, asks the router for a model, dispatches to
         that model's provider, and updates the tracker. On 429 puts the model
-        in cooldown and retries with the next available model. Raises
-        LLMRateLimitError only when the router returns None (all pools empty).
+        in cooldown and retries with the next available model. On HTTP 404
+        "model not found" puts the model in a 24-hour cooldown and retries
+        rather than propagating an error that would bring down the whole pool.
+        Raises LLMRateLimitError only when the router returns None (all pools empty).
 
         Args:
             messages: OpenAI-formatted message list.
@@ -271,13 +422,13 @@ class GroqModelPool(BaseLLM):
 
         Raises:
             LLMRateLimitError: If all models are in cooldown / exhausted.
-            LLMProviderError:  For non-rate-limit provider errors.
+            LLMProviderError:  For non-rate-limit, non-404 provider errors.
         """
         role = self._detect_role(kwargs.get("max_tokens"))
         est_tokens = await self._estimate_tokens(messages, kwargs.get("max_tokens"))
 
-        # We retry in a loop; each 429 eliminates one model via cooldown
-        # and the router automatically skips it on the next iteration.
+        # Retry loop: each 429 or 404 eliminates one model via cooldown and
+        # the router automatically skips it on the next iteration.
         # The loop terminates when router.route() returns None (all pools empty).
         while True:
             model_id = await self._router.route(role=role, est_tokens=est_tokens)
@@ -303,13 +454,33 @@ class GroqModelPool(BaseLLM):
                 return response
 
             except LLMRateLimitError as exc:
-                # Extract Retry-After seconds from the error string if present
+                # HTTP 429 — put model in cooldown and retry with the next model
                 retry_after = self._parse_retry_after(str(exc))
                 await self._router.on_429(model_id, retry_after=retry_after)
                 # Loop back — router will skip the cooled-down model
 
-            # All other exceptions (auth, timeout, token limit, provider) propagate
-            # immediately — they are not recoverable by switching models.
+            except LLMProviderError as exc:
+                error_msg = str(exc).lower()
+                if "does not exist" in error_msg or "model_not_found" in error_msg:
+                    # HTTP 404 — this account does not have access to the model.
+                    # Exclude it for the rest of the session (24-hour cooldown)
+                    # and try the next model. Do NOT propagate — the pool stays up.
+                    logger.warning(
+                        "model=%s returned 404 (not found / no access) — "
+                        "excluding from pool for 24 hours. "
+                        "Remove it from _ALL_POOL_MODELS to silence this warning.",
+                        model_id,
+                    )
+                    await self._router.on_429(model_id, retry_after=86_400)
+                    # Loop back — router will skip the excluded model
+                else:
+                    # Auth errors, token limit exceeded, timeout, etc. —
+                    # not recoverable by switching models; propagate immediately.
+                    raise
+
+            # All other exceptions propagate immediately — not model-specific
+
+    # Provider call + header extraction
 
     async def _call_provider(
         self,

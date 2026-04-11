@@ -6,10 +6,11 @@ Design:
     to frozen _ModelLimits dataclasses. get_rate_limit_config() looks up the
     model and returns a RateLimiterConfig ready for LLMRateLimiter.
 
-    RPM, RPD, TPM, and TPD values are provider-enforced constants, not
-    deployment config. Storing them here (rather than in settings/.env) prevents
-    false impressions that they are tunable — setting rpm=60 for a model
-    limited to 30 causes 429s.
+    Only models that are actively used appear here — Groq pool models and
+    the Gemini fallback. All limits are sourced directly from official provider
+    documentation (Groq free-tier rate limits page, Gemini AI Studio limits)
+    and are NOT tunable via settings — setting a higher value than the provider
+    enforces causes 429s.
 
     pool: Marks which Groq model pool(s) a model belongs to:
         "FAST"   — lightweight tasks (eval, rewrite, classify) max_tokens≤512
@@ -17,7 +18,9 @@ Design:
         "BOTH"   — shared budget; model appears in both pools (e.g. qwen3-32b)
         None     — non-Groq provider; pool routing does not apply
 
-    Adding a new Groq model requires exactly one line in MODEL_RATE_LIMITS.
+    Adding a new Groq model requires exactly one line in MODEL_RATE_LIMITS
+    plus an entry in _ALL_POOL_MODELS (groq_model_pool.py) and the appropriate
+    pool list in model_router.py.
 
 Chain of Responsibility:
     LLMFactory.create_rate_limited() calls get_rate_limit_config(model_name) →
@@ -25,6 +28,10 @@ Chain of Responsibility:
 
     GroqModelPool reads MODEL_RATE_LIMITS directly via get_model_limits() to
     build its per-model RateLimitTracker budget.
+
+Sources:
+    Groq: https://console.groq.com/docs/rate-limits  (free tier, April 2026)
+    Gemini: https://ai.google.dev/gemini-api/docs/rate-limits
 
 Dependencies:
     llm.rate_limiter.rate_limiter_config.RateLimiterConfig, utils.logger.
@@ -67,60 +74,30 @@ class _ModelLimits:
             "BOTH"   — model shared between both pools; one budget tracked
     """
 
-    rpm: int                     # requests per minute
-    rpd: int                     # requests per day
-    tpm: int                     # tokens per minute
-    tpd: int                     # tokens per day
+    rpm: int                        # requests per minute
+    rpd: int                        # requests per day
+    tpm: int                        # tokens per minute
+    tpd: int                        # tokens per day
     pool: Optional[PoolTag] = None  # Groq pool tag; None = not a Groq pool model
 
 
-# Registry — add ONE line per new Groq model using the exact model ID
+# Registry — only active models are listed here
 
 MODEL_RATE_LIMITS: dict[str, _ModelLimits] = {
 
-    # Groq free tier — Groq Model Pool members
-    # Priority order within pools is defined in ModelRouter, not here.
+    # Groq — FAST pool
+    "llama-3.1-8b-instant":                      _ModelLimits(rpm=30,  rpd=14_400, tpm=6_000,  tpd=500_000, pool="FAST"),
 
-    # FAST pool — lightweight tasks, high volume, sub-512-token responses
-    "llama-3.1-8b-instant":             _ModelLimits(rpm=30, rpd=14_400, tpm=20_000,  tpd=500_000,  pool="FAST"),
+    # Groq — STRONG pool
+    "moonshotai/kimi-k2-instruct":               _ModelLimits(rpm=60,  rpd=1_000,  tpm=10_000, tpd=300_000, pool="STRONG"),
+    "llama-3.3-70b-versatile":                   _ModelLimits(rpm=30,  rpd=1_000,  tpm=12_000, tpd=100_000, pool="STRONG"),
+    "meta-llama/llama-4-scout-17b-16e-instruct": _ModelLimits(rpm=30,  rpd=1_000,  tpm=30_000, tpd=500_000, pool="STRONG"),
 
-    # STRONG pool — final synthesis, complex reasoning, large output
-    "moonshotai/kimi-k2":               _ModelLimits(rpm=30, rpd=400,    tpm=12_800,  tpd=300_000,  pool="STRONG"),
-    "llama-3.3-70b-versatile":          _ModelLimits(rpm=30, rpd=1_000,  tpm=12_000,  tpd=100_000,  pool="STRONG"),
-    "meta-llama/llama-4-scout-17b-16e-instruct": _ModelLimits(rpm=30, rpd=400, tpm=12_800, tpd=500_000, pool="STRONG"),
+    # Groq — BOTH pools (shared budget)
+    "qwen/qwen3-32b":                            _ModelLimits(rpm=60,  rpd=1_000,  tpm=6_000,  tpd=500_000, pool="BOTH"),
 
-    # BOTH pools — shared budget; one RateLimitState instance, referenced by both pools
-    "qwen/qwen3-32b":                   _ModelLimits(rpm=30, rpd=400,    tpm=12_800,  tpd=500_000,  pool="BOTH"),
-
-    # Groq free tier — legacy / non-pool models (kept for backward compat)
-    "llama-3.2-1b-preview":             _ModelLimits(rpm=30, rpd=14_400, tpm=7_000,   tpd=500_000),
-    "llama-3.2-3b-preview":             _ModelLimits(rpm=30, rpd=14_400, tpm=7_000,   tpd=500_000),
-    "llama-3.2-11b-vision-preview":     _ModelLimits(rpm=15, rpd=3_500,  tpm=7_000,   tpd=250_000),
-    "llama-3.2-90b-vision-preview":     _ModelLimits(rpm=15, rpd=3_500,  tpm=7_000,   tpd=250_000),
-    "llama-3.1-70b-versatile":          _ModelLimits(rpm=30, rpd=14_400, tpm=20_000,  tpd=500_000),
-    "mixtral-8x7b-32768":               _ModelLimits(rpm=30, rpd=14_400, tpm=5_000,   tpd=500_000),
-    "gemma2-9b-it":                     _ModelLimits(rpm=30, rpd=14_400, tpm=15_000,  tpd=500_000),
-    "gemma-7b-it":                      _ModelLimits(rpm=30, rpd=14_400, tpm=15_000,  tpd=500_000),
-    "qwen-qwq-32b":                     _ModelLimits(rpm=30, rpd=1_000,  tpm=6_000,   tpd=500_000),
-    "deepseek-r1-distill-llama-70b":    _ModelLimits(rpm=30, rpd=1_000,  tpm=6_000,   tpd=500_000),
-
-    # Gemini free tier
-    "gemini-2.5-flash":                 _ModelLimits(rpm=10,  rpd=500,   tpm=250_000, tpd=1_000_000),
-    "gemini-2.5-flash-preview-04-17":   _ModelLimits(rpm=10,  rpd=500,   tpm=250_000, tpd=1_000_000),
-    "gemini-2.0-flash":                 _ModelLimits(rpm=15,  rpd=1_500, tpm=1_000_000, tpd=1_000_000),
-    "gemini-2.0-flash-lite":            _ModelLimits(rpm=30,  rpd=1_500, tpm=1_000_000, tpd=1_000_000),
-    "gemini-1.5-flash":                 _ModelLimits(rpm=15,  rpd=1_500, tpm=1_000_000, tpd=1_000_000),
-    "gemini-1.5-flash-8b":              _ModelLimits(rpm=15,  rpd=1_500, tpm=1_000_000, tpd=1_000_000),
-    "gemini-1.5-pro":                   _ModelLimits(rpm=2,   rpd=50,    tpm=32_000,  tpd=50_000),
-    "gemini-1.0-pro":                   _ModelLimits(rpm=15,  rpd=1_500, tpm=32_000,  tpd=1_000_000),
-
-    # OpenAI free tier
-    "gpt-3.5-turbo":                    _ModelLimits(rpm=3,   rpd=200,   tpm=40_000,  tpd=200_000),
-    "gpt-3.5-turbo-instruct":           _ModelLimits(rpm=3,   rpd=200,   tpm=40_000,  tpd=200_000),
-    "gpt-4o-mini":                      _ModelLimits(rpm=3,   rpd=200,   tpm=40_000,  tpd=200_000),
-    "gpt-4o":                           _ModelLimits(rpm=3,   rpd=200,   tpm=10_000,  tpd=100_000),
-    "gpt-4":                            _ModelLimits(rpm=3,   rpd=200,   tpm=10_000,  tpd=100_000),
-    "gpt-4-turbo":                      _ModelLimits(rpm=3,   rpd=200,   tpm=10_000,  tpd=100_000),
+    # Gemini — fallback provider
+    "gemini-2.5-flash":                          _ModelLimits(rpm=10,  rpd=500,    tpm=250_000, tpd=1_000_000),
 }
 
 
@@ -175,7 +152,7 @@ def get_rate_limit_config(
     not found, so unknown models degrade gracefully rather than flooding 429s.
 
     Args:
-        model_name: Exact model ID string e.g. 'llama-3.3-70b-versatile'.
+        model_name: Exact model ID string e.g. 'gemini-2.5-flash'.
         max_concurrent: Max simultaneous in-flight requests (semaphore size).
         burst_multiplier: Burst tolerance multiplier above the sustained RPM rate.
 

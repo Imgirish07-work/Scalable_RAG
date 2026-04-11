@@ -21,7 +21,7 @@ Design:
 
     Pool definitions:
         FAST   : ["llama-3.1-8b-instant", "qwen/qwen3-32b"]
-        STRONG : ["moonshotai/kimi-k2", "llama-3.3-70b-versatile",
+        STRONG : ["moonshotai/kimi-k2-instruct", "llama-3.3-70b-versatile",
                   "qwen/qwen3-32b", "meta-llama/llama-4-scout-17b-16e-instruct"]
 
         qwen3-32b appears in both pools — its budget is tracked once
@@ -58,14 +58,10 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
 # Call role — determined from max_tokens kwarg by GroqModelPool
-# ---------------------------------------------------------------------------
 CallRole = Literal["FAST", "STRONG"]
 
-# ---------------------------------------------------------------------------
 # Pool definitions — priority order matters (first = preferred)
-# ---------------------------------------------------------------------------
 
 # FAST pool: high-volume, low-latency tasks (eval, rewrite, classify)
 # Llama 3.1 8B is the workhorse; Qwen3 32B is the capacity overflow fallback
@@ -75,17 +71,17 @@ _FAST_POOL: list[str] = [
 ]
 
 # STRONG pool: final answer generation, complex reasoning
-# Priority: Kimi K2 (best quality) → Llama 3.3 70B → Qwen3 32B → Llama 4 Scout
+# Priority: Kimi K2 (60 RPM, best quality) → Llama 3.3 70B → Qwen3 32B → Llama 4 Scout
+# Note: kimi-k2-instruct is "Unlisted" on Groq — if your account lacks access it
+#       returns 404, which _dispatch catches and skips automatically (24h cooldown).
 _STRONG_POOL: list[str] = [
-    "moonshotai/kimi-k2",
+    "moonshotai/kimi-k2-instruct",
     "llama-3.3-70b-versatile",
     "qwen/qwen3-32b",
     "meta-llama/llama-4-scout-17b-16e-instruct",
 ]
 
-# ---------------------------------------------------------------------------
 # Headroom constants — buffer to avoid last-slot 429s
-# ---------------------------------------------------------------------------
 
 # Minimum RPM remaining before a model is considered "at capacity" for routing.
 # Routing to a model with 1 remaining request risks a 429 if another coroutine
