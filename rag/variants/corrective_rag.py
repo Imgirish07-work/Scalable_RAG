@@ -310,13 +310,19 @@ class CorrectiveRAG(BaseRAG):
         Evaluating only the top N chunks caps cost — if the top 3 are
         irrelevant, the rest almost certainly are too.
 
+        Fallback: when ALL individual evaluations fail (LLM timeout, parse
+        error, etc.), falls back to the average retrieval score of the
+        evaluated chunks. This prevents returning 0.0 for chunks that are
+        clearly relevant (e.g. retrieval score=1.0) just because the eval
+        LLM call failed, which would incorrectly trigger low_confidence.
+
         Args:
             query: The user's query.
             chunks: Retrieved chunks ordered by retrieval score.
 
         Returns:
-            Average relevance score (0.0–1.0). Returns 0.0 if all
-            individual evaluations fail.
+            Average LLM relevance score (0.0–1.0), or average retrieval
+            score as fallback when all LLM evaluations fail.
         """
         eval_chunks = chunks[:self._eval_chunk_count]
         scores = []
@@ -331,13 +337,21 @@ class CorrectiveRAG(BaseRAG):
         elapsed_ms = (time.perf_counter() - start) * 1000
 
         if not scores:
+            # All LLM eval calls failed — fall back to retrieval scores so we
+            # don't treat a high-relevance result as low-confidence due to a
+            # transient eval failure (timeout, rate-limit, parse error).
+            fallback = (
+                sum(c.relevance_score for c in eval_chunks) / len(eval_chunks)
+                if eval_chunks else 0.0
+            )
             logger.warning(
-                "CorrectiveRAG: all chunk evaluations failed | "
-                "chunks_evaluated=%d | latency=%.1f ms",
+                "CorrectiveRAG: all chunk evaluations failed — using retrieval "
+                "score fallback | fallback=%.3f | chunks=%d | latency=%.1f ms",
+                fallback,
                 len(eval_chunks),
                 elapsed_ms,
             )
-            return 0.0
+            return fallback
 
         avg = sum(scores) / len(scores)
 

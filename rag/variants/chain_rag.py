@@ -148,6 +148,12 @@ class ChainRAG(BaseRAG):
         Raises:
             RAGRetrievalError: If the initial retrieval (hop 1) fails entirely.
         """
+        # Reset per-query state — instance is reused across queries, so stale
+        # values from a prior query must be cleared before this one begins.
+        # CorrectiveRAG does the same at the top of its retrieve().
+        self._chain_completed = False
+        self._chain_avg_relevance = 0.0
+
         max_hops = self._resolve_max_hops(request)
         accumulated_chunks: list[RetrievedChunk] = []
         current_query = query
