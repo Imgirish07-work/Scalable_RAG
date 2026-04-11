@@ -122,7 +122,7 @@ async def run():
     # Step 4: Build the RAG pipeline
     retriever = HybridRetriever(store)
     try:
-        llm = LLMFactory.create_rate_limited("groq")
+        llm = LLMFactory.create_groq_pool()
         fallback_llm = LLMFactory.create_rate_limited("gemini")
         logger.info("LLM: %s | fallback: %s", llm.model_name, fallback_llm.model_name)
     except Exception as e:
