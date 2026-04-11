@@ -7,6 +7,16 @@ Design:
     one registry entry — no other code changes. All public methods are
     classmethods so no factory instantiation is needed at the call site.
 
+    Groq pool path:
+        When default_provider == 'groq', create_from_settings() returns a
+        GroqModelPool instead of a plain GroqProvider. The pool manages 5
+        models with dynamic routing and header-based rate limit tracking.
+        create_groq_pool() is also available for explicit pool construction.
+
+        The existing create() / create_rate_limited() methods still work for
+        single-model Groq usage (e.g. tests, one-off scripts) by passing
+        provider_name='groq' as before.
+
 Chain of Responsibility:
     Pipeline calls LLMFactory.create() or create_from_settings() →
     factory instantiates the concrete provider → wraps it in LLMRateLimiter
@@ -15,7 +25,7 @@ Chain of Responsibility:
 Dependencies:
     llm.contracts.base_llm, llm.providers.*, llm.exceptions.llm_exceptions,
     llm.rate_limiter (LLMRateLimiter, get_rate_limit_config),
-    config.settings, utils.logger.
+    llm.providers.groq_model_pool, config.settings, utils.logger.
 """
 
 from typing import Optional
@@ -25,6 +35,7 @@ from llm.exceptions.llm_exceptions import LLMProviderError
 from llm.providers.openai_provider import OpenAIProvider
 from llm.providers.gemini_provider import GeminiProvider
 from llm.providers.groq_provider import GroqProvider
+from llm.providers.groq_model_pool import GroqModelPool
 from llm.rate_limiter import LLMRateLimiter, get_rate_limit_config
 from config.settings import settings
 from utils.logger import get_logger
@@ -145,14 +156,55 @@ class LLMFactory:
         )
 
     @classmethod
-    def create_from_settings(cls) -> BaseLLM:
-        """Create a rate-limited provider from the default_provider setting.
+    def create_groq_pool(
+        cls,
+        api_key: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> GroqModelPool:
+        """Create a GroqModelPool that dynamically routes across 5 Groq models.
 
-        Always returns a rate-limited provider when LLM_RATE_LIMITER_ENABLED
-        is True — no manual wrapping is needed at the call site.
+        The pool is the recommended way to use Groq — it routes each call to
+        the best available model based on real-time header data, preventing
+        429 exhaustion from hitting a single model's daily RPD limit.
+
+        All args fall back to settings when not provided, matching the same
+        defaults as create_rate_limited("groq").
+
+        Args:
+            api_key:     Groq API key. Falls back to settings.groq_api_key.
+            temperature: Default temperature. Falls back to settings.temperature.
+            max_tokens:  Default max output tokens. Falls back to settings.max_tokens.
+            timeout:     Request timeout in seconds. Falls back to settings.GROQ_TIMEOUT.
 
         Returns:
-            Rate-limited BaseLLM configured from settings.
+            GroqModelPool instance implementing BaseLLM.
+        """
+        logger.info("Creating GroqModelPool (multi-model dynamic routing)")
+
+        return GroqModelPool(
+            api_key=api_key,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+
+    @classmethod
+    def create_from_settings(cls) -> BaseLLM:
+        """Create a provider from the default_provider setting.
+
+        When default_provider == 'groq', returns a GroqModelPool for dynamic
+        multi-model routing instead of a single-model GroqProvider. The pool
+        manages its own reactive rate limiting via response headers, so no
+        LLMRateLimiter wrapper is added for Groq.
+
+        For all other providers, returns the standard rate-limited single-model
+        provider, wrapping with LLMRateLimiter when LLM_RATE_LIMITER_ENABLED.
+
+        Returns:
+            BaseLLM configured from settings. Either a GroqModelPool (groq)
+            or a rate-limited single-model provider (openai, gemini).
 
         Raises:
             LLMProviderError: If default_provider in settings is not registered.
@@ -164,6 +216,11 @@ class LLMFactory:
             provider_name,
         )
 
+        # Groq → use the multi-model pool (reactive header-based rate limiting)
+        if provider_name.strip().lower() == "groq":
+            return cls.create_groq_pool()
+
+        # All other providers → single model with LLMRateLimiter wrapper
         return cls.create_rate_limited(provider_name)
 
     @classmethod
