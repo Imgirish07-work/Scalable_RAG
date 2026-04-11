@@ -1,6 +1,6 @@
 # Scalable RAG System — Optimizations
 
-Complete catalogue of all 54 optimizations implemented across the codebase.
+Complete catalogue of all 57 optimizations implemented across the codebase.
 Organized by system layer. Each entry covers: what it does, benefit, drawbacks,
 how it is implemented, and where.
 
@@ -1243,6 +1243,106 @@ in `GroqProvider.__init__()`.
 
 ---
 
+### OPT-55 · Groq Queue + Worker Burst Protection
+
+**Category:** Reliability, Scalability
+
+**What it does:**
+`GroqModelPool` fronts all Groq calls with an `asyncio.Queue(maxsize=50)` drained by
+3 persistent worker coroutines. Every `chat()` / `generate()` call enqueues a
+`_RequestItem(messages, kwargs, future)` and awaits its `asyncio.Future`. Workers pick
+items off the queue one at a time and resolve the future with the result or exception.
+If the queue is full (50 items backlogged), the call is rejected immediately with
+`LLMRateLimitError` rather than blocking the event loop.
+
+**Benefit:**
+Caps simultaneous in-flight Groq requests at 3 regardless of how many coroutines call
+the pool concurrently. Eliminates burst 429s that occur when stale `remaining_rpm`
+headers are in flight and multiple coroutines simultaneously believe a model has
+capacity. Workers are started lazily on first call — zero cost when the pool is unused.
+
+**Drawbacks:**
+Queue depth of 50 and worker count of 3 are fixed constants. A sustained burst beyond
+50 concurrent callers will reject requests rather than queue them. Worker tasks are
+daemon-style — an unhandled exception in a worker requires restart.
+
+**How implemented:**
+`GroqModelPool.__init__()` creates `self._queue = asyncio.Queue(maxsize=50)` and
+`self._workers: list[asyncio.Task] = []`. `_ensure_workers_started()` lazily spawns
+`_NUM_WORKERS = 3` worker coroutines as asyncio tasks on first call.
+`_enqueue()` calls `queue.put_nowait()` (raises `QueueFull` on overflow) then
+`await future`. Each `_worker(worker_id)` loop calls `await queue.get()`, dispatches
+via `_dispatch()`, and resolves `item.future` with the result or exception.
+
+**Where:** `llm/providers/groq_model_pool.py` — `_enqueue()`, `_worker()`, `_ensure_workers_started()`
+
+---
+
+### OPT-56 · Five-Model Dynamic Pool Routing with 4-Dimension Availability
+
+**Category:** Reliability, Cost, Scalability
+
+**What it does:**
+`ModelRouter` selects the best available Groq model for every call using five sequential
+availability checks across four rate limit dimensions. Two pools are defined:
+
+- **FAST** (max_tokens ≤ 512): `llama-3.1-8b-instant`, `qwen/qwen3-32b`
+- **STRONG** (max_tokens > 512 or None): `moonshotai/kimi-k2-instruct`,
+  `llama-3.3-70b-versatile`, `qwen/qwen3-32b`, `meta-llama/llama-4-scout-17b-16e-instruct`
+
+`qwen/qwen3-32b` appears in both pools with a single shared budget. Pool role is
+auto-detected from the `max_tokens` kwarg — zero changes required in RAG variant code.
+
+Availability checks (in order):
+1. **429 cooldown** — skip if model is in active cooldown.
+2. **RPM headroom** — skip if server-reported `remaining_rpm < 2` (stale-safe: skipped when header not yet received).
+3. **TPM headroom** — skip if server-reported `remaining_tpm < max(est_tokens, 500)`.
+4. **Daily RPD ceiling** — skip if locally-tracked `used_rpd ≥ rpd - 5`.
+5. **Daily TPD ceiling** — skip if locally-tracked `used_tpd + est_tokens ≥ tpd - 2000`.
+
+When the primary pool is exhausted, the router cross-pool overflows to the secondary
+pool before returning `None`. On 429, `_dispatch` calls `router.on_429(model_id,
+retry_after)` immediately — cooldown is set from the `Retry-After` response header.
+On 404 (model not found / unlisted), the model enters a 24-hour cooldown via
+`on_429(model_id, retry_after=86_400)` so the pool never retries an unavailable model.
+
+Rate limit state is updated from server-authoritative response headers
+(`x-ratelimit-remaining-requests`, `x-ratelimit-remaining-tokens`) via
+`RateLimitTracker.update_from_headers()` after every successful call. The OpenAI
+SDK's built-in retry is disabled (`max_retries=0`) so 429s reach `_dispatch`
+immediately rather than being absorbed by an 11-second SDK sleep.
+
+**Benefit:**
+Near-zero downtime on Groq free tier: when one model's minute window is exhausted,
+the next model in priority order is tried within the same request. Daily budgets are
+tracked locally and prevent routing to a model that is about to hit its 1,000 RPD
+ceiling. The `qwen3-32b` shared-budget design means FAST pool overflow doesn't double-
+count its daily quota. Header-authoritative minute-window state prevents the optimistic
+routing mistakes that cause burst 429s under concurrency.
+
+**Drawbacks:**
+Local daily counters reset on process restart — in-flight usage from a prior run is
+invisible. Header values lag by one round trip — the first call to a model after its
+minute window resets may use stale `remaining_rpm = 0` and incorrectly skip it
+(mitigated by the `is_minute_window_fresh()` staleness check). Priority order is
+hardcoded; A/B testing different routing strategies requires a code change.
+
+**How implemented:**
+`ModelRouter.route(role, est_tokens)` iterates the primary pool via
+`_pick_from_pool()` → `_is_model_available()`. `RateLimitTracker` (singleton) holds
+one `ModelRateLimitState` per model with asyncio-locked reads/writes.
+`update_from_headers(model_id, headers)` parses the four Groq rate limit headers.
+`increment_daily(model_id, tokens)` updates `used_rpd` / `used_tpd`.
+`on_429(model_id, cooldown_seconds)` sets `in_cooldown=True` and `cooldown_until`.
+
+**Where:**
+`llm/providers/model_router.py` — `ModelRouter`;
+`llm/rate_limiter/rate_limit_tracker.py` — `RateLimitTracker`, `ModelRateLimitState`;
+`llm/rate_limiter/model_limits.py` — `MODEL_RATE_LIMITS`;
+`llm/providers/groq_model_pool.py` — `_dispatch()`
+
+---
+
 ## 13. Agents
 
 ---
@@ -1470,6 +1570,57 @@ table-heavy documents.
 
 ---
 
+### OPT-57 · Short-Page Merging to Prevent Silent Content Loss
+
+**Category:** Quality, Reliability
+
+**What it does:**
+Replaces the naive "drop short pages" filter in `DocumentCleaner._clean_documents()`
+with a two-phase strategy that guarantees zero silent content loss:
+
+**Phase 1 — noise rejection:** `_clean_text()` strips boilerplate (standalone page
+numbers, URLs, copyright lines) *before* the length check. Pages that become empty
+after stripping are pure noise and are dropped.
+
+**Phase 2 — short-page merging:** Pages that survive stripping but are below
+`min_chars_per_page` are buffered (stored as `(text, metadata)` tuples) and stitched
+into the next qualifying page by prepending the buffer. The merged page retains the
+qualifying page's metadata (source, page number) — the natural navigation anchor.
+
+Three flush rules handle every edge case:
+- **Mid-document:** buffer prepended to next qualifying page; buffer cleared.
+- **Trailing:** buffer appended to the last kept page via a new `Document` object
+  (no in-place mutation).
+- **Entire document short:** each buffered page kept individually with its original
+  metadata rather than collapsed or dropped.
+
+**Benefit:**
+Critical single-sentence content — a story climax, an epilogue fragment, a chapter
+conclusion — is preserved and retrievable rather than silently discarded. Chapter and
+section headers (`"Chapter 5"`, `"BOOK FIVE: 1806–1807"`) that hit the short-page
+path are merged into the following page, enriching that chunk's retrieval signal with
+section context. Prevents the failure mode where "what happened at the end?" returns
+no answer because the final page was 14 characters and was dropped.
+
+**Drawbacks:**
+A merged chunk is slightly larger than its qualifying page alone — downstream chunk
+splitting will handle the overflow, but the short content may appear in a different
+chunk boundary than its original page position. The qualifying page's metadata (not
+the short page's) is used for the merged document, so the short page's original page
+number is not directly surfaced in the chunk metadata.
+
+**How implemented:**
+`_clean_documents()` maintains `short_buffer: List[tuple]` of `(cleaned_text,
+original_metadata)` pairs. On each page: empty → drop; short → `short_buffer.append`;
+qualifying → flush buffer with `"\n\n".join(text for text, _ in short_buffer)` +
+prepend + `short_buffer = []`. Post-loop trailing flush creates a new `Document` to
+avoid mutating the stored instance. All-short-pages fallback uses a list comprehension
+over the buffer tuples to preserve per-page metadata.
+
+**Where:** `chunking/document_cleaner.py` — `_clean_documents()`
+
+---
+
 ## 15. Configuration
 
 ---
@@ -1587,10 +1738,13 @@ state — concurrent registration in parallel tests can cause interference.
 | OPT-52 | Multi-Format Document Loading | Reliability, Quality | `chunking/document_cleaner.py` |
 | OPT-53 | Centralised Pydantic Settings | Reliability | `config/settings.py` |
 | OPT-54 | RAGFactory Registry-Based Selection | Scalability | `rag/rag_factory.py` |
+| OPT-55 | Groq Queue + Worker Burst Protection | Reliability, Scalability | `llm/providers/groq_model_pool.py` |
+| OPT-56 | Five-Model Dynamic Pool Routing 4-Dimension | Reliability, Cost, Scalability | `llm/providers/model_router.py`, `llm/rate_limiter/rate_limit_tracker.py` |
+| OPT-57 | Short-Page Merging — No Silent Content Loss | Quality, Reliability | `chunking/document_cleaner.py` |
 
 ---
 
-**Total: 54 optimizations across 6 system layers.**
+**Total: 57 optimizations across 6 system layers.**
 
 | Category | Count |
 |---|---|

@@ -240,43 +240,106 @@ class DocumentCleaner:
             return ""
 
     def _clean_documents(self, documents: List[Document]) -> List[Document]:
-        """Apply _clean_text() to every page and filter low-quality results.
+        """Apply _clean_text() to every page and return cleaned documents with no
+        silent content loss.
 
-        Filters applied:
-            - Skips pages that are empty after cleaning.
-            - Skips pages shorter than min_chars_per_page.
-            - Preserves all original metadata on kept pages.
+        Two-phase filter:
+
+        Phase 1 — noise rejection (before length check):
+            _clean_text() strips boilerplate (page numbers, standalone URLs,
+            copyright lines) before we measure length. Pages that become empty
+            after stripping are pure noise and are dropped silently.
+
+        Phase 2 — short-page merging (replaces dropping):
+            Pages that survive stripping but are below min_chars_per_page are NOT
+            dropped. They are buffered and stitched into the next qualifying page.
+            This preserves critical single-sentence content — a story climax, a
+            chapter conclusion, a scene break — that would be silently lost by a
+            naive length filter.
+
+            Buffer flush rules:
+                - On the next qualifying page: prepend buffer → clear buffer.
+                - At end of document with buffered content: append to last kept page.
+                - If the document has NO qualifying pages at all: keep short pages
+                  as-is rather than lose them.
+
+        Chapter/section headers ("Chapter 5", "BOOK FIVE: 1806–1807") also hit
+        the short-page path. Merging them into the following page is beneficial —
+        the chunk gains section context that improves retrieval precision.
 
         Args:
-            documents: List of raw Document objects from the loader.
+            documents: Raw Document objects from the loader, one per page.
 
         Returns:
-            List of cleaned Document objects.
+            Cleaned Documents with all meaningful content preserved.
         """
-        cleaned = []
+        # Buffer stores (text, metadata) pairs so page provenance is never lost,
+        # even in the edge case where the entire document consists of short pages.
+        cleaned: List[Document] = []
+        short_buffer: List[tuple] = []  # (cleaned_text, original_metadata)
 
         for doc in documents:
             cleaned_text = self._clean_text(doc.page_content)
 
+            # Phase 1: pure noise — empty after boilerplate stripping → drop
             if not cleaned_text:
                 logger.info(
-                    "Page empty after cleaning — skipping: source=%s, page=%s",
+                    "Page empty after cleaning — dropped: source=%s, page=%s",
                     doc.metadata.get("source", "unknown"),
                     doc.metadata.get("page", "?"),
                 )
                 continue
 
+            # Phase 2: real but short content → buffer for merge, never drop
             if len(cleaned_text) < self._min_chars_per_page:
                 logger.info(
-                    "Page too short (%d chars) — skipping: source=%s, page=%s",
+                    "Page too short (%d chars) — buffering for merge: source=%s, page=%s",
                     len(cleaned_text),
                     doc.metadata.get("source", "unknown"),
                     doc.metadata.get("page", "?"),
                 )
+                short_buffer.append((cleaned_text, doc.metadata))
                 continue
 
-            cleaned.append(
-                Document(page_content=cleaned_text, metadata=doc.metadata)
-            )
+            # Qualifying page — flush buffered short content by prepending it.
+            # The merged page keeps the qualifying page's metadata (source, page number)
+            # since that is the anchor page readers would navigate to.
+            if short_buffer:
+                buffered_text = "\n\n".join(text for text, _ in short_buffer)
+                cleaned_text = buffered_text + "\n\n" + cleaned_text
+                logger.debug(
+                    "Merged %d buffered short page(s) into page=%s",
+                    len(short_buffer),
+                    doc.metadata.get("page", "?"),
+                )
+                short_buffer = []
+
+            cleaned.append(Document(page_content=cleaned_text, metadata=doc.metadata))
+
+        # Flush trailing buffer into the last kept page so end-of-document
+        # content (climax lines, epilogue fragments) is never silently lost.
+        if short_buffer:
+            if cleaned:
+                trailing_text = "\n\n".join(text for text, _ in short_buffer)
+                cleaned[-1] = Document(
+                    page_content=cleaned[-1].page_content + "\n\n" + trailing_text,
+                    metadata=cleaned[-1].metadata,
+                )
+                logger.debug(
+                    "Flushed %d trailing short page(s) into last kept page",
+                    len(short_buffer),
+                )
+            else:
+                # Entire document consists of short pages — keep each with its own
+                # metadata rather than lose everything or collapse into one blob.
+                logger.warning(
+                    "All %d page(s) were short — keeping as individual documents "
+                    "to avoid data loss",
+                    len(short_buffer),
+                )
+                cleaned = [
+                    Document(page_content=text, metadata=meta)
+                    for text, meta in short_buffer
+                ]
 
         return cleaned
