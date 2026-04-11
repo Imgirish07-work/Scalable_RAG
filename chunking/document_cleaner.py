@@ -64,6 +64,31 @@ class DocumentCleaner:
         re.IGNORECASE | re.MULTILINE,
     )
 
+    # Running header/footer detection thresholds.
+    # A line seen verbatim on >= max(MIN_PAGES, PAGE_FRACTION * total_pages) pages
+    # is classified as a running header and stripped from all pages before chunking.
+    # MAX_WORDS and MAX_CHARS cap what can qualify — real content lines are longer.
+    _RUNNING_HEADER_MIN_PAGES: int = 3
+    _RUNNING_HEADER_PAGE_FRACTION: float = 0.15
+    _RUNNING_HEADER_MAX_WORDS: int = 6
+    _RUNNING_HEADER_MAX_CHARS: int = 80
+
+    # Backslash between two word characters is always an OCR artifact in natural prose.
+    # PDF text never contains escape sequences; markdown is absent post-extraction.
+    _OCR_BACKSLASH_RE = re.compile(r"(?<=[a-zA-Z0-9])\\(?=[a-zA-Z0-9])")
+
+    # Characters outside standard prose, digits, whitespace, and common punctuation.
+    # Used to measure symbol density per line for noisy-line filtering.
+    _NOISY_SYMBOL_RE = re.compile(r"[^a-zA-Z0-9\s.,!?;:\-'\"()\u00C0-\u024F]")
+
+    # Lines shorter than this skip the noise check — too short for a reliable ratio.
+    _NOISE_CHECK_MIN_LEN: int = 5
+    # Lines longer than this also skip the noise check — long lines with high symbol
+    # density are usually mathematical notation or code, not garbage.
+    _NOISE_CHECK_MAX_LEN: int = 100
+    # Maximum allowed noisy-symbol fraction before a short line is dropped.
+    _MAX_LINE_NOISE_RATIO: float = 0.45
+
     def __init__(self) -> None:
         self._min_chars_per_page: int = settings.min_chars_per_page
         self._prefer_pdfplumber: bool = settings.prefer_pdfplumber
@@ -201,11 +226,13 @@ class DocumentCleaner:
         """Apply multi-step cleaning to raw extracted text from a single page.
 
         Steps applied in order:
-            1. ftfy — fix broken unicode and mojibake encoding issues.
-            2. Hyphens — rejoin hyphenated line breaks ('retriev-\\nal' → 'retrieval').
-            3. Boilerplate — remove page numbers, standalone URLs, copyright lines.
-            4. Whitespace — collapse 3+ newlines to 2, collapse repeated spaces.
-            5. Strip — remove leading and trailing whitespace.
+            1. ftfy           — fix broken unicode and mojibake encoding issues.
+            2. OCR artifacts  — remove backslashes between word characters.
+            3. Hyphens        — rejoin hyphenated line breaks ('retriev-\\nal' → 'retrieval').
+            4. Boilerplate    — remove page numbers, standalone URLs, copyright lines.
+            5. Noisy lines    — drop lines whose symbol-noise ratio exceeds the threshold.
+            6. Whitespace     — collapse 3+ newlines to 2, collapse repeated spaces.
+            7. Strip          — remove leading and trailing whitespace.
 
         Args:
             text: Raw text extracted from a document page.
@@ -221,11 +248,17 @@ class DocumentCleaner:
             # Fix encoding issues such as mojibake and broken unicode
             cleaned = ftfy.fix_text(text)
 
+            # Remove inter-word backslashes — always OCR artifacts in PDF prose
+            cleaned = self._remove_ocr_artifacts(cleaned)
+
             # Rejoin hyphenated line breaks introduced by PDF line wrapping
             cleaned = re.sub(r"(\w+)-\n(\w+)", r"\1\2", cleaned)
 
             # Remove boilerplate: page numbers, standalone URLs, copyright notices
             cleaned = self._BOILERPLATE_REGEX.sub("", cleaned)
+
+            # Drop lines that are predominantly non-prose symbols (OCR garbage)
+            cleaned = self._filter_noisy_lines(cleaned)
 
             # Normalize whitespace: collapse excess newlines and spaces
             cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
@@ -239,11 +272,150 @@ class DocumentCleaner:
             logger.exception("Error cleaning text: %s", e)
             return ""
 
+    def _remove_ocr_artifacts(self, text: str) -> str:
+        """Remove backslash OCR artifacts between word characters.
+
+        PDF text extraction never produces real backslash escape sequences
+        within prose. A backslash between two word characters (e.g., 'retriev\\al')
+        is always an artifact from a ligature or font-encoding mapping error.
+        The conservative lookbehind/lookahead restricts the match to
+        [a-zA-Z0-9] pairs, leaving mathematical notation and code paths untouched.
+
+        Args:
+            text: Text after ftfy encoding fixes.
+
+        Returns:
+            Text with inter-word backslashes removed.
+        """
+        return self._OCR_BACKSLASH_RE.sub("", text)
+
+    def _filter_noisy_lines(self, text: str) -> str:
+        """Drop lines whose noisy-symbol ratio exceeds the configured threshold.
+
+        Applied per-line after boilerplate removal. Lines shorter than
+        _NOISE_CHECK_MIN_LEN or longer than _NOISE_CHECK_MAX_LEN are
+        always kept — very short lines lack statistical reliability, and
+        long lines with high symbol density are more likely math or code
+        than garbage.
+
+        Noisy symbols: any character outside standard prose letters, digits,
+        whitespace, and common punctuation (defined by _NOISY_SYMBOL_RE).
+
+        Args:
+            text: Text after boilerplate removal.
+
+        Returns:
+            Text with high-noise lines removed; blank lines preserved.
+        """
+        lines = text.split("\n")
+        filtered = []
+        for line in lines:
+            length = len(line)
+            # Short or long lines are exempt — see class docstring for rationale
+            if length < self._NOISE_CHECK_MIN_LEN or length > self._NOISE_CHECK_MAX_LEN:
+                filtered.append(line)
+                continue
+            noisy_count = len(self._NOISY_SYMBOL_RE.findall(line))
+            ratio = noisy_count / length
+            if ratio > self._MAX_LINE_NOISE_RATIO:
+                logger.debug(
+                    "Noisy line dropped: ratio=%.2f '%s'",
+                    ratio,
+                    line[:60],
+                )
+                continue
+            filtered.append(line)
+        return "\n".join(filtered)
+
+    def _detect_running_headers(self, documents: List[Document]) -> frozenset:
+        """Identify running headers and footers that repeat verbatim across pages.
+
+        A line is classified as a running header when it appears on at least
+        max(MIN_PAGES, PAGE_FRACTION * total_pages) distinct pages AND is
+        short enough not to be real content (MAX_WORDS words, MAX_CHARS chars).
+
+        Common examples in large books: chapter titles ("BOOK ONE: 1805"),
+        document titles ("Attention Is All You Need"), section markers
+        ("CHAPTER V"), and repeating footers. Detecting these cross-document
+        prevents every chunk from being polluted with the same header text,
+        which would skew embedding similarity for unrelated queries.
+
+        Args:
+            documents: Raw Document list from the loader, one per page.
+
+        Returns:
+            Frozenset of stripped line strings classified as running headers.
+        """
+        if not documents:
+            return frozenset()
+
+        total_pages = len(documents)
+        threshold = max(
+            self._RUNNING_HEADER_MIN_PAGES,
+            int(self._RUNNING_HEADER_PAGE_FRACTION * total_pages),
+        )
+
+        # Count distinct pages each candidate line appears on.
+        # Using a set per page ensures a line repeated within one page counts once.
+        line_page_count: dict = {}
+        for doc in documents:
+            page_lines: set = set()
+            for line in doc.page_content.splitlines():
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if len(stripped) > self._RUNNING_HEADER_MAX_CHARS:
+                    continue
+                if len(stripped.split()) > self._RUNNING_HEADER_MAX_WORDS:
+                    continue
+                page_lines.add(stripped)
+            for line in page_lines:
+                line_page_count[line] = line_page_count.get(line, 0) + 1
+
+        headers = frozenset(
+            line for line, count in line_page_count.items()
+            if count >= threshold
+        )
+
+        if headers:
+            logger.info(
+                "Detected %d running header(s) across %d pages (threshold=%d): %s",
+                len(headers),
+                total_pages,
+                threshold,
+                list(headers)[:5],
+            )
+
+        return headers
+
+    def _strip_running_headers(self, text: str, headers: frozenset) -> str:
+        """Remove running header lines from a page's cleaned text.
+
+        Lines whose stripped form is in the headers set are removed.
+        Called per-page after _clean_text() in _clean_documents(), so
+        it operates on already-cleaned text rather than raw extraction output.
+
+        Args:
+            text: Cleaned page text.
+            headers: Frozenset of running header strings from _detect_running_headers.
+
+        Returns:
+            Text with running header lines removed.
+        """
+        if not headers:
+            return text
+        lines = text.split("\n")
+        return "\n".join(line for line in lines if line.strip() not in headers)
+
     def _clean_documents(self, documents: List[Document]) -> List[Document]:
-        """Apply _clean_text() to every page and return cleaned documents with no
+        """Apply cleaning to every page and return cleaned documents with no
         silent content loss.
 
-        Two-phase filter:
+        Pre-pass — running header detection:
+            Before any per-page cleaning, scan all pages to identify lines that
+            repeat verbatim across >= threshold pages (e.g. chapter titles,
+            document headers). These are stripped from every page after cleaning
+            to prevent them polluting embedding vectors for unrelated queries.
 
         Phase 1 — noise rejection (before length check):
             _clean_text() strips boilerplate (page numbers, standalone URLs,
@@ -273,6 +445,10 @@ class DocumentCleaner:
         Returns:
             Cleaned Documents with all meaningful content preserved.
         """
+        # Detect running headers cross-document before cleaning any page.
+        # Headers are stripped after per-page cleaning so they don't pollute chunks.
+        running_headers = self._detect_running_headers(documents)
+
         # Buffer stores (text, metadata) pairs so page provenance is never lost,
         # even in the edge case where the entire document consists of short pages.
         cleaned: List[Document] = []
@@ -280,6 +456,11 @@ class DocumentCleaner:
 
         for doc in documents:
             cleaned_text = self._clean_text(doc.page_content)
+
+            # Strip running headers identified across the full document
+            if running_headers:
+                cleaned_text = self._strip_running_headers(cleaned_text, running_headers)
+                cleaned_text = cleaned_text.strip()
 
             # Phase 1: pure noise — empty after boilerplate stripping → drop
             if not cleaned_text:

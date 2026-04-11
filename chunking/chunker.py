@@ -332,13 +332,23 @@ class Chunker:
 
     # Post-split processing
 
+    # Alpha ratio threshold for the TOC/index quality gate.
+    # Chunks below this fraction of alphabetic characters are likely
+    # index entries or page-number lists rather than prose content.
+    _MIN_ALPHA_RATIO: float = 0.40
+    # Only apply the alpha gate to short chunks — long chunks with low alpha
+    # are more likely to be legitimate code or data tables.
+    _ALPHA_GATE_MAX_TOKENS: int = 60
+
     def _filter_chunks(self, chunks: List[Document]) -> List[Document]:
         """Remove low-quality chunks and attempt to break oversized ones.
 
-        Filters applied:
+        Filters applied in order:
             empty       → blank content after strip
             too short   → token_count < min_chunk_tokens
             boilerplate → standalone page numbers, copyright lines
+            alpha gate  → alpha_ratio < 0.40 AND token_count < 60
+                          (catches TOC/index entries that pass the token minimum)
 
         Oversized chunks (> chunk_size tokens) are re-split with the zero-overlap
         splitter. If re-splitting produces more than one sub-chunk, those pass
@@ -372,6 +382,22 @@ class Chunker:
             if _BOILERPLATE.match(content):
                 logger.debug("Filtered: boilerplate '%s'", content[:40])
                 continue
+
+            # Alpha ratio gate: drop short chunks dominated by non-alphabetic
+            # characters — these are TOC entries, index pages, or page-number lists
+            # that slipped past the token minimum but carry no semantic value.
+            if token_count < self._ALPHA_GATE_MAX_TOKENS and content:
+                alpha_chars = sum(1 for c in content if c.isalpha())
+                alpha_ratio = alpha_chars / len(content)
+                if alpha_ratio < self._MIN_ALPHA_RATIO:
+                    logger.debug(
+                        "Filtered: low alpha ratio (%.2f < %.2f, %d tokens) '%s'",
+                        alpha_ratio,
+                        self._MIN_ALPHA_RATIO,
+                        token_count,
+                        content[:60],
+                    )
+                    continue
 
             # Oversized chunks are re-split with zero overlap to prevent the LLM
             # seeing duplicate content that would appear in overlapping sub-chunks
