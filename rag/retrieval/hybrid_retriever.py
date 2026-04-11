@@ -175,6 +175,14 @@ class HybridRetriever(BaseRetriever):
             List of LangChain Documents, or None if hybrid is unavailable
             or raises.
         """
+        # Respect the store's configured search mode — if it was initialised in
+        # dense-only mode, skip the hybrid path entirely so we never pay for a
+        # doomed prefetch attempt followed by a fallback penalty.
+        store_mode = getattr(self._store, "search_mode", "hybrid")
+        if store_mode == "dense":
+            logger.debug("Store search_mode=dense — routing directly to dense search")
+            return None
+
         if not hasattr(self._store, "hybrid_search_with_vectors"):
             logger.warning(
                 "QdrantStore does not have hybrid_search_with_vectors method, "

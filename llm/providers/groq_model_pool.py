@@ -87,7 +87,7 @@ from llm.providers.groq_provider import GroqProvider
 from llm.providers.model_router import ModelRouter, CallRole
 from llm.rate_limiter.rate_limit_tracker import get_tracker
 from llm.models.llm_response import LLMResponse
-from llm.exceptions.llm_exceptions import LLMRateLimitError, LLMProviderError
+from llm.exceptions.llm_exceptions import LLMRateLimitError, LLMProviderError, LLMTimeoutError
 from config.settings import settings
 from utils.logger import get_logger
 
@@ -481,6 +481,16 @@ class GroqModelPool(BaseLLM):
                 await self._router.on_429(model_id, retry_after=retry_after)
                 # Loop back — router will skip the cooled-down model
 
+            except LLMTimeoutError:
+                # Timeout on one model does not mean all models will time out.
+                # Put the model in a short cooldown and try the next one.
+                logger.warning(
+                    "Timeout on model=%s — applying 60s cooldown and trying next model",
+                    model_id,
+                )
+                await self._router.on_429(model_id, retry_after=60)
+                # Loop back — router will skip the cooled-down model
+
             except LLMProviderError as exc:
                 error_msg = str(exc).lower()
                 if "does not exist" in error_msg or "model_not_found" in error_msg:
@@ -496,7 +506,7 @@ class GroqModelPool(BaseLLM):
                     await self._router.on_429(model_id, retry_after=86_400)
                     # Loop back — router will skip the excluded model
                 else:
-                    # Auth errors, token limit exceeded, timeout, etc. —
+                    # Auth errors, token limit exceeded, etc. —
                     # not recoverable by switching models; propagate immediately.
                     raise
 

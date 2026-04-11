@@ -4,12 +4,16 @@ End-to-end RAG pipeline test using a real PDF with no mocks.
 Test scope:
     End-to-end integration test covering the full ingestion and query pipeline:
     DocumentCleaner → StructurePreserver → Chunker → QdrantStore →
-    HybridRetriever → SimpleRAG with CacheManager (L1+L2).
+    HybridRetriever → SimpleRAG / ChainRAG / CorrectiveRAG with CacheManager.
     Each query is run twice: first call is a cache miss, second is a cache hit.
 
 Flow:
     Load PDF → chunk → upsert to Qdrant → initialize cache → pre-warm LLM
     → run queries (miss + hit pairs) → print structured response summaries.
+
+Configuration (change these two lines to switch modes):
+    SEARCH_MODE  : "hybrid" | "dense" | "sparse"
+    RAG_VARIANT  : "simple" | "chain" | "corrective"
 
 Dependencies:
     GEMINI_API_KEY (and optionally GROQ_API_KEY) in .env; BGE embedding model;
@@ -32,28 +36,64 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Change this to "dense" or "sparse" to compare retrieval modes
-SEARCH_MODE = "hybrid"
+# Configuration — change these two lines to switch modes
+SEARCH_MODE = "hybrid"       # "hybrid" | "dense" | "sparse"
+RAG_VARIANT = "simple"       # "simple" | "chain" | "corrective"
 
 PDF_PATH = "./data/sample_docs/Attention is all you need.pdf"
-# Original queries (Run 1): populate the semantic cache with canonical forms.
-# Paraphrases (Run 2): verify cross-restart semantic cache hits on startup.
-# QUERIES = [
-#     "what is the transformer architecture?",
-#     "how does multi-head attention work?",
-#     "what are the results on WMT translation tasks?",
-# ]
 
-# Paraphrases for Run 2 semantic cache validation
-QUERIES = [
+# Query sets — each variant gets queries matched to its strengths
+
+# SimpleRAG: direct factual, single-hop questions
+_SIMPLE_QUERIES = [
     "explain the transformer model architecture",
     "describe how multi-headed attention works",
     "what BLEU scores did the transformer get on WMT?",
 ]
 
-def _print_response(response, query_num: int) -> None:
+# ChainRAG: multi-hop questions that require connecting multiple sections
+_CHAIN_QUERIES = [
+    (
+        "How does positional encoding work in the transformer, and why is it necessary "
+        "given that the architecture uses no recurrence or convolution?"
+    ),
+    (
+        "Explain the full training procedure of the transformer: what optimizer was used, "
+        "what learning rate schedule was applied, and what regularisation techniques "
+        "were used to prevent overfitting?"
+    ),
+    (
+        "How does the transformer's multi-head attention differ from single-head attention, "
+        "and what is the computational cost tradeoff between the number of heads "
+        "and the dimension per head?"
+    ),
+]
+
+# CorrectiveRAG: borderline or ambiguous questions that may trigger re-retrieval
+_CORRECTIVE_QUERIES = [
+    (
+        "Does the transformer architecture completely outperform all RNN and CNN models "
+        "on every NLP benchmark, or are there tasks where previous architectures are competitive?"
+    ),
+    (
+        "What are the limitations and failure modes of the transformer architecture "
+        "as acknowledged by the authors?"
+    ),
+    (
+        "Is scaled dot-product attention more or less computationally expensive than "
+        "additive attention, and under what conditions does that relationship change?"
+    ),
+]
+
+QUERIES = {
+    "simple":     _SIMPLE_QUERIES,
+    "chain":      _CHAIN_QUERIES,
+    "corrective": _CORRECTIVE_QUERIES,
+}[RAG_VARIANT]
+
+
+def _print_response(response, query_num: int, query_text: str) -> None:
     """Print a structured summary of a RAGResponse for manual inspection."""
-    # Derive the execution path label from actual response fields
     if response.cache_hit:
         execution_path = f"cache HIT ({response.cache_layer})"
         model_label = f"[cached] {response.model_name}"
@@ -65,7 +105,8 @@ def _print_response(response, query_num: int) -> None:
         model_label = response.model_name
 
     print(f"\n{'=' * 60}")
-    print(f"[ QUERY {query_num} — {execution_path} ]")
+    print(f"[ QUERY {query_num} | {RAG_VARIANT.upper()} | {SEARCH_MODE} | {execution_path} ]")
+    print(f"QUERY      : {query_text}")
     print(f"CACHE HIT  : {response.cache_hit} | layer={response.cache_layer}")
     if response.low_confidence:
         print("LOW CONFIDENCE: retrieval threshold not met — answer may be empty")
@@ -85,7 +126,7 @@ def _print_response(response, query_num: int) -> None:
 
 async def run() -> None:
     """Load the PDF, ingest it into Qdrant, initialize the cache, and run all queries."""
-    logger.info("Search mode: %s", SEARCH_MODE)
+    logger.info("Pipeline config | variant=%s | search_mode=%s", RAG_VARIANT, SEARCH_MODE)
 
     # Step 1: Load and clean the PDF
     logger.info("Loading PDF: %s", PDF_PATH)
@@ -93,14 +134,14 @@ async def run() -> None:
     preserver = StructurePreserver()
     chunker   = Chunker()
 
-    raw_docs    = await asyncio.to_thread(cleaner.load_and_clean, PDF_PATH)
+    raw_docs   = await asyncio.to_thread(cleaner.load_and_clean, PDF_PATH)
     logger.info("Loaded %d pages from PDF", len(raw_docs))
 
-    structured  = await asyncio.to_thread(preserver.preserve, raw_docs)
-    chunks      = await asyncio.to_thread(chunker.split_documents, structured)
+    structured = await asyncio.to_thread(preserver.preserve, raw_docs)
+    chunks     = await asyncio.to_thread(chunker.split_documents, structured)
     logger.info("Split into %d chunks", len(chunks))
 
-    # Step 2: Build in-memory Qdrant store and ingest chunks
+    # Step 2: Build Qdrant store and ingest chunks
     store = QdrantStore(
         collection_name="attention_paper",
         in_memory=False,
@@ -134,7 +175,7 @@ async def run() -> None:
         llm = LLMFactory.create_rate_limited("gemini")
         fallback_llm = None
 
-    # Pre-warm the LLM to open TCP+TLS before Q1 (no RAGPipeline.initialize() here)
+    # Pre-warm Gemini to open TCP+TLS before Q1
     async def _pre_warm_llm(provider, name):
         try:
             await provider.generate("Reply with: OK", max_tokens=2)
@@ -142,7 +183,6 @@ async def run() -> None:
         except Exception as exc:
             err = str(exc)
             if "<html" in err.lower() or "<!doctype" in err.lower():
-                # Zscaler/proxy returned an HTML block page — log cleanly
                 logger.warning(
                     "LLM pre-warm skipped (%s): blocked by corporate proxy/firewall "
                     "(request to provider API was intercepted)", name,
@@ -150,17 +190,28 @@ async def run() -> None:
             else:
                 logger.warning("LLM pre-warm failed (%s): %s", name, err[:200])
 
-    # Only warm Gemini; Groq is Zscaler-blocked on corp network and will
-    # self-attempt on first query then fall back to the warm Gemini provider.
+    # Only warm Gemini; Groq is Zscaler-blocked on corp network
     if fallback_llm:
         await _pre_warm_llm(fallback_llm, fallback_llm.model_name)
 
+    # ChainRAG config: tighter top_k per hop — it accumulates across hops
+    rag_config = RAGConfig(
+        top_k=3 if RAG_VARIANT == "chain" else 5,
+        rerank_strategy="cross_encoder",
+        max_hops=3 if RAG_VARIANT == "chain" else 1,
+    )
+
     rag = RAGFactory.create(
-        "simple",
+        RAG_VARIANT,
         retriever=retriever,
         llm=llm,
         cache=cache,
         fallback_llm=fallback_llm,
+    )
+
+    logger.info(
+        "RAG pipeline ready | variant=%s | search_mode=%s | queries=%d",
+        RAG_VARIANT, SEARCH_MODE, len(QUERIES),
     )
 
     # Step 5: Run each query twice — first call is a miss, second is a cache hit
@@ -168,16 +219,16 @@ async def run() -> None:
         request = RAGRequest(
             query=query_text,
             collection_name="attention_paper",
-            config=RAGConfig(top_k=5, rerank_strategy="cross_encoder"),
+            config=rag_config,
         )
 
-        logger.info("=== QUERY %d/%d (first call): %s ===", q_idx, len(QUERIES), query_text)
+        logger.info("=== QUERY %d/%d (first call): %s ===", q_idx, len(QUERIES), query_text[:80])
         resp_miss = await rag.query(request)
-        _print_response(resp_miss, q_idx * 2 - 1)
+        _print_response(resp_miss, q_idx * 2 - 1, query_text)
 
-        logger.info("=== QUERY %d/%d (second call): %s ===", q_idx, len(QUERIES), query_text)
+        logger.info("=== QUERY %d/%d (second call — cache): %s ===", q_idx, len(QUERIES), query_text[:80])
         resp_hit = await rag.query(request)
-        _print_response(resp_hit, q_idx * 2)
+        _print_response(resp_hit, q_idx * 2, query_text)
 
 
 if __name__ == "__main__":
