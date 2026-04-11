@@ -364,11 +364,19 @@ class GroqModelPool(BaseLLM):
         try:
             self._queue.put_nowait(item)
         except asyncio.QueueFull:
+            logger.warning(
+                "Request queue full — rejecting request | queue_size=%d/%d",
+                self._queue.qsize(), _QUEUE_MAX_SIZE,
+            )
             raise LLMRateLimitError(
                 f"GroqModelPool request queue is full (max={_QUEUE_MAX_SIZE}). "
                 "The system is overloaded — try again shortly."
             )
 
+        logger.debug(
+            "Request added to queue | queue_size=%d/%d",
+            self._queue.qsize(), _QUEUE_MAX_SIZE,
+        )
         return await future
 
     async def _worker(self, worker_id: int) -> None:
@@ -390,6 +398,10 @@ class GroqModelPool(BaseLLM):
 
         while True:
             item: _RequestItem = await self._queue.get()
+            logger.debug(
+                "Worker %d picked up request | queue_remaining=%d",
+                worker_id, self._queue.qsize(),
+            )
             try:
                 response = await self._dispatch(item.messages, **item.kwargs)
                 item.future.set_result(response)
@@ -427,6 +439,8 @@ class GroqModelPool(BaseLLM):
         role = self._detect_role(kwargs.get("max_tokens"))
         est_tokens = await self._estimate_tokens(messages, kwargs.get("max_tokens"))
 
+        logger.debug("Routing started | role=%s | est_tokens=%d", role, est_tokens)
+
         # Retry loop: each 429 or 404 eliminates one model via cooldown and
         # the router automatically skips it on the next iteration.
         # The loop terminates when router.route() returns None (all pools empty).
@@ -439,6 +453,11 @@ class GroqModelPool(BaseLLM):
                     "All Groq pool models are rate-limited or exhausted. "
                     "Try again after the shortest cooldown expires."
                 )
+
+            logger.info(
+                "Routing to model | model=%s | role=%s | est_tokens=%d",
+                model_id, role, est_tokens,
+            )
 
             try:
                 response = await self._call_provider(model_id, messages, **kwargs)
@@ -454,8 +473,11 @@ class GroqModelPool(BaseLLM):
                 return response
 
             except LLMRateLimitError as exc:
-                # HTTP 429 — put model in cooldown and retry with the next model
                 retry_after = self._parse_retry_after(str(exc))
+                logger.warning(
+                    "429 on model=%s — cooldown=%ss | switching to next available model",
+                    model_id, retry_after if retry_after is not None else 60,
+                )
                 await self._router.on_429(model_id, retry_after=retry_after)
                 # Loop back — router will skip the cooled-down model
 
