@@ -191,7 +191,7 @@ class RAGConfig(BaseModel):
 
     rag_variant: str | None = Field(
         default=None,
-        description="RAG variant: simple, corrective. None = use settings default.",
+        description="RAG variant: simple, corrective, chain. None = use settings default.",
     )
     retrieval_mode: str = Field(
         default="dense",

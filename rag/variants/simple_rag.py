@@ -68,16 +68,19 @@ class SimpleRAG(BaseRAG):
         query: str,
         top_k: int,
         filters: list[MetadataFilter] | None = None,
+        request=None,
     ) -> list[RetrievedChunk]:
         """Retrieve relevant chunks via direct retriever call.
 
         No evaluation, no retry, no query rewriting. Delegates directly to
-        the injected BaseRetriever (dense or hybrid).
+        the injected BaseRetriever (dense or hybrid). The request parameter
+        is accepted for interface consistency but not used by SimpleRAG.
 
         Args:
             query: Processed query string (output of pre_process).
             top_k: Maximum number of chunks to retrieve.
             filters: Optional metadata filters from RAGConfig.
+            request: Unused. Accepted for interface compatibility with ChainRAG.
 
         Returns:
             List of RetrievedChunk ordered by relevance (highest first).

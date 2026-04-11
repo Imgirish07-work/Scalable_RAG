@@ -87,6 +87,7 @@ class CorrectiveRAG(BaseRAG):
         cache: object | None = None,
         ranker: ContextRanker | None = None,
         assembler: ContextAssembler | None = None,
+        fallback_llm: BaseLLM | None = None,
         pass_threshold: float | None = None,
         retry_threshold: float | None = None,
         max_retries: int | None = None,
@@ -100,6 +101,7 @@ class CorrectiveRAG(BaseRAG):
             cache: Optional CacheManager.
             ranker: Optional ContextRanker.
             assembler: Optional ContextAssembler.
+            fallback_llm: Optional secondary LLM used when the primary fails.
             pass_threshold: Minimum relevance to accept without retry.
                 Falls back to settings.CRAG_RELEVANCE_THRESHOLD_PASS.
             retry_threshold: Minimum relevance to attempt a query rewrite.
@@ -116,6 +118,7 @@ class CorrectiveRAG(BaseRAG):
             cache=cache,
             ranker=ranker,
             assembler=assembler,
+            fallback_llm=fallback_llm,
         )
 
         self._pass_threshold = (
@@ -164,6 +167,7 @@ class CorrectiveRAG(BaseRAG):
         query: str,
         top_k: int,
         filters: list[MetadataFilter] | None = None,
+        request=None,
     ) -> list[RetrievedChunk]:
         """Retrieve with relevance evaluation and optional query rewrite retry.
 
@@ -179,6 +183,7 @@ class CorrectiveRAG(BaseRAG):
             query: Processed query string (output of pre_process).
             top_k: Maximum chunks to retrieve.
             filters: Optional metadata filters.
+            request: Unused. Accepted for interface compatibility with ChainRAG.
 
         Returns:
             List of RetrievedChunk ordered by relevance.

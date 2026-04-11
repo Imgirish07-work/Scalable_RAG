@@ -150,17 +150,21 @@ class BaseRAG(ABC):
         query: str,
         top_k: int,
         filters: list | None = None,
+        request: RAGRequest | None = None,
     ) -> list[RetrievedChunk]:
         """Retrieve relevant chunks from the vector store.
 
         This is the primary hook every variant implements. SimpleRAG
         calls the retriever directly. CorrectiveRAG adds relevance
-        evaluation and retry logic.
+        evaluation and retry logic. ChainRAG uses request to resolve
+        per-request max_hops from RAGConfig.
 
         Args:
             query: Processed query string (output of pre_process).
             top_k: Maximum chunks to retrieve.
             filters: Optional metadata filters from RAGConfig.
+            request: Full RAGRequest. ChainRAG reads config.max_hops from it.
+                Other variants may ignore it.
 
         Returns:
             List of RetrievedChunk ordered by relevance.
@@ -229,6 +233,7 @@ class BaseRAG(ABC):
             query=processed_query,
             top_k=retrieval_k,
             filters=config.metadata_filters,
+            request=request,
         )
         retrieval_ms = (time.perf_counter() - retrieval_start) * 1000
 
@@ -564,15 +569,18 @@ class BaseRAG(ABC):
             raise
 
         except Exception as exc:
-            # Primary LLM failed with a provider-level error (network, timeout, etc.).
-            # Mark it as unavailable so subsequent queries skip straight to fallback.
-            # If a fallback LLM is configured, retry generation ONLY — no re-retrieval.
-            # This saves ~3-4s vs re-running the full pipeline from the caller.
-            if isinstance(exc, LLMProviderError) and self._fallback_llm is not None:
-                provider_health.mark_failed(self._llm.provider_name)
+            # Any LLM-layer error (timeout, rate-limit, provider failure) with a
+            # fallback configured → retry generation with the fallback LLM only.
+            # Re-retrieval is skipped — this saves ~3-4s vs re-running the pipeline.
+            # Only LLMProviderError (hard failure) marks the primary as unavailable;
+            # transient errors (timeout, rate-limit) let the pool self-recover.
+            if isinstance(exc, LLMError) and self._fallback_llm is not None:
+                if isinstance(exc, LLMProviderError):
+                    provider_health.mark_failed(self._llm.provider_name)
                 logger.warning(
-                    "Primary LLM failed, retrying generation with fallback | "
+                    "Primary LLM failed (%s), retrying generation with fallback | "
                     "primary=%s | fallback=%s | error=%s",
+                    type(exc).__name__,
                     self._llm.provider_name,
                     self._fallback_llm.provider_name,
                     str(exc),
@@ -596,7 +604,7 @@ class BaseRAG(ABC):
                         details={"request_id": request.request_id},
                     ) from fallback_exc
 
-            # Non-provider errors or no fallback configured — propagate as-is
+            # No fallback configured — propagate LLM errors as-is, wrap the rest
             if isinstance(exc, LLMError):
                 raise
 
@@ -665,7 +673,7 @@ class BaseRAG(ABC):
         self,
         request: RAGRequest,
         llm_response: LLMResponse,
-        sources: list[RetrievedChunk] = [],
+        sources: list[RetrievedChunk] | None = None,
         confidence: ConfidenceScore | None = None,
     ) -> None:
         """Attempt to write a response to cache. Errors are caught and logged.
@@ -686,7 +694,7 @@ class BaseRAG(ABC):
                 temperature=request.config.temperature,
                 response=llm_response,
                 system_prompt=request.config.system_prompt or "",
-                sources=[chunk.model_dump() for chunk in sources],
+                sources=[chunk.model_dump() for chunk in (sources or [])],
                 confidence_value=confidence.value if confidence is not None else 0.0,
             )
             await self._cache.resolve_in_flight(

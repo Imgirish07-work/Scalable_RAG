@@ -87,6 +87,7 @@ class ChainRAG(BaseRAG):
         cache=None,
         ranker: Optional[ContextRanker] = None,
         assembler: Optional[ContextAssembler] = None,
+        fallback_llm: Optional[BaseLLM] = None,
     ) -> None:
         """Initialize the ChainRAG variant.
 
@@ -96,6 +97,7 @@ class ChainRAG(BaseRAG):
             cache: Optional CacheManager instance.
             ranker: Optional ContextRanker. Defaults to MMR in BaseRAG.
             assembler: Optional ContextAssembler. Defaults in BaseRAG.
+            fallback_llm: Optional secondary LLM used when the primary fails.
         """
         super().__init__(
             retriever=retriever,
@@ -103,6 +105,7 @@ class ChainRAG(BaseRAG):
             cache=cache,
             ranker=ranker,
             assembler=assembler,
+            fallback_llm=fallback_llm,
         )
         # True when the chain resolves within max_hops; False when truncated
         self._chain_completed: bool = False
