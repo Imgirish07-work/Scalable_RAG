@@ -3,19 +3,26 @@ End-to-end RAG pipeline test using a real PDF with no mocks.
 
 Test scope:
     End-to-end integration test covering the full ingestion and query pipeline:
-    DocumentCleaner → StructurePreserver → Chunker → QdrantStore (in-memory,
-    hybrid mode) → HybridRetriever → SimpleRAG with CacheManager (L1+L2).
+    DocumentCleaner → StructurePreserver → Chunker → QdrantStore →
+    HybridRetriever → SimpleRAG with CacheManager (L1+L2).
     Each query is run twice: first call is a cache miss, second is a cache hit.
 
 Flow:
     Load PDF → chunk → upsert to Qdrant → initialize cache → pre-warm LLM
     → run queries (miss + hit pairs) → print structured response summaries.
 
+Usage:
+    python test_real_pipeline.py                      # defaults to hybrid mode
+    python test_real_pipeline.py --search-mode dense
+    python test_real_pipeline.py --search-mode sparse
+    python test_real_pipeline.py --search-mode hybrid
+
 Dependencies:
     GEMINI_API_KEY (and optionally GROQ_API_KEY) in .env; BGE embedding model;
     sample PDF at data/sample_docs/Attention is all you need.pdf.
 """
 
+import argparse
 import asyncio
 
 from chunking.document_cleaner import DocumentCleaner
@@ -32,6 +39,9 @@ from config.settings import settings
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Valid search modes accepted by QdrantStore
+_SEARCH_MODES = ("dense", "sparse", "hybrid")
 
 PDF_PATH = "./data/sample_docs/Attention is all you need.pdf"
 # Original queries (Run 1): populate the semantic cache with canonical forms.
@@ -81,8 +91,14 @@ def _print_response(response, query_num: int) -> None:
     print("=" * 60 + "\n")
 
 
-async def run():
-    """Load the PDF, ingest it into Qdrant, initialize the cache, and run all queries."""
+async def run(search_mode: str) -> None:
+    """Load the PDF, ingest it into Qdrant, initialize the cache, and run all queries.
+
+    Args:
+        search_mode: Qdrant retrieval strategy — 'dense', 'sparse', or 'hybrid'.
+    """
+    logger.info("Search mode: %s", search_mode)
+
     # Step 1: Load and clean the PDF
     logger.info("Loading PDF: %s", PDF_PATH)
     cleaner   = DocumentCleaner()
@@ -100,7 +116,7 @@ async def run():
     store = QdrantStore(
         collection_name="attention_paper",
         in_memory=False,
-        search_mode="hybrid",
+        search_mode=search_mode,
     )
     await store.initialize()
 
@@ -177,4 +193,12 @@ async def run():
 
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    parser = argparse.ArgumentParser(description="End-to-end RAG pipeline test.")
+    parser.add_argument(
+        "--search-mode",
+        choices=_SEARCH_MODES,
+        default="hybrid",
+        help="Qdrant retrieval strategy (default: hybrid).",
+    )
+    args = parser.parse_args()
+    asyncio.run(run(search_mode=args.search_mode))
