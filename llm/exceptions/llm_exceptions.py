@@ -1,45 +1,45 @@
 """
-LLM exception hierarchy.
+Custom exception hierarchy for LLM provider errors.
 
 Design:
-    - Every provider translates SDK-specific errors into this hierarchy.
-    - Pipeline and RAG layers catch ONLY these exceptions — never raw
-      OpenAI/Gemini SDK errors.
-    - LLMError is the base — catching it catches everything.
+    Every provider translates its SDK-specific exceptions into this hierarchy
+    before raising. The pipeline and RAG layers catch only these exceptions,
+    never raw OpenAI or Gemini SDK errors. LLMError is the base class —
+    catching it handles any provider failure uniformly.
 
-Hierarchy:
-    LLMError
-    ├── LLMAuthError          (invalid / missing API key)
-    ├── LLMRateLimitError     (quota exceeded — retry after delay)
-    ├── LLMTimeoutError       (request exceeded deadline)
-    ├── LLMTokenLimitError    (prompt exceeds context window)
-    └── LLMProviderError      (generic provider-side failure)
+Chain of Responsibility:
+    Provider._handle_error() translates SDK exceptions → raises LLMError
+    subclass → caught by BaseRAG.generate() or LLMRateLimiter.
+
+Dependencies:
+    None (stdlib only).
 """
 
 
 class LLMError(Exception):
-    """Base exception for all LLM errors.
+    """Base exception for all LLM-related errors.
 
-    All provider-specific errors are translated into subclasses of this.
-    Pipeline code catches LLMError to handle any provider failure uniformly.
+    Catch this to handle any provider failure uniformly. All provider-specific
+    errors are subclasses of LLMError so a single except clause is sufficient
+    when the caller does not need to distinguish failure modes.
     """
 
 
 class LLMAuthError(LLMError):
-    """Invalid or missing API key.
+    """API key is invalid or missing.
 
     Raised when:
-        - API key is not set in .env or constructor.
-        - Provider returns 401/403 or equivalent authentication failure.
+        - API key is not set in .env or passed to the constructor.
+        - The provider returns a 401 or 403 (or equivalent) response.
     """
 
 
 class LLMRateLimitError(LLMError):
-    """API quota or rate limit exceeded.
+    """API quota or rate limit has been exceeded.
 
     Raised when:
-        - Provider returns 429 or ResourceExhausted.
-        - Caller should implement exponential backoff before retrying.
+        - The provider returns HTTP 429 or ResourceExhausted.
+        - Caller should apply exponential backoff before retrying.
     """
 
 
@@ -47,8 +47,8 @@ class LLMTimeoutError(LLMError):
     """Request exceeded the configured deadline.
 
     Raised when:
-        - Provider returns DeadlineExceeded or APITimeoutError.
-        - Consider increasing timeout or reducing prompt size.
+        - The provider returns DeadlineExceeded or APITimeoutError.
+        - Consider increasing the timeout or reducing the prompt size.
     """
 
 
@@ -56,15 +56,15 @@ class LLMTokenLimitError(LLMError):
     """Prompt exceeds the model's context window.
 
     Raised when:
-        - Provider returns context_length_exceeded or equivalent.
-        - RLM layer uses this as a signal to chunk and recurse.
+        - The provider returns context_length_exceeded or equivalent.
+        - The RLM layer uses this as a signal to chunk and recurse.
     """
 
 
 class LLMProviderError(LLMError):
-    """Generic provider-side error not covered by specific subclasses.
+    """Generic provider-side error not covered by a more specific subclass.
 
     Raised when:
-        - Provider returns an unrecognized API error.
-        - Unknown exceptions from the SDK are wrapped in this.
+        - The provider returns an unrecognized API error.
+        - Unknown SDK exceptions are wrapped in this class.
     """

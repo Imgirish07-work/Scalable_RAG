@@ -1,13 +1,23 @@
-"""Prompt templates for the agent layer.
+"""
+Prompt templates for the agent layer.
 
-Three prompt pairs: planning, verification, and synthesis.
-Each returns a (system_prompt, user_prompt) tuple compatible
-with BaseLLM.chat().
+Design:
+    Three prompt pairs (planning, verification, synthesis), each as a
+    module-level constant plus a builder function. Constants hold the
+    static system prompt; builder functions inject runtime values into
+    the user prompt. All builders return (system_prompt, user_prompt)
+    tuples compatible with BaseLLM.chat().
+
+Chain of Responsibility:
+    QueryPlanner calls build_planning_prompt() → ResultVerifier calls
+    build_verification_prompt() → AnswerSynthesizer calls
+    build_synthesis_prompt().
+
+Dependencies:
+    None (stdlib only).
 """
 
-# ──────────────────────────────────────────────
 # Planning — decompose query into sub-queries
-# ──────────────────────────────────────────────
 
 PLANNING_SYSTEM_PROMPT = (
     "You are a query decomposition planner. Your job is to break a complex "
@@ -42,6 +52,8 @@ PLANNING_USER_PROMPT = (
 )
 
 
+# Verification — check whether a sub-query answer is adequate
+
 VERIFICATION_SYSTEM_PROMPT = (
     "You are a result quality verifier. Evaluate whether a sub-query answer "
     "adequately addresses the question it was meant to answer.\n\n"
@@ -61,9 +73,7 @@ VERIFICATION_USER_PROMPT = (
 )
 
 
-# ──────────────────────────────────────────────
-# Synthesis — combine sub-query results
-# ──────────────────────────────────────────────
+# Synthesis — combine sub-query results into a final answer
 
 SYNTHESIS_SYSTEM_PROMPT = (
     "You are an answer synthesizer. Combine multiple sub-query results into "
@@ -85,9 +95,7 @@ SYNTHESIS_USER_PROMPT = (
 )
 
 
-# ──────────────────────────────────────────────
 # Builder functions
-# ──────────────────────────────────────────────
 
 def build_planning_prompt(
     query: str,

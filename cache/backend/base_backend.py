@@ -1,24 +1,39 @@
 """
-Abstract base class for all cache backends.
+Abstract base class for all cache storage backends.
 
-Defines the async interface that memory_backend.py and redis_backend.py
+Design:
+    ABC defining the async contract that every backend must implement.
+    MemoryBackend (L1) and RedisBackend (L2) are the two concrete
+    implementations. All methods are async so the event loop is never
+    blocked by storage I/O, regardless of backend type.
 
-All methods are async — FastAPI ready, event loop never blocked.
+    Design contract:
+        - get() returns None on miss, never raises on a missing key
+        - set() silently overwrites existing keys
+        - delete() is idempotent — deleting a missing key is a no-op
+        - clear() removes ALL entries (use with caution in production)
+        - All methods raise CacheBackendError on internal failures
+        - The caller (cache_manager.py) wraps all calls in try/except
 
-Design contract:
-    - get() returns None on miss, never raises on missing key
-    - set() overwrites existing keys silently
-    - delete() is idempotent — deleting a missing key does nothing
-    - clear() removes ALL entries (use with caution)
-    - All methods raise CacheBackendError on internal failures
-    - The caller (cache_manager.py) wraps all calls in try/except
+Chain of Responsibility:
+    Created and injected by CacheManager. Called by ExactCacheStrategy
+    and SemanticCacheStrategy during lookup and write operations.
+    CircuitBreaker wraps every call in RedisCacheBackend.
+
+Dependencies:
+    abc (stdlib only — no third-party dependencies at this level)
 """
 
 from abc import ABC, abstractmethod
 from typing import Optional
 
+
 class BaseCacheBackend(ABC):
-    """Async interface for cache storage backends."""
+    """Async interface for cache storage backends.
+
+    Attributes:
+        name: Human-readable backend identifier used in logs and metrics.
+    """
 
     @property
     @abstractmethod
@@ -37,7 +52,7 @@ class BaseCacheBackend(ABC):
         """
 
     @abstractmethod
-    async def set(self, key: str, value: str, ttl_seconds: int) ->  None:
+    async def set(self, key: str, value: str, ttl_seconds: int) -> None:
         """Store a value with TTL.
 
         Args:
@@ -56,7 +71,7 @@ class BaseCacheBackend(ABC):
         Returns:
             True if the key was found and deleted, False if missing.
         """
-        
+
     @abstractmethod
     async def exists(self, key: str) -> bool:
         """Check if a key exists without retrieving the value.

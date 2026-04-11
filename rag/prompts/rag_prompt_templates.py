@@ -1,38 +1,32 @@
 """
-RAG prompt templates — plain Python string templates
+Prompt templates for RAG generation, evaluation, and query refinement.
 
 Design:
-    - Each template is a module-level constant string with {placeholders}.
-    - Templates are filled via str.format() — simple, debuggable, no
-      template engine dependency.
-    - Separate templates for each RAG variant and sub-task. Variants
-      pick the template they need — no giant multi-purpose template.
-    - System prompts define the LLM's role and grounding rules.
-      User prompts carry the actual query + context.
+    Each template is a module-level string constant with {placeholders}
+    filled via str.format(). No template engine dependency — plain Python,
+    easy to diff and debug. Separate templates per task: generation, relevance
+    evaluation, query rewriting, and conversation refinement. Builder
+    functions pair each system prompt with its user prompt and handle
+    placeholder substitution, keeping call sites clean.
 
-Template categories:
-    1. System prompts — define LLM behavior for RAG generation
-    2. User prompts — carry query + assembled context
-    3. CorrectiveRAG prompts — relevance evaluation + query rewriting
-    4. Utility prompts — conversation-aware query refinement
+    Grounding rule: every RAG system prompt instructs the LLM to answer
+    ONLY from the provided context. Without this rule the LLM hallucinates
+    confidently — it is the single most important RAG prompt engineering
+    decision.
 
-Grounding philosophy:
-    - Every RAG system prompt instructs the LLM to answer ONLY from
-      the provided context. If the context doesn't contain the answer,
-      the LLM must say so explicitly.
-    - This is the single most important prompt engineering decision
-      for RAG — without it, the LLM will hallucinate confidently.
+Chain of Responsibility:
+    build_rag_prompt() called by BaseRAG.generate()
+    build_relevance_eval_prompt() called by CorrectiveRAG._evaluate_single_chunk()
+    build_query_rewrite_prompt() called by CorrectiveRAG._rewrite_query()
+    build_conversation_refinement_prompt() called by BaseRAG.pre_process()
+    build_chain_draft_prompt() / build_chain_completeness_prompt() called by ChainRAG
 
-Integration:
-    - BaseRAG.generate() uses SYSTEM_PROMPT + USER_PROMPT
-    - CorrectiveRAG.retrieve() uses RELEVANCE_EVAL_PROMPT
-    - CorrectiveRAG.retrieve() uses QUERY_REWRITE_PROMPT on retry
-    - Pre-process step uses CONVERSATION_QUERY_REFINEMENT_PROMPT
-      when conversation_history is present
+Dependencies:
+    None (stdlib only).
 """
 
 
-# 1. System prompts — LLM role and grounding rules
+# 1. System prompts — define LLM role and grounding rules
 
 RAG_SYSTEM_PROMPT = (
     "You are a helpful assistant that answers questions based strictly on "
@@ -58,7 +52,7 @@ RAG_SYSTEM_PROMPT_CONCISE = (
 )
 
 
-# 2. User prompts — query + context for generation
+# 2. User prompts — carry query and assembled context
 
 RAG_USER_PROMPT = (
     "Context:\n"
@@ -126,7 +120,8 @@ QUERY_REWRITE_USER_PROMPT = (
     "Rewritten query:"
 )
 
-# CoRAG (Chain-of-RAG) — Draft + Completeness
+
+# 4. ChainRAG prompts — draft generation and completeness evaluation
 
 CHAIN_DRAFT_SYSTEM_PROMPT = (
     "You are a precise information extractor. Generate a concise draft answer "
@@ -175,7 +170,7 @@ CHAIN_COMPLETENESS_USER_PROMPT = (
 )
 
 
-# 4. Utility prompts — conversation-aware query refinement
+# 5. Utility prompts — conversation-aware query refinement
 
 CONVERSATION_QUERY_REFINEMENT_PROMPT = (
     "Given the conversation history and the latest user query, "
@@ -202,14 +197,13 @@ def build_rag_prompt(
 ) -> tuple[str, str]:
     """Build the system + user prompt pair for RAG generation.
 
-    Selects the appropriate user prompt template based on whether
-    conversation history is provided.
+    Selects the history-aware template when conversation_history is provided,
+    otherwise uses the plain template.
 
     Args:
         query: The user's question.
         context: Assembled context string from ContextAssembler.
-        conversation_history: Optional formatted conversation history.
-            If provided, uses the history-aware template.
+        conversation_history: Optional formatted conversation history string.
 
     Returns:
         Tuple of (system_prompt, user_prompt).
@@ -239,7 +233,7 @@ def build_relevance_eval_prompt(
 
     Args:
         query: The user's original question.
-        document: Single chunk content to evaluate.
+        document: Single chunk content to evaluate for relevance.
 
     Returns:
         Tuple of (system_prompt, user_prompt).
@@ -256,7 +250,7 @@ def build_query_rewrite_prompt(query: str) -> tuple[str, str]:
     """Build the prompt pair for CorrectiveRAG query rewriting.
 
     Args:
-        query: The original query that failed retrieval.
+        query: The original query that produced low-relevance retrieval results.
 
     Returns:
         Tuple of (system_prompt, user_prompt).
@@ -272,17 +266,16 @@ def build_conversation_refinement_prompt(
 ) -> tuple[str, str]:
     """Build the prompt pair for conversation-aware query refinement.
 
-    Used in pre_process() when the RAGRequest has conversation_history.
-    Resolves pronouns and references to make the query self-contained
-    for retrieval.
+    Used in BaseRAG.pre_process() when the RAGRequest has conversation_history.
+    Resolves pronouns and trailing references to make the query self-contained
+    for retrieval embedding.
 
     Args:
-        query: The latest user query (may contain pronouns).
-        conversation_history: Formatted previous turns.
+        query: The latest user query, possibly containing pronouns or references.
+        conversation_history: Formatted string of previous conversation turns.
 
     Returns:
-        Tuple of (system_prompt, user_prompt) where system is a
-            simple instruction and user carries the history + query.
+        Tuple of (system_prompt, user_prompt).
     """
     system = (
         "Rewrite the query to be self-contained. "
@@ -299,17 +292,16 @@ def format_conversation_history(
     turns: list[dict],
     max_turns: int = 10,
 ) -> str:
-    """Format conversation turns into a readable string.
+    """Format conversation turns into a human-readable string.
 
-    Limits the number of turns to prevent context window bloat.
-    Takes the most recent turns (tail of the list).
+    Takes the most recent turns to prevent context window bloat when
+    conversation history is long.
 
     Args:
         turns: List of {"role": str, "content": str} dicts.
             Output of RAGRequest.get_chat_messages().
-        max_turns: Maximum number of turns to include.
-            Default 10 — enough for context, not enough to
-            blow the token budget.
+        max_turns: Maximum number of turns to include. Default 10 —
+            enough for context without blowing the token budget.
 
     Returns:
         Formatted conversation string. Empty string if no turns.
@@ -317,7 +309,7 @@ def format_conversation_history(
     if not turns:
         return ""
 
-    # Take the most recent turns
+    # Use only the most recent turns to cap token usage
     recent = turns[-max_turns:]
 
     lines = []
@@ -330,11 +322,11 @@ def format_conversation_history(
 
 
 def build_chain_draft_prompt(context: str, query: str) -> tuple[str, str]:
-    """Build system and user prompts for CoRAG draft generation.
+    """Build system and user prompts for ChainRAG draft generation.
 
     Args:
-        context: Assembled context string from retrieved chunks.
-        query: The current query (original or follow-up).
+        context: Assembled context string from accumulated retrieved chunks.
+        query: The current query (original or follow-up hop query).
 
     Returns:
         Tuple of (system_prompt, user_prompt) for BaseLLM.chat().
@@ -350,11 +342,11 @@ def build_chain_completeness_prompt(
     query: str,
     draft_answer: str,
 ) -> tuple[str, str]:
-    """Build system and user prompts for CoRAG completeness evaluation.
+    """Build system and user prompts for ChainRAG completeness evaluation.
 
     Args:
-        query: The original user query (not follow-up).
-        draft_answer: The draft answer to evaluate.
+        query: The original user query (not a follow-up hop query).
+        draft_answer: The draft answer to evaluate for completeness.
 
     Returns:
         Tuple of (system_prompt, user_prompt) for BaseLLM.chat().

@@ -1,11 +1,21 @@
-"""Agent orchestrator — coordinates the full agent flow.
+"""
+Agent orchestrator — coordinates the full agent decomposition flow.
 
-The orchestrator is the single entry point for the agent layer.
-It wires together: planner → parallel retriever → verifier → synthesizer.
+Design:
+    Mediator pattern that wires together: QueryPlanner → ParallelRetriever
+    → ResultVerifier → AnswerSynthesizer. The orchestrator owns timing,
+    error aggregation, and the AgentResponse assembly — each component
+    does exactly one job.
 
-The pipeline calls orchestrator.execute() when a query needs
-decomposition. The orchestrator returns an AgentResponse that
-can be collapsed to a standard RAGResponse via to_rag_response().
+Chain of Responsibility:
+    RAGPipeline.query() → AgentOrchestrator.execute() (when should_decompose=True)
+    → QueryPlanner → ParallelRetriever → ResultVerifier → AnswerSynthesizer
+    → AgentResponse → RAGPipeline (converts via to_rag_response())
+
+Dependencies:
+    agents.planner.query_planner, agents.retriever.parallel_retriever,
+    agents.synthesizer.answer_synthesizer, agents.verifier.result_verifier,
+    llm.contracts.base_llm
 """
 
 # stdlib
@@ -102,7 +112,7 @@ class AgentOrchestrator:
             request_id, query[:100],
         )
 
-        # step 1 — plan
+        # Step 1 — decompose query into sub-queries.
         plan_start = time.perf_counter()
         plan = await self._planner.plan(query)
         plan_ms = (time.perf_counter() - plan_start) * 1000
@@ -112,7 +122,7 @@ class AgentOrchestrator:
             len(plan.sub_queries), plan.parallel_safe, plan_ms,
         )
 
-        # step 2 — execute sub-queries
+        # Step 2 — execute sub-queries in parallel or sequentially.
         retrieval_start = time.perf_counter()
         sub_results = await self._retriever.execute(
             plan=plan,
@@ -120,7 +130,7 @@ class AgentOrchestrator:
         )
         retrieval_ms = (time.perf_counter() - retrieval_start) * 1000
 
-        # check for total failure
+        # Raise immediately if every sub-query failed — nothing to verify or synthesize.
         any_success = any(r.success for r in sub_results)
         if not any_success:
             raise AgentRetrievalError(
@@ -132,12 +142,12 @@ class AgentOrchestrator:
                 },
             )
 
-        # step 3 — verify results
+        # Step 3 — verify result quality before synthesis.
         verify_start = time.perf_counter()
         verified_results = await self._verifier.verify(sub_results)
         verify_ms = (time.perf_counter() - verify_start) * 1000
 
-        # re-check after verification
+        # Re-check after verification — some results may have been downgraded.
         any_verified = any(r.success for r in verified_results)
         if not any_verified:
             raise AgentRetrievalError(
@@ -148,7 +158,7 @@ class AgentOrchestrator:
                 },
             )
 
-        # step 4 — synthesize
+        # Step 4 — synthesize verified results into a final answer.
         synthesis_start = time.perf_counter()
         answer = await self._synthesizer.synthesize(
             query=query,
@@ -158,7 +168,7 @@ class AgentOrchestrator:
 
         total_ms = (time.perf_counter() - total_start) * 1000
 
-        # build response
+        # Assemble response with full transparency into the agent's work.
         successful = [r for r in verified_results if r.success]
         failed = [r for r in verified_results if not r.success]
 
@@ -195,9 +205,8 @@ class AgentOrchestrator:
         return response
 
 
-# ──────────────────────────────────────────────
 # Module-level pure functions
-# ──────────────────────────────────────────────
+
 
 def _compute_agent_confidence(results: list[SubQueryResult]) -> ConfidenceScore:
     """Compute aggregate confidence across sub-query results.
@@ -216,10 +225,8 @@ def _compute_agent_confidence(results: list[SubQueryResult]) -> ConfidenceScore:
     if not successful:
         return ConfidenceScore(value=0.0, method="agent")
 
-    # average confidence of successful results
+    # Average confidence of successful results, then penalize by failure rate.
     avg_confidence = sum(r.confidence for r in successful) / len(successful)
-
-    # penalize by failure rate
     success_rate = len(successful) / len(results)
     penalized = avg_confidence * success_rate
 
@@ -243,6 +250,6 @@ def _sum_tokens(results: list[SubQueryResult], token_type: str) -> int:
     Returns:
         Total token count (currently 0 — placeholder).
     """
-    # SubQueryResult doesn't store token counts directly.
+    # SubQueryResult doesn't store token counts directly;
     # the pipeline's cache and metrics layer tracks these.
     return 0

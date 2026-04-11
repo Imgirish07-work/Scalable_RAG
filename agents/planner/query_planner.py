@@ -1,8 +1,18 @@
-"""Query planner — decomposes complex queries into sub-queries.
+"""
+Query planner — decomposes complex queries into sub-queries.
 
-Single LLM call to break a query into independent, focused sub-queries.
-Each sub-query targets a specific collection and can be executed as
-a standalone RAG call.
+Design:
+    Single LLM call with a structured JSON prompt. The LLM returns a
+    decomposition plan; this module parses, validates, and caps it.
+    Falls back to a single-sub-query plan if the LLM output is
+    unparseable, ensuring the agent path always produces a result.
+
+Chain of Responsibility:
+    AgentOrchestrator.execute() → QueryPlanner.plan() → LLM call →
+    _parse_plan_response() → DecompositionPlan returned to orchestrator.
+
+Dependencies:
+    agents.prompts.agent_prompt_templates, llm.contracts.base_llm
 """
 
 # stdlib
@@ -19,7 +29,7 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# safety caps
+# Safety caps to prevent runaway decomposition.
 _MAX_SUB_QUERIES = 6
 _PLANNING_MAX_TOKENS = 1024
 
@@ -123,7 +133,7 @@ def _parse_plan_response(
     parsed = _try_json_parse(text)
 
     if parsed is None:
-        # stage 2 — strip markdown fences
+        # Strip markdown code fences that some LLMs add despite instructions.
         stripped = re.sub(r"^```(?:json)?\s*", "", text.strip())
         stripped = re.sub(r"\s*```$", "", stripped).strip()
         parsed = _try_json_parse(stripped)
@@ -176,7 +186,7 @@ def _validate_plan(
         logger.warning("Plan has no sub-queries, falling back")
         return _fallback_plan(original_query, default_collection)
 
-    # cap at max
+    # Cap to prevent excessive parallelism and token usage.
     if len(raw_sub_queries) > _MAX_SUB_QUERIES:
         logger.warning(
             "Plan produced %d sub-queries, capping at %d",

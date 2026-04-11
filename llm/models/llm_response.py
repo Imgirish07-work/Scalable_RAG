@@ -1,16 +1,19 @@
 """
-Standardized LLM response model.
+Standardized response model returned by all LLM providers.
 
-Every provider (Gemini, OpenAI, future providers) returns this exact model.
-Pipeline, cache, RAG, and RLM layers import ONLY LLMResponse — never raw
-provider response objects.
+Design:
+    Frozen Pydantic model (immutable after construction). Every provider returns
+    this exact model — the pipeline never sees raw provider response objects.
+    finish_reason is normalized to a consistent lowercase string across all
+    providers. tokens_used is cross-validated against prompt + completion counts.
 
-Key design decisions:
-    - Frozen (immutable) — once created, fields cannot be modified.
-    - finish_reason normalized to lowercase strings across all providers:
-      "stop", "length", "safety", "content_filter", "tool_calls", "unknown".
-    - tokens_used cross-validated against prompt_tokens + completion_tokens.
-    - metadata dict available for provider-specific extras without schema changes.
+Chain of Responsibility:
+    Provider._parse_response() constructs LLMResponse → returned to
+    BaseRAG.generate() → optionally wrapped in CacheEntry by the cache layer
+    → wrapped in RAGResponse by the RAG layer.
+
+Dependencies:
+    pydantic (BaseModel, ConfigDict, Field, field_validator, model_validator).
 """
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -18,37 +21,37 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 SUPPORTED_PROVIDERS = {"openai", "gemini", "groq"}
 
-# Normalized finish_reason values accepted across all providers
+# Normalized finish_reason strings accepted from all providers
 VALID_FINISH_REASONS = {
     "stop",             # Normal completion
-    "length",           # Hit max_tokens limit (truncated)
+    "length",           # Truncated at max_tokens limit
     "safety",           # Blocked by safety filters
     "content_filter",   # Blocked by content policy
-    "recitation",       # Blocked by recitation filter (Gemini)
-    "tool_calls",       # Model wants to call a tool
+    "recitation",       # Blocked by recitation filter (Gemini-specific)
+    "tool_calls",       # Model requested a tool call
     "error",            # Generation failed mid-stream
     "unknown",          # Provider did not return a reason
 }
 
 
 class LLMResponse(BaseModel):
-    """
-    Standard response returned by ALL LLM providers.
+    """Standard response returned by all LLM providers.
 
-    Pipeline only ever sees this — never raw provider responses.
-    Cache layer wraps this in CacheEntry. RAG layer wraps this in RAGResponse.
+    The pipeline only ever sees this model — never raw provider responses.
+    The cache layer wraps this in CacheEntry; the RAG layer wraps it in
+    RAGResponse.
 
     Attributes:
-        text: Generated text from the LLM. Cannot be empty.
+        text: Generated text. Cannot be empty or whitespace-only.
         model: Model identifier e.g. 'gpt-4o-mini', 'gemini-2.5-flash'.
         provider: Provider name. Must be in SUPPORTED_PROVIDERS.
         finish_reason: Why generation stopped. Normalized to lowercase.
-            Used by QualityGate to detect truncation (finish_reason == 'length').
+            QualityGate uses 'length' to detect truncated responses.
         prompt_tokens: Number of input tokens consumed.
         completion_tokens: Number of output tokens generated.
         tokens_used: Total tokens consumed. Must be >= prompt + completion.
         latency_ms: Round-trip time for the API call in milliseconds.
-        cached: Whether this response was served from cache.
+        cached: True if this response was served from cache.
         metadata: Provider-specific extras (safety ratings, logprobs, etc.).
     """
 
@@ -106,10 +109,10 @@ class LLMResponse(BaseModel):
     @field_validator("provider")
     @classmethod
     def validate_provider(cls, value: str) -> str:
-        """Normalize and validate provider name.
+        """Normalize and validate the provider name.
 
         Args:
-            value: Raw provider string from constructor.
+            value: Raw provider string from the constructor.
 
         Returns:
             Cleaned lowercase provider name.
@@ -131,13 +134,13 @@ class LLMResponse(BaseModel):
         """Reject blank or whitespace-only strings.
 
         Args:
-            value: Raw string from constructor.
+            value: Raw string from the constructor.
 
         Returns:
             Stripped string.
 
         Raises:
-            ValueError: If value is empty or whitespace only.
+            ValueError: If value is empty or whitespace-only.
         """
         if not value.strip():
             raise ValueError("Field cannot be blank or whitespace only.")
@@ -148,28 +151,28 @@ class LLMResponse(BaseModel):
     def validate_finish_reason(cls, value: str) -> str:
         """Normalize finish_reason to lowercase.
 
-        Accepts any string but warns if not in the known set.
-        Unknown values are passed through — providers may add new ones.
+        Unknown values are passed through rather than rejected — providers
+        may introduce new finish reasons in future API versions.
 
         Args:
-            value: Raw finish_reason from provider.
+            value: Raw finish_reason string from the provider.
 
         Returns:
             Lowercase finish_reason string.
         """
         cleaned = value.strip().lower() if value else "unknown"
-        # Allow unknown values through — don't break on new provider reasons
+        # Pass unknown values through to avoid breaking on new provider reasons
         return cleaned
 
     # Cross-field validation
 
     @model_validator(mode="after")
     def validate_token_consistency(self) -> "LLMResponse":
-        """Validate that tokens_used >= prompt_tokens + completion_tokens.
+        """Validate that tokens_used is not less than prompt + completion tokens.
 
-        Some providers include internal overhead tokens in tokens_used,
-        so tokens_used may be greater than the sum. But it should never
-        be less — that indicates a parsing bug.
+        Some providers include internal overhead in tokens_used, so it may
+        legitimately exceed the sum. But it should never be less — that
+        indicates a parsing or provider bug.
 
         Returns:
             Self if valid.

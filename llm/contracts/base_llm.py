@@ -73,21 +73,26 @@
 #         )
 
 """
-Abstract contract for all LLM providers.
+Abstract base class defining the contract all LLM providers must satisfy.
 
-Rules:
-    - Pipeline imports ONLY BaseLLM — never OpenAIProvider or GeminiProvider.
-    - LLMFactory returns BaseLLM instances — callers never know the concrete type.
-    - Every provider MUST implement all abstract methods.
-    - fits_context() is shared logic — all providers inherit it free.
+Design:
+    ABC (Abstract Base Class) pattern. The pipeline imports only BaseLLM —
+    never concrete provider classes directly. LLMFactory returns BaseLLM
+    instances so callers are decoupled from the implementation.
 
-Note on async in this ABC:
     count_tokens() is declared async because GeminiProvider's implementation
-    makes an API call (I/O-bound). OpenAIProvider's implementation uses tiktoken
-    (CPU-only), which technically violates Rule 2, but the ABC interface must be
-    async to accommodate the I/O-bound implementation. This is an accepted
-    tradeoff — the alternative (two separate interfaces) adds complexity without
-    meaningful benefit.
+    makes an API call (I/O-bound). OpenAIProvider uses tiktoken locally
+    (CPU-only), but the ABC interface must be async to accommodate the
+    I/O-bound case. This is an accepted tradeoff — two separate interfaces
+    would add complexity for little benefit.
+
+Chain of Responsibility:
+    LLMFactory.create() instantiates a concrete provider and returns it as
+    BaseLLM → RAGPipeline.configure_llm() stores it → BaseRAG.generate()
+    calls generate() or chat() → ContextAssembler calls count_tokens().
+
+Dependencies:
+    llm.models.llm_response.LLMResponse, abc.
 """
 
 from abc import ABC, abstractmethod
@@ -96,19 +101,18 @@ from llm.models.llm_response import LLMResponse
 
 
 class BaseLLM(ABC):
-    """
-    Abstract base class for all LLM providers.
+    """Abstract contract for all LLM providers.
 
     Subclasses must implement:
-        - generate()      — single-turn text generation
-        - chat()          — multi-turn conversation
-        - count_tokens()  — token counting for context window decisions
-        - is_available()  — health check for routing / fallback
-        - provider_name   — identifier string (property)
-        - model_name      — active model string (property)
+        generate()     — single-turn text generation
+        chat()         — multi-turn conversation
+        count_tokens() — token counting for context window decisions
+        is_available() — health check for routing and failover
+        provider_name  — provider identifier string (property)
+        model_name     — active model name string (property)
     """
 
-    # Abstract methods — must be implemented by every provider
+    # Abstract methods — every provider must implement all of these
 
     @abstractmethod
     async def generate(self, prompt: str, **kwargs) -> LLMResponse:
@@ -135,7 +139,7 @@ class BaseLLM(ABC):
     async def chat(self, messages: list[dict], **kwargs) -> LLMResponse:
         """Multi-turn conversation.
 
-        Message format follows OpenAI convention (providers convert internally):
+        Message format follows OpenAI convention; providers convert internally:
             [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
 
         Use for: agents, multi-hop reasoning, ReAct loops, conversation-aware RAG.
@@ -159,14 +163,14 @@ class BaseLLM(ABC):
 
     @abstractmethod
     async def count_tokens(self, text: str) -> int:
-        """Count tokens for a given text.
+        """Count tokens for a given text string.
 
         Critical for RLM — determines whether text fits the context window
         or needs to be chunked and processed recursively.
 
         Implementation note:
-            - OpenAI: uses tiktoken locally (CPU-only, fast).
-            - Gemini: calls the count_tokens API (I/O, accurate).
+            OpenAI: uses tiktoken locally (CPU-only, fast).
+            Gemini: calls the count_tokens API (I/O-bound, accurate).
 
         Args:
             text: Input text to count tokens for.
@@ -177,13 +181,13 @@ class BaseLLM(ABC):
 
     @abstractmethod
     async def is_available(self) -> bool:
-        """Health check — can this provider accept requests right now?
+        """Health check — verify the provider can accept requests right now.
 
-        Used by the smart router (Layer 5) for fallback decisions.
-        Sends a minimal request to verify API reachability.
+        Used by the smart router for failover decisions. Sends a minimal
+        request to confirm API reachability.
 
         Returns:
-            True if the provider is reachable and responding.
+            True if the provider responds successfully.
             False if the health check fails for any reason.
         """
 
@@ -205,10 +209,10 @@ class BaseLLM(ABC):
             Model name e.g. 'gpt-4o-mini', 'gemini-2.5-flash'.
         """
 
-    # Concrete methods — shared logic, all providers inherit free
+    # Concrete methods — shared logic inherited by all providers
 
     async def fits_context(self, text: str, max_tokens: int) -> bool:
-        """RLM decision helper — does this text fit the context window?
+        """RLM decision helper — check whether text fits within the context window.
 
         If True  → direct LLM call (no chunking needed).
         If False → chunk → process → combine → recurse.
@@ -218,7 +222,7 @@ class BaseLLM(ABC):
             max_tokens: Maximum token budget for the context window.
 
         Returns:
-            True if token count of text <= max_tokens.
+            True if token count of text is within max_tokens.
         """
         return await self.count_tokens(text) <= max_tokens
 

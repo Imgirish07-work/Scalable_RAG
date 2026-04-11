@@ -1,32 +1,18 @@
 """
-CoRAG (Chain-of-RAG) end-to-end pipeline test.
+Integration test for the ChainRAG (CoRAG) multi-hop retrieval pipeline.
 
-CoRAG is designed for queries that require multi-hop retrieval — where the
-initial context references external sections, regulations, or documents not
-present in the first retrieval. It iteratively follows these references until
-the answer is complete or max_hops is reached.
+Test scope:
+    End-to-end integration comparing SimpleRAG (single-hop baseline) against
+    CoRAG (multi-hop chain retrieval) using a real PDF document. No mocks —
+    exercises the full ingestion stack and real LLM calls.
 
-What this test demonstrates:
-    - ChainRAG initialisation via RAGFactory
-    - Multi-hop retrieval with draft generation + completeness evaluation
-    - Chain completion detection (completed vs exhausted max_hops)
-    - Confidence scoring via "chain_eval" method
-    - How CoRAG differs from SimpleRAG for the same query
+Flow:
+    Load PDF → chunk → ingest into in-memory QdrantStore → SimpleRAG baseline
+    query → CoRAG multi-hop query → side-by-side comparison printout.
 
-Uses:
-    - redis_commands_reference.pdf  (real document, no mocks)
-    - Full ingestion pipeline (DocumentCleaner → StructurePreserver → Chunker)
-    - QdrantStore in-memory
-    - DenseRetriever (BGE embeddings)
-    - GeminiProvider (real LLM — CoRAG makes 2-4 LLM calls per query)
-
-Best queries for CoRAG:
-    - Questions that span multiple sections of a document
-    - Questions requiring definitions AND examples
-    - Anything where a partial answer naturally raises a follow-up
-
-Run:
-    python test_corag_pipeline.py
+Dependencies:
+    redis_commands_reference.pdf in data/sample_docs/, GeminiProvider API key,
+    BGE embedding model, in-memory QdrantStore, CacheManager.
 """
 
 import asyncio
@@ -79,7 +65,7 @@ def _print_response(response, label: str) -> None:
 
 
 async def run():
-    # ── 1. Load + chunk PDF ──────────────────────────────────────────────────
+    # 1. Load + chunk PDF
     logger.info("Loading PDF: %s", PDF_PATH)
     cleaner   = DocumentCleaner()
     preserver = StructurePreserver()
@@ -90,7 +76,7 @@ async def run():
     chunks     = await asyncio.to_thread(chunker.split_documents, structured)
     logger.info("Loaded %d pages -> %d chunks", len(raw_docs), len(chunks))
 
-    # ── 2. Vector store ───────────────────────────────────────────────────────
+    # 2. Vector store
     store = QdrantStore(
         collection_name="redis_corag_test",
         in_memory=True,
@@ -100,12 +86,12 @@ async def run():
     await store.add_documents(chunks)
     logger.info("Ingested %d chunks into Qdrant", len(chunks))
 
-    # ── 3. Shared dependencies ────────────────────────────────────────────────
+    # 3. Shared dependencies
     llm   = GeminiProvider()
     cache = CacheManager(settings)
     await cache.initialize()
 
-    # ── 4. SimpleRAG — baseline ───────────────────────────────────────────────
+    # 4. SimpleRAG — baseline
     logger.info("=" * 50)
     logger.info("SIMPLE RAG — baseline (1 retrieval, 1 LLM call)")
     logger.info("=" * 50)
@@ -126,7 +112,7 @@ async def run():
     simple_response = await simple_rag.query(simple_request)
     _print_response(simple_response, "SIMPLE RAG — single retrieval pass")
 
-    # ── 5. CoRAG — multi-hop retrieval ────────────────────────────────────────
+    # 5. CoRAG — multi-hop retrieval
     logger.info("=" * 50)
     logger.info("CoRAG — multi-hop retrieval (up to 3 hops)")
     logger.info("LLM calls: 2 per hop (draft + completeness) + 1 final generation")
@@ -152,7 +138,7 @@ async def run():
     corag_response = await corag.query(corag_request)
     _print_response(corag_response, "CoRAG — multi-hop chain retrieval")
 
-    # ── 6. Side-by-side comparison ────────────────────────────────────────────
+    # 6. Side-by-side comparison
     print("\n" + "=" * 60)
     print("COMPARISON: SimpleRAG vs CoRAG")
     print("=" * 60)

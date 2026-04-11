@@ -1,8 +1,19 @@
-"""Answer synthesizer — combines sub-query results into a final answer.
+"""
+Answer synthesizer — combines sub-query results into a final answer.
 
-Single LLM call that takes the original query and all sub-query results
-(successful and failed) and produces a coherent, comprehensive answer.
-The synthesizer explicitly notes gaps where sub-queries failed.
+Design:
+    Single LLM call that receives the original query and all sub-query
+    results (successful and failed). The prompt instructs the LLM to
+    note gaps from failed sub-queries explicitly rather than hallucinating
+    to fill them. Only successful results contribute to synthesis, but
+    failed results appear in the prompt so the LLM can acknowledge gaps.
+
+Chain of Responsibility:
+    AgentOrchestrator.execute() → AnswerSynthesizer.synthesize()
+    → LLM call → answer string returned to orchestrator.
+
+Dependencies:
+    agents.prompts.agent_prompt_templates, llm.contracts.base_llm
 """
 
 # internal
@@ -53,7 +64,7 @@ class AnswerSynthesizer:
         Raises:
             AgentSynthesisError: If synthesis fails or produces empty output.
         """
-        # check if we have anything to synthesize
+        # Guard — nothing to synthesize if every sub-query failed.
         successful = [r for r in sub_results if r.success]
         if not successful:
             logger.warning("No successful sub-results to synthesize")
@@ -65,7 +76,7 @@ class AnswerSynthesizer:
                 },
             )
 
-        # build prompt with all results (including failures for transparency)
+        # Include all results (including failures) so the LLM can note gaps.
         formatted_results = _format_sub_results(sub_results)
         system_prompt, user_prompt = build_synthesis_prompt(
             query=query,

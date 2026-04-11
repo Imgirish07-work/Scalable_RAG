@@ -1,22 +1,22 @@
 """
 OpenAI implementation of BaseLLM.
 
-Supports:
-    - GPT-4o
-    - GPT-4o Mini
-    - Any OpenAI chat completion model
+Design:
+    Concrete BaseLLM subclass. Translates all OpenAI SDK errors into the
+    LLMError hierarchy before raising, so the pipeline never handles raw
+    SDK exceptions. Also used as the base class for GroqProvider via
+    OpenAI-compatible API inheritance.
 
-Responsibilities:
-    - Call OpenAI API via AsyncOpenAI client.
-    - Translate OpenAI SDK errors → LLMError hierarchy.
-    - Parse finish_reason from response (already lowercase from OpenAI).
-    - Return standard LLMResponse always.
+Chain of Responsibility:
+    LLMFactory.create("openai") instantiates this provider →
+    returned as BaseLLM → BaseRAG.generate() calls generate() or chat() →
+    LLMRateLimiter wraps calls when rate limiting is enabled.
 
-OpenAI-specific notes:
-    - count_tokens() uses tiktoken (CPU-only, fast, local). Declared async
-      to satisfy BaseLLM ABC, but does not perform I/O.
-    - finish_reason comes as lowercase string directly from OpenAI API:
-      'stop', 'length', 'content_filter', 'tool_calls'.
+Dependencies:
+    openai (AsyncOpenAI, AuthenticationError, RateLimitError, APITimeoutError,
+    BadRequestError, APIError), tiktoken, llm.contracts.base_llm,
+    llm.models.llm_response, llm.exceptions.llm_exceptions,
+    config.settings, utils.logger.
 """
 
 import time
@@ -53,7 +53,7 @@ class OpenAIProvider(BaseLLM):
     Attributes:
         _client: AsyncOpenAI client instance.
         _encoder: tiktoken encoder for local token counting.
-        _model: Active model name.
+        _model: Active model name string.
         _temperature: Default sampling temperature.
         _max_tokens: Default max output tokens.
         _timeout: Request timeout in seconds.
@@ -69,7 +69,7 @@ class OpenAIProvider(BaseLLM):
         base_url: Optional[str] = None,
         max_retries: Optional[int] = None,
     ) -> None:
-        """Initialize OpenAI provider.
+        """Initialize the AsyncOpenAI client and tiktoken encoder.
 
         Args:
             api_key: OpenAI API key. Falls back to settings.openai_api_key.
@@ -77,11 +77,11 @@ class OpenAIProvider(BaseLLM):
             temperature: Sampling temperature 0.0–2.0. Falls back to settings.
             max_tokens: Max tokens in response. Falls back to settings.
             timeout: Request timeout in seconds. Falls back to settings.
-            base_url: Optional API base URL. Used by OpenAI-compatible providers
-                (e.g. Groq). None uses the default OpenAI endpoint.
-            max_retries: Max automatic retries on transient errors. Defaults to
-                the httpx client default (2). Pass 1 for fast-fail providers like
-                Groq where retries burn through a tight per-request timeout budget.
+            base_url: Optional API base URL for OpenAI-compatible providers
+                such as Groq. None uses the default OpenAI endpoint.
+            max_retries: Max automatic retries on transient errors. Pass 1 for
+                fast-fail providers (e.g. Groq) to avoid burning the per-request
+                timeout budget on multiple attempts.
 
         Raises:
             LLMAuthError: If no API key is available from args or settings.
@@ -104,7 +104,7 @@ class OpenAIProvider(BaseLLM):
                 "Set OPENAI_API_KEY in .env or pass api_key argument."
             )
 
-        # Initialize async client — base_url allows OpenAI-compatible providers
+        # base_url enables OpenAI-compatible providers (e.g. Groq) without subclassing _call_api
         client_kwargs = {"api_key": self._api_key, "timeout": self._timeout}
         if base_url is not None:
             client_kwargs["base_url"] = base_url
@@ -112,7 +112,7 @@ class OpenAIProvider(BaseLLM):
             client_kwargs["max_retries"] = max_retries
         self._client = AsyncOpenAI(**client_kwargs)
 
-        # Initialize tiktoken encoder for local token counting
+        # tiktoken may not have an encoding for newer/custom models — fall back gracefully
         try:
             self._encoder = tiktoken.encoding_for_model(self._model)
         except KeyError:
@@ -132,32 +132,24 @@ class OpenAIProvider(BaseLLM):
 
     @property
     def provider_name(self) -> str:
-        """Returns provider identifier.
-
-        Returns:
-            The string 'openai'.
-        """
+        """Returns the provider identifier string 'openai'."""
         return "openai"
 
     @property
     def model_name(self) -> str:
-        """Returns the active model name.
-
-        Returns:
-            Model name string e.g. 'gpt-4o-mini'.
-        """
+        """Returns the active model name e.g. 'gpt-4o-mini'."""
         return self._model
 
-    # Abstract method implementations
+    # BaseLLM abstract method implementations
 
     async def generate(self, prompt: str, **kwargs) -> LLMResponse:
         """Single-turn text generation.
 
-        Wraps the prompt in a user message and calls chat completion.
+        Wraps the prompt in a user message and delegates to _call_api.
 
         Args:
             prompt: Input text prompt.
-            **kwargs: Per-call overrides for temperature, max_tokens.
+            **kwargs: Per-call overrides for temperature or max_tokens.
 
         Returns:
             LLMResponse with generated text, token usage, and timing.
@@ -177,8 +169,8 @@ class OpenAIProvider(BaseLLM):
 
         Args:
             messages: List of dicts [{"role": "user", "content": "..."}].
-                Roles: 'user', 'assistant', 'system'.
-            **kwargs: Per-call overrides for temperature, max_tokens.
+                Accepted roles: 'user', 'assistant', 'system'.
+            **kwargs: Per-call overrides for temperature or max_tokens.
 
         Returns:
             LLMResponse with generated text, token usage, and timing.
@@ -197,10 +189,10 @@ class OpenAIProvider(BaseLLM):
         return await self._call_api(messages, **kwargs)
 
     async def count_tokens(self, text: str) -> int:
-        """Count tokens using tiktoken.
+        """Count tokens using tiktoken (CPU-only, no I/O).
 
-        CPU-only operation (no I/O). Declared async to satisfy BaseLLM ABC
-        because GeminiProvider's implementation makes an API call.
+        Declared async to satisfy the BaseLLM ABC, which must accommodate
+        GeminiProvider's I/O-bound implementation. No await is performed here.
 
         Args:
             text: Input text to count tokens for.
@@ -214,7 +206,7 @@ class OpenAIProvider(BaseLLM):
         return len(self._encoder.encode(text))
 
     async def is_available(self) -> bool:
-        """Health check — sends minimal request to verify API reachability.
+        """Health check — send a minimal request to verify API reachability.
 
         Returns:
             True if OpenAI API responds successfully.
@@ -234,11 +226,11 @@ class OpenAIProvider(BaseLLM):
     # Private methods
 
     async def _call_api(self, messages: list[dict], **kwargs) -> LLMResponse:
-        """Core API call with timing, error handling, and response parsing.
+        """Execute the OpenAI chat completion call with timing and error handling.
 
         Args:
             messages: OpenAI-formatted message list.
-            **kwargs: Per-call overrides for temperature, max_tokens.
+            **kwargs: Per-call overrides for temperature or max_tokens.
 
         Returns:
             LLMResponse with generated text, token usage, and timing.
@@ -272,14 +264,14 @@ class OpenAIProvider(BaseLLM):
             LLMTokenLimitError,
             LLMProviderError,
         ):
-            # Already translated — re-raise without wrapping again
+            # Already translated — re-raise without double-wrapping
             raise
 
         except Exception as exc:
             latency_ms = (time.monotonic() - start_time) * 1000
             err_str = str(exc)
-            # Zscaler/proxy block pages return full HTML in the exception body.
-            # Log a clean message instead of dumping thousands of lines of HTML.
+            # Zscaler/proxy block pages return full HTML in the exception body;
+            # log a clean message instead of dumping thousands of HTML lines
             if "<html" in err_str.lower() or "<!doctype" in err_str.lower():
                 err_display = "blocked by corporate proxy/firewall (HTML response received)"
             else:
@@ -290,13 +282,13 @@ class OpenAIProvider(BaseLLM):
                 err_display,
             )
             self._handle_error(exc)
-            # _handle_error always raises, but this satisfies the type checker
+            # _handle_error always raises; this line satisfies the type checker
             raise LLMProviderError(
                 f"Unhandled error in OpenAI provider. | {err_display}"
             )
 
     def _build_messages(self, prompt: str) -> list[dict]:
-        """Wrap a plain prompt into OpenAI message format.
+        """Wrap a plain prompt string into the OpenAI message format.
 
         Args:
             prompt: Raw text prompt.
@@ -307,14 +299,14 @@ class OpenAIProvider(BaseLLM):
         return [{"role": "user", "content": prompt}]
 
     def _parse_response(self, response, latency_ms: float) -> LLMResponse:
-        """Parse raw OpenAI response into standard LLMResponse.
+        """Parse a raw OpenAI response into a standard LLMResponse.
 
-        OpenAI finish_reason values are already lowercase strings:
-        'stop', 'length', 'content_filter', 'tool_calls'.
+        OpenAI finish_reason values are already lowercase strings
+        ('stop', 'length', 'content_filter', 'tool_calls') — no mapping needed.
 
         Args:
             response: Raw OpenAI API response object.
-            latency_ms: Time taken for the API call.
+            latency_ms: Elapsed time for the API call in milliseconds.
 
         Returns:
             LLMResponse with normalized fields.
@@ -322,7 +314,6 @@ class OpenAIProvider(BaseLLM):
         choice = response.choices[0]
         usage = response.usage
 
-        # OpenAI finish_reason is already lowercase — no mapping needed
         finish_reason = choice.finish_reason or "unknown"
 
         return LLMResponse(
@@ -337,9 +328,9 @@ class OpenAIProvider(BaseLLM):
         )
 
     def _handle_error(self, error: Exception) -> None:
-        """Translate OpenAI SDK errors → LLMError hierarchy.
+        """Translate OpenAI SDK exceptions into the LLMError hierarchy.
 
-        Pipeline catches our errors — never OpenAI SDK errors directly.
+        Pipeline catches LLMError subclasses — never raw OpenAI SDK errors.
 
         Args:
             error: Raw OpenAI exception.
@@ -375,6 +366,7 @@ class OpenAIProvider(BaseLLM):
 
         if isinstance(error, APIError):
             err_str = str(error)
+            # Sanitize proxy block HTML pages before logging or raising
             if "<html" in err_str.lower() or "<!doctype" in err_str.lower():
                 err_detail = "blocked by corporate proxy/firewall (HTML response received)"
             else:
@@ -383,7 +375,7 @@ class OpenAIProvider(BaseLLM):
                 f"OpenAI API error occurred. | {err_detail}"
             ) from error
 
-        # Unknown error — still wrap in our hierarchy
+        # Catch-all — sanitize any HTML before raising
         err_str = str(error)
         if "<html" in err_str.lower() or "<!doctype" in err_str.lower():
             err_str = "blocked by corporate proxy/firewall (HTML response received)"

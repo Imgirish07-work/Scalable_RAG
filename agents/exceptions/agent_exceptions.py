@@ -1,8 +1,18 @@
-"""Agent-layer exceptions.
+"""
+Agent-layer exceptions.
 
-Agent errors wrap failures in planning, sub-query execution, verification,
-and synthesis. LLM-layer errors (LLMAuthError, LLMRateLimitError) propagate
-as-is — agents do NOT blanket-wrap inner-layer exceptions.
+Design:
+    Thin exception hierarchy mirroring the agent pipeline stages.
+    Each exception covers exactly one stage (planning, retrieval,
+    synthesis). LLM-layer errors (LLMAuthError, LLMRateLimitError)
+    propagate as-is — agents do NOT blanket-wrap inner-layer exceptions.
+
+Chain of Responsibility:
+    Raised inside AgentOrchestrator sub-components; caught by
+    AgentOrchestrator.execute() or the calling RAGPipeline.
+
+Dependencies:
+    None (stdlib only).
 """
 
 
@@ -35,9 +45,9 @@ class AgentPlanningError(AgentError):
 
 
 class AgentRetrievalError(AgentError):
-    """Raised when sub-query execution fails.
+    """Raised when sub-query execution fails completely.
 
-    Covers complete failure of all sub-queries. Partial failures
+    Covers total failure of all sub-queries. Partial failures
     (some sub-queries succeed, some fail) are handled gracefully
     by the verifier — this exception is for total failure only.
     """

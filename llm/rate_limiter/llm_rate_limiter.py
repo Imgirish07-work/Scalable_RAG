@@ -1,33 +1,30 @@
 """
-LLM Rate Limiter — transparent BaseLLM wrapper.
+Transparent rate-limiting wrapper around any BaseLLM provider.
 
-Design: Decorator Pattern
-─────────────────────────
-LLMRateLimiter IS-A BaseLLM and HAS-A BaseLLM (the real provider).
+Design:
+    Decorator pattern. LLMRateLimiter IS-A BaseLLM and HAS-A BaseLLM. The
+    pipeline calls generate() or chat() on this wrapper exactly as it would
+    on the real provider — rate limiting is invisible to the caller.
 
-    pipeline.query()
-        → LLMRateLimiter.generate()  ← throttles here
-            → GeminiProvider.generate()  ← real API call
+    Three layers are applied in order before each LLM call:
+        1. asyncio.Semaphore — caps simultaneous in-flight requests, preventing
+           a thundering herd of coroutines from hitting the API simultaneously.
+        2. RPM TokenBucket — enforces requests-per-minute quota.
+        3. RPD TokenBucket — enforces requests-per-day quota.
 
-The pipeline never knows rate limiting is happening. It just calls
-generate() / chat() on what it thinks is a regular LLM provider.
+    The semaphore is acquired first to bound the number of coroutines competing
+    for rate-limit tokens. Without it, many coroutines would pile up inside
+    the bucket's acquire() loop, consuming memory and CPU while waiting.
 
-Three layers of protection (applied in order):
-    1. asyncio.Semaphore — caps simultaneous in-flight requests.
-       Prevents thundering herd: 100 concurrent requests hitting
-       the API at the same millisecond.
+Chain of Responsibility:
+    LLMFactory.create_rate_limited() wraps provider → pipeline calls
+    generate()/chat() on this wrapper → wrapper throttles → delegates to
+    the real provider (GeminiProvider, OpenAIProvider, or GroqProvider).
 
-    2. RPM TokenBucket — enforces requests-per-minute limit.
-       Waits until the minute-window allows another request.
-
-    3. RPD TokenBucket — enforces requests-per-day limit.
-       Waits until the day-window allows another request.
-       (Effectively blocks for the rest of the day if daily quota hit.)
-
-Why Semaphore first, then buckets?
-    Semaphore limits the number of requests competing for tokens.
-    Without it, 100 coroutines would all pile up waiting for tokens,
-    consuming memory and CPU. The semaphore keeps the queue bounded.
+Dependencies:
+    asyncio, llm.contracts.base_llm, llm.models.llm_response,
+    llm.rate_limiter.rate_limiter_config, llm.rate_limiter.token_bucket,
+    utils.logger.
 """
 
 import asyncio
@@ -44,27 +41,21 @@ logger = get_logger(__name__)
 class LLMRateLimiter(BaseLLM):
     """Transparent rate-limiting wrapper around any BaseLLM provider.
 
-    Drop-in replacement — wraps an existing provider and adds:
+    Drop-in replacement — wraps an existing provider and enforces:
         - Concurrency cap via asyncio.Semaphore
-        - Per-minute rate limiting via RPM TokenBucket
-        - Per-day rate limiting via RPD TokenBucket
-
-    Usage:
-        provider = GeminiProvider(...)
-        config = RateLimiterConfig(rpm=60, rpd=1500, max_concurrent=5)
-        llm = LLMRateLimiter(provider, config)
-        # Use llm exactly like provider — same interface
+        - Per-minute rate limit via RPM TokenBucket
+        - Per-day rate limit via RPD TokenBucket
 
     Attributes:
-        _provider: The real LLM provider being wrapped.
-        _config: Rate limiter configuration.
-        _semaphore: asyncio.Semaphore for concurrency cap.
-        _rpm_bucket: Token bucket for per-minute rate limit.
-        _rpd_bucket: Token bucket for per-day rate limit.
+        _provider: The wrapped BaseLLM provider receiving the real API calls.
+        _config: Rate limiter configuration (rpm, rpd, max_concurrent, burst).
+        _semaphore: asyncio.Semaphore enforcing the concurrency cap.
+        _rpm_bucket: TokenBucket enforcing the per-minute request rate.
+        _rpd_bucket: TokenBucket enforcing the per-day request rate.
     """
 
     def __init__(self, provider: BaseLLM, config: RateLimiterConfig) -> None:
-        """Wrap a provider with rate limiting.
+        """Wrap a provider with semaphore and token bucket rate limiting.
 
         Args:
             provider: Any BaseLLM implementation to wrap.
@@ -73,20 +64,18 @@ class LLMRateLimiter(BaseLLM):
         self._provider = provider
         self._config = config
 
-        # Layer 1: concurrency cap
+        # Layer 1: semaphore caps concurrency before any bucket checks
         self._semaphore = asyncio.Semaphore(config.max_concurrent)
 
-        # Layer 2: per-minute token bucket
-        # capacity = rpm * burst_multiplier (allows short bursts)
-        # refill_rate = rpm / 60 (tokens per second)
+        # Layer 2: RPM bucket — capacity allows short bursts above sustained rate
+        # refill_rate = rpm / 60 → tokens per second
         self._rpm_bucket = TokenBucket(
             capacity=config.bucket_capacity,
             refill_rate=config.refill_rate,
         )
 
-        # Layer 3: per-day token bucket
-        # capacity = rpd (no burst — daily cap is hard)
-        # refill_rate = rpd / 86400 (tokens per second over 24h)
+        # Layer 3: RPD bucket — no burst; daily cap is a hard limit
+        # refill_rate = rpd / 86400 → tokens per second over 24 hours
         self._rpd_bucket = TokenBucket(
             capacity=float(config.rpd),
             refill_rate=config.rpd / 86400.0,
@@ -103,19 +92,16 @@ class LLMRateLimiter(BaseLLM):
         )
 
     async def _throttle(self) -> None:
-        """Apply all three rate-limiting layers before an LLM call.
+        """Apply RPM and RPD token buckets before an LLM call.
 
-        Layers applied in sequence:
-            1. Acquire semaphore slot (concurrency cap)
-            2. Acquire RPM token (minute-window rate)
-            3. Acquire RPD token (day-window rate)
+        Called inside the semaphore context in generate() and chat().
+        The semaphore (Layer 1) is already held by the caller — this method
+        applies Layers 2 and 3 only.
 
-        Note: Semaphore is NOT used as a context manager here because
-        we release it AFTER the actual LLM call (in generate/chat),
-        not after throttling. The caller holds the semaphore for the
-        full duration of the LLM request.
+        Note: The semaphore is not used as a context manager here because
+        it must remain held for the full duration of the LLM request,
+        not just for the throttle check.
         """
-        # Layer 2 + 3: rate buckets (semaphore held by caller)
         await self._rpm_bucket.acquire()
         await self._rpd_bucket.acquire()
 
@@ -128,9 +114,9 @@ class LLMRateLimiter(BaseLLM):
     async def generate(self, prompt: str, **kwargs) -> LLMResponse:
         """Rate-limited single-turn generation.
 
-        Acquires semaphore + both token buckets before delegating
-        to the wrapped provider. Semaphore is held for the full
-        duration of the API call (not just during throttle check).
+        Acquires the semaphore slot and both token buckets before delegating
+        to the wrapped provider. The semaphore is held for the full duration
+        of the API call, not just during the throttle check.
 
         Args:
             prompt: Input text prompt.
@@ -139,9 +125,8 @@ class LLMRateLimiter(BaseLLM):
         Returns:
             LLMResponse from the wrapped provider.
         """
-        async with self._semaphore: 
-            # First acquire the semaphore slot to limit concurrency, then apply rate limiting before the actual API call.
-            await self._throttle() # Layer 2 + 3: wait for rate limits
+        async with self._semaphore:
+            await self._throttle()
             return await self._provider.generate(prompt, **kwargs)
 
     async def chat(self, messages: list[dict], **kwargs) -> LLMResponse:
@@ -155,16 +140,15 @@ class LLMRateLimiter(BaseLLM):
             LLMResponse from the wrapped provider.
         """
         async with self._semaphore:
-            # First acquire the semaphore slot to limit concurrency, then apply rate limiting before the actual API call.
-            await self._throttle()  # Layer 2 + 3: wait for rate limits
+            await self._throttle()
             return await self._provider.chat(messages, **kwargs)
 
     async def count_tokens(self, text: str) -> int:
-        """Token counting — NOT rate limited.
+        """Token counting — bypasses rate limiting and delegates directly.
 
-        count_tokens() is a lightweight metadata call. Rate limiting
-        it would throttle the pipeline's context-window decisions,
-        which is counterproductive. Delegates directly.
+        count_tokens() is a lightweight metadata call used for context window
+        decisions. Rate-limiting it would throttle pipeline planning logic,
+        which is counterproductive.
 
         Args:
             text: Input text to count tokens for.

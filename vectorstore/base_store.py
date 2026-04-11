@@ -1,22 +1,27 @@
 """
-Abstract base class for all vector store backends.
+Abstract base class defining the vector store interface.
 
-Defines the async interface that QdrantStore (and any future backends
-like Pinecone, Weaviate, pgvector) must implement.
+Design:
+    ABC (Abstract Base Class) pattern. Declares all async methods that every
+    vector store backend must implement. Concrete implementations (e.g.,
+    QdrantStore) subclass this and provide the backend-specific logic.
+    All methods are async — FastAPI ready, event loop never blocked.
 
-All methods are async — FastAPI ready, event loop never blocked.
+    Design contract:
+        - add_documents() embeds page_content (or embed_content) and stores with metadata.
+        - similarity_search() returns Documents with clean page_content for LLM use.
+        - Metadata is NEVER embedded — only stored as payload.
+        - doc_id and user_id must be present in metadata for every document.
+        - close() must be called on shutdown to prevent connection leaks.
 
-Design contract:
-    - add_documents() embeds page_content (or embed_content) and stores with metadata
-    - similarity_search() returns Documents with clean page_content for LLM use
-    - Metadata is NEVER embedded — only stored as payload
-    - doc_id and user_id must be present in metadata for every document
-    - close() must be called on shutdown to prevent connection leaks
-
-Pipeline position:
+Chain of Responsibility:
     DocumentCleaner → StructurePreserver → Chunker
-        → VectorStore.add_documents()     ← write
-        → VectorStore.similarity_search() ← read
+        → VectorStore.add_documents()     (write path)
+        → VectorStore.similarity_search() (read path)
+    QdrantStore inherits this class and is called by the RAG pipeline.
+
+Dependencies:
+    langchain_core.documents
 """
 
 from abc import ABC, abstractmethod
@@ -26,19 +31,16 @@ from langchain_core.documents import Document
 
 
 class BaseVectorStore(ABC):
-    """Async interface for vector store backends.
+    """Async interface contract for all vector store backends.
 
-    Implementations must handle:
-        - Connection management (pooling, reconnection)
-        - Collection/index creation
-        - Embedding via the configured model
-        - Metadata payload storage and filtering
-        - Graceful shutdown
+    Implementations must handle connection management (pooling, reconnection),
+    collection or index creation, embedding via the configured model, metadata
+    payload storage and filtering, and graceful shutdown.
     """
 
     @abstractmethod
     async def initialize(self) -> None:
-        """Async initialization — create connections, collections, indexes.
+        """Create connections, collections, and indexes.
 
         Must be called once before add_documents() or similarity_search().
         Safe to call multiple times (idempotent).
@@ -55,14 +57,14 @@ class BaseVectorStore(ABC):
         Embedding source:
             Uses metadata['embed_content'] if available (richer vector
             with title + section context from Chunker). Falls back to
-            page_content if embed_content is not set.
+            page_content when embed_content is not set.
 
         Metadata requirements:
-            doc_id      : str → document identifier (FK to documents table)
-            user_id     : str → owner identifier (for per-user filtering)
-            source      : str → filename or URL
-            page        : int → page number
-            chunk_index : int → position within document
+            doc_id      : str — document identifier (FK to documents table).
+            user_id     : str — owner identifier (for per-user filtering).
+            source      : str — filename or URL.
+            page        : int — page number.
+            chunk_index : int — position within document.
 
         Args:
             documents: List of Document objects from Chunker.
@@ -83,18 +85,17 @@ class BaseVectorStore(ABC):
         score_threshold: Optional[float] = None,
         filter_user_id: Optional[str] = None,
     ) -> List[Document]:
-        """Return top-k semantically similar documents.
+        """Return top-k semantically similar documents for the given query.
 
-        Returned documents have clean page_content suitable for LLM
-        consumption (no embed_content prefix). Relevance scores are
-        attached to metadata['relevance_score'] when score_threshold
-        is provided.
+        Returned documents carry clean page_content suitable for LLM
+        consumption (no embed_content prefix). When score_threshold is
+        provided, relevance scores are attached to metadata['relevance_score'].
 
         Args:
             query: Search text to embed and compare.
             k: Number of results to return.
             score_threshold: Minimum similarity score (0.0-1.0).
-                             None = return all top-k without filtering.
+                             None = return all top-k without score filtering.
             filter_user_id: When set, returns only that user's documents.
                             None = search entire collection.
 
@@ -108,10 +109,9 @@ class BaseVectorStore(ABC):
 
     @abstractmethod
     async def delete_collection(self) -> None:
-        """Permanently delete the entire collection/index.
+        """Permanently delete the entire collection.
 
-        Use with extreme caution — this is irreversible.
-        All vectors and metadata are lost.
+        Irreversible — all vectors and metadata are lost. Use with caution.
 
         Raises:
             Exception: If deletion fails.
@@ -130,9 +130,9 @@ class BaseVectorStore(ABC):
 
     @abstractmethod
     async def close(self) -> None:
-        """Graceful shutdown — release connections and resources.
+        """Release connections and resources on shutdown.
 
-        Must be called on application shutdown to prevent leaks.
+        Must be called on application shutdown to prevent connection leaks.
         Safe to call multiple times.
         """
         ...

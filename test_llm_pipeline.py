@@ -1,26 +1,19 @@
 """
-LLM layer test suite — real API calls, no mocking.
+End-to-end LLM provider pipeline tests — real API calls plus local validation.
 
-API call budget per provider (3 calls, ~35 tokens each):
-    1. generate()     — single-turn path + response validation
-    2. chat()         — multi-turn path + response validation
-    3. is_available() — health check ("ping", max_tokens=1)
+Test scope:
+    Phases 1-4 are pure local tests (0 API calls) covering LLMResponse model
+    validation, exception hierarchy, constants/exports, and factory error paths.
+    Phases 5-9 make 3 real API calls per provider (generate, chat, is_available)
+    and validate responses, token counts, finish reasons, and bad-key handling.
 
-0-hit tests (local only):
-    - LLMResponse validation (construction, immutability, finish_reason, tokens)
-    - Factory creation, properties, registry, error handling
-    - Token counting (tiktoken for OpenAI, count_tokens API for Gemini)
-    - fits_context() logic
-    - Empty chat rejection
-    - Error translation (bad key, unknown provider, empty provider)
+Flow:
+    Local tests (Phases 1-4) → per-provider loop (Phases 5-9: local setup,
+    generate, chat, is_available, bad key) → summary.
 
-Run:
-    python test_llm_pipeline.py
-
-Requirements:
-    - GEMINI_API_KEY and OPENAI_API_KEY set in .env
-    - Network access to both APIs
-    - Total cost: ~70 tokens per provider (~140 total)
+Dependencies:
+    GEMINI_API_KEY and OPENAI_API_KEY set in .env, network access to both APIs.
+    Total cost: ~70 tokens per provider (~140 tokens total).
 """
 
 import asyncio
@@ -45,9 +38,7 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-# ------------------------------------------------------------------ #
 # Config — minimal prompts to save tokens
-# ------------------------------------------------------------------ #
 
 PROVIDERS = ["gemini", "openai"]
 
@@ -61,9 +52,7 @@ CHAT_MESSAGES = [
 ]
 CHAT_MAX_TOKENS = 50
 
-# ------------------------------------------------------------------ #
 # Counters and helpers
-# ------------------------------------------------------------------ #
 
 _pass_count = 0
 _fail_count = 0
@@ -116,12 +105,10 @@ def print_response(response: LLMResponse) -> None:
     print(f"    cached           : {response.cached}")
 
 
-# ------------------------------------------------------------------ #
 # Phase 1: LLMResponse model validation — 0 API calls
-# ------------------------------------------------------------------ #
 
 def test_response_model() -> None:
-    """Validate LLMResponse construction, immutability, and validators."""
+    """Verifies LLMResponse construction, immutability, and field validators."""
     separator("Phase 1: LLMResponse Model Validation (0 API calls)")
 
     # Valid construction
@@ -245,12 +232,10 @@ def test_response_model() -> None:
         _report("negative_latency_rejected", True)
 
 
-# ------------------------------------------------------------------ #
 # Phase 2: Exception hierarchy — 0 API calls
-# ------------------------------------------------------------------ #
 
 def test_exception_hierarchy() -> None:
-    """Validate exception inheritance and catch-all behavior."""
+    """Verifies that all LLM exception subclasses inherit from LLMError."""
     separator("Phase 2: Exception Hierarchy (0 API calls)")
 
     # All subclasses inherit from LLMError
@@ -288,12 +273,10 @@ def test_exception_hierarchy() -> None:
     _report("message_preserved", str(exc) == "bad key")
 
 
-# ------------------------------------------------------------------ #
 # Phase 3: Constants and exports — 0 API calls
-# ------------------------------------------------------------------ #
 
 def test_constants() -> None:
-    """Validate module-level constants and __init__ exports."""
+    """Verifies module-level constants and __init__ exports are complete."""
     separator("Phase 3: Constants & Exports (0 API calls)")
 
     _report(
@@ -310,12 +293,10 @@ def test_constants() -> None:
     )
 
 
-# ------------------------------------------------------------------ #
 # Phase 4: Factory — 0 API calls (error paths)
-# ------------------------------------------------------------------ #
 
 def test_factory_errors() -> None:
-    """Validate factory error handling — all local, 0 API calls."""
+    """Verifies factory error handling for unknown, empty, and invalid inputs."""
     separator("Phase 4: Factory Error Handling (0 API calls)")
 
     # Unknown provider
@@ -386,15 +367,13 @@ def test_factory_errors() -> None:
         LLMFactory._registry.pop("_tiny_test", None)
 
 
-# ------------------------------------------------------------------ #
 # Phase 5: Per-provider local tests — 0 API calls
-# ------------------------------------------------------------------ #
 
 async def test_provider_local(provider_name: str) -> BaseLLM:
-    """Factory creation, properties, token counting — 0 API calls.
+    """Verifies factory creation, properties, and token counting without generation calls.
 
-    Note: Gemini count_tokens makes an API call internally, but it's
-    a lightweight metadata call (no generation, no output tokens).
+    Note: Gemini count_tokens makes an API call internally, but it is a
+    lightweight metadata call with no output tokens.
 
     Args:
         provider_name: Provider to test.
@@ -453,15 +432,10 @@ async def test_provider_local(provider_name: str) -> BaseLLM:
     return llm
 
 
-# ------------------------------------------------------------------ #
 # Phase 6: generate() — 1 API call per provider
-# ------------------------------------------------------------------ #
 
 async def test_generate(llm: BaseLLM, provider_name: str) -> None:
-    """Single-turn generate() — 1 API call, ~15 tokens.
-
-    Validates: response type, text, provider, model, finish_reason,
-    token counts, latency, cached flag.
+    """Verifies generate() response structure, token counts, and finish reason.
 
     Args:
         llm: Provider instance.
@@ -532,14 +506,10 @@ async def test_generate(llm: BaseLLM, provider_name: str) -> None:
     )
 
 
-# ------------------------------------------------------------------ #
 # Phase 7: chat() — 1 API call per provider
-# ------------------------------------------------------------------ #
 
 async def test_chat(llm: BaseLLM, provider_name: str) -> None:
-    """Multi-turn chat() — 1 API call, ~15 tokens.
-
-    Validates same fields as generate() plus message format handling.
+    """Verifies chat() response structure including prompt_tokens > 0.
 
     Args:
         llm: Provider instance.
@@ -586,12 +556,10 @@ async def test_chat(llm: BaseLLM, provider_name: str) -> None:
     )
 
 
-# ------------------------------------------------------------------ #
 # Phase 8: is_available() — 1 API call per provider
-# ------------------------------------------------------------------ #
 
 async def test_is_available(llm: BaseLLM, provider_name: str) -> None:
-    """Health check — 1 API call, ~5 tokens (sends 'ping').
+    """Verifies that is_available() returns True for a working provider.
 
     Args:
         llm: Provider instance.
@@ -609,16 +577,14 @@ async def test_is_available(llm: BaseLLM, provider_name: str) -> None:
     logger.info("[PASS] is_available | provider=%s | available=%s", provider_name, available)
 
 
-# ------------------------------------------------------------------ #
 # Phase 9: Error handling with bad API key — 0 API calls
-# ------------------------------------------------------------------ #
 
 async def test_bad_api_key(provider_name: str) -> None:
-    """Bad API key should raise LLMAuthError or fail before hitting API.
+    """Verifies that a bad API key raises LLMError (never a raw SDK error).
 
-    Some providers validate the key format locally (fail before API call).
+    Some providers validate the key format locally (0 API calls).
     Others send the request and get a 401 (1 API call with invalid key).
-    Either way, we must get an LLMError subclass — never a raw SDK error.
+    Either way, the error must be wrapped in an LLMError subclass.
 
     Args:
         provider_name: Provider to test.
@@ -651,16 +617,13 @@ async def test_bad_api_key(provider_name: str) -> None:
         )
 
 
-# ------------------------------------------------------------------ #
 # Main runner
-# ------------------------------------------------------------------ #
 
 async def main() -> None:
     """Run all test phases sequentially.
 
-    Order:
-        Phases 1-4: Pure local tests (0 API calls)
-        Phases 5-9: Per-provider tests (3 API calls per provider)
+    Phases 1-4 are pure local (0 API calls).
+    Phases 5-9 run per provider (3 API calls each).
     """
     global _pass_count, _fail_count, _skip_count, _api_calls
 
@@ -671,14 +634,14 @@ async def main() -> None:
     print(f"  Budget per provider: 3 API calls (~150 tokens)")
     print(f"  Total budget     : {len(PROVIDERS) * 3} API calls (~{len(PROVIDERS) * 150} tokens)")
 
-    # ---- Pure local tests (0 API calls) ---- #
+    # Pure local tests (0 API calls)
 
     test_response_model()
     test_exception_hierarchy()
     test_constants()
     test_factory_errors()
 
-    # ---- Per-provider tests (3 API calls each) ---- #
+    # Per-provider tests (3 API calls each)
 
     for provider_name in PROVIDERS:
         separator(f"PROVIDER: {provider_name.upper()}")
@@ -725,7 +688,7 @@ async def main() -> None:
             )
             print(f"\n  UNEXPECTED ERROR: {type(exc).__name__} | {exc}")
 
-    # ---- Summary ---- #
+    # Summary
 
     elapsed = (time.monotonic() - overall_start) * 1000
 

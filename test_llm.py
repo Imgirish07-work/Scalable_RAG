@@ -1,18 +1,16 @@
 """
-Real LLM test — live API calls to all three Groq models.
+Integration tests for Groq LLM provider — live API calls.
 
-Tests each model with:
-    1. generate()     — single-turn prompt
-    2. chat()         — multi-turn messages
-    3. count_tokens() — local token count (no API hit)
+Test scope:
+    Exercises all three Groq model tiers (fast, strong, fallback) with
+    generate(), chat(), and count_tokens(). All tests make real API calls.
 
-Models under test:
-    GROQ_MODEL_FAST     llama-3.1-8b-instant      classify / decompose
-    GROQ_MODEL_STRONG   llama-3.3-70b-versatile   final synthesis
-    GROQ_MODEL_FALLBACK qwen/qwen3-32b             fallback if strong hits 429
+Flow:
+    For each model: generate() → chat() → count_tokens() → summary.
 
-Run:
-    python test_llm.py
+Dependencies:
+    GROQ_API_KEY set in .env, network access to Groq API.
+    Models under test: GROQ_MODEL_FAST, GROQ_MODEL_STRONG, GROQ_MODEL_FALLBACK.
 """
 
 import asyncio
@@ -24,7 +22,7 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ── Models to test ────────────────────────────────────────────────────────────
+# Models to test
 GROQ_MODELS = [
     (settings.GROQ_MODEL_FAST,     "Fast     — classify / decompose / simple queries (RPD: 14,400)"),
     (settings.GROQ_MODEL_STRONG,   "Strong   — final answer synthesis, complex queries (RPD: 1,000)"),
@@ -41,7 +39,7 @@ CHAT_MESSAGES = [
 TOKEN_COUNT_TEXT = "The quick brown fox jumps over the lazy dog."
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# Helpers
 
 def _banner(title: str) -> None:
     print(f"\n{'=' * 70}")
@@ -65,7 +63,7 @@ def _print_response(label: str, response: LLMResponse, elapsed_ms: float) -> Non
     print(f"  latency_ms        : {elapsed_ms:.1f} ms")
 
 
-# ── Per-model test ────────────────────────────────────────────────────────────
+# Per-model test
 
 async def test_groq_model(model: str, role_desc: str) -> bool:
     """Run generate, chat, and count_tokens against one Groq model.
@@ -80,7 +78,7 @@ async def test_groq_model(model: str, role_desc: str) -> bool:
         llm = LLMFactory.create("groq", model=model)
         print(f"  Provider : {llm.provider_name} | Model : {llm.model_name}\n")
 
-        # ── 1. generate() ─────────────────────────────────────────────────────
+        # 1. generate()
         _section("1. generate()")
         print(f"  Prompt : {GENERATE_PROMPT!r}\n")
 
@@ -90,7 +88,7 @@ async def test_groq_model(model: str, role_desc: str) -> bool:
 
         _print_response("generate", gen_response, gen_ms)
 
-        # ── 2. chat() ─────────────────────────────────────────────────────────
+        # 2. chat()
         _section("2. chat()")
         for msg in CHAT_MESSAGES:
             print(f"  [{msg['role']}] {msg['content']}")
@@ -102,7 +100,7 @@ async def test_groq_model(model: str, role_desc: str) -> bool:
 
         _print_response("chat", chat_response, chat_ms)
 
-        # ── 3. count_tokens() — no API hit ────────────────────────────────────
+        # 3. count_tokens() — no API hit
         _section("3. count_tokens()  [local, no API hit]")
         print(f"  Text : {TOKEN_COUNT_TEXT!r}")
 
@@ -123,7 +121,7 @@ async def test_groq_model(model: str, role_desc: str) -> bool:
         return False
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# Main
 
 async def run() -> None:
     _banner("GROQ LLM TEST — Real API Calls (All Three Models)")
@@ -143,7 +141,7 @@ async def run() -> None:
         passed = await test_groq_model(model, role_desc)
         results.append((model, passed))
 
-    # ── Summary ───────────────────────────────────────────────────────────────
+    # Summary
     _banner("SUMMARY")
     all_passed = True
     for model, passed in results:

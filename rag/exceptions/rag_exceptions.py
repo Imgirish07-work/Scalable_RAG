@@ -1,14 +1,21 @@
 """
-RAG exception hierarchy.
+Custom exception hierarchy for RAG-specific failure modes.
 
 Design:
-    - Every RAG component translates internal failures into this hierarchy.
-    - Pipeline and agent layers catch ONLY these exceptions — never raw
-      Qdrant, embedding, or LLM errors directly.
-    - RAGError is the base — catching it catches everything RAG-related.
-    - LLM-specific errors (auth, rate limit, timeout) are NOT re-wrapped here.
-      They propagate as-is from the LLM layer. This hierarchy covers only
-      RAG-specific failure modes.
+    Every RAG component translates internal failures into this hierarchy.
+    Pipeline and agent layers catch only these exceptions — never raw
+    Qdrant, embedding, or LLM errors directly. RAGError is the base:
+    catching it catches all RAG failures uniformly. LLM-specific errors
+    (auth, rate limit, timeout) are NOT re-wrapped here; they propagate
+    as-is from the LLM layer.
+
+Chain of Responsibility:
+    Raised by DenseRetriever / HybridRetriever, ContextAssembler,
+    ContextRanker, BaseRAG variants → caught by the pipeline layer
+    (RAGPipeline) or the API layer for structured error responses.
+
+Dependencies:
+    None (stdlib only).
 
 Hierarchy:
     RAGError
@@ -23,9 +30,9 @@ Hierarchy:
 class RAGError(Exception):
     """Base exception for all RAG errors.
 
-    All RAG-specific errors are subclasses of this. Pipeline code catches
-    RAGError to handle any RAG failure uniformly without importing every
-    individual subclass.
+    All RAG-specific exceptions are subclasses of this. Pipeline code
+    catches RAGError to handle any RAG failure uniformly without importing
+    every individual subclass.
 
     Attributes:
         message: Human-readable error description.
@@ -65,9 +72,9 @@ class RAGRetrievalError(RAGError):
         - Hybrid retrieval sparse component fails.
 
     Note:
-        Transient failures (network timeouts to Qdrant) should be retried
-        at the retriever level before raising this. This exception means
-        retrieval genuinely failed after retries.
+        Transient failures (network timeouts to Qdrant) should be retried at
+        the retriever level before raising this. This exception means retrieval
+        genuinely failed after all retry attempts.
     """
 
 
@@ -76,9 +83,9 @@ class RAGContextError(RAGError):
 
     Raised when:
         - No documents survive relevance filtering (all below threshold).
-        - Token budget is exceeded and cannot be resolved by truncation.
-        - Context assembler receives empty document list.
-        - Ranker encounters incompatible document format.
+        - Token budget is exhausted and cannot be resolved by truncation.
+        - Context assembler receives an empty document list.
+        - Ranker encounters an incompatible document format.
     """
 
 
@@ -88,12 +95,12 @@ class RAGGenerationError(RAGError):
     Raised when:
         - LLM returns empty text after prompt assembly.
         - Generation produces output that fails RAG-specific validation.
-        - CorrectiveRAG's query rewrite + retry cycle is exhausted.
+        - CorrectiveRAG's query rewrite and retry cycle is exhausted.
 
     Note:
         LLM-layer errors (LLMAuthError, LLMRateLimitError, etc.) are NOT
         re-wrapped in this exception. They propagate as-is so the pipeline
-        can handle them with provider-specific logic (retry, fallback, etc.).
+        can apply provider-specific logic (retry, fallback, etc.).
         This exception covers RAG-specific generation failures only.
     """
 
@@ -102,8 +109,8 @@ class RAGQualityError(RAGError):
     """Answer quality check failed.
 
     Raised when:
-        - CorrectiveRAG's relevance evaluation falls below minimum threshold
-          after all retry attempts are exhausted.
+        - CorrectiveRAG's relevance evaluation falls below the minimum
+          threshold after all retry attempts are exhausted.
         - Self-refinement (future RLM integration) detects persistent
           grounding failures.
         - Confidence score is below the acceptable floor and the variant

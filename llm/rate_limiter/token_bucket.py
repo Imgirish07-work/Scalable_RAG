@@ -1,31 +1,30 @@
 """
-Async-safe Token Bucket implementation.
+Async-safe token bucket algorithm for rate limiting.
 
-How the Token Bucket algorithm works:
-Imagine a bucket that holds tokens. Each token = permission for 1 request.
+Design:
+    The token bucket works like a physical bucket with a slow drip:
+        REFILL  — tokens accumulate continuously at refill_rate tokens/second,
+                  up to a maximum capacity. Excess tokens overflow and are lost.
+        CONSUME — each request takes one token. If the bucket is empty, the
+                  caller waits precisely until one token has accumulated.
 
-    REFILL: Tokens drip into the bucket continuously at a fixed rate
-            (e.g. 1 token/second for rpm=60). The bucket has a max
-            capacity — excess tokens overflow and are lost.
+    Advantages over a fixed sleep(60/rpm) approach:
+        - Accounts for time already elapsed in the previous request cycle.
+        - Zero wasted waiting — sleeps only as long as strictly necessary.
+        - Burst absorption — capacity > 1 allows short bursts above sustained rate.
 
-    CONSUME: Each request takes 1 token. If the bucket is empty,
-             the request WAITS until enough tokens have accumulated.
+    asyncio.Lock() ensures the check-and-consume operation is atomic across
+    concurrent coroutines. Without the lock, two coroutines could both observe
+    tokens >= 1, both consume the same token, and one request would bypass the limit.
+    The wait sleep happens OUTSIDE the lock so other coroutines can proceed
+    concurrently while a waiting coroutine sleeps.
 
-This gives you:
-    - Sustained rate enforcement (you can't exceed rpm over time)
-    - Burst tolerance (capacity > 1 means short spikes are absorbed)
-    - Zero wasted time (waits only as long as needed, no over-sleeping)
+Chain of Responsibility:
+    LLMRateLimiter._throttle() calls acquire() on two TokenBucket instances
+    (one for RPM, one for RPD) before every LLM API call.
 
-Why NOT just sleep(60/rpm)?
-    Fixed sleep ignores time already elapsed. If a request took 2s to
-    process, you'd sleep the full interval anyway. Token bucket accounts
-    for elapsed time — no wasted waiting.
-
-asyncio.Lock() usage:
-    Multiple coroutines call acquire() concurrently. Without a lock,
-    two coroutines could both see tokens > 0, both consume the same
-    token, and one request sneaks through above the limit.
-    The lock serializes the check-and-consume operation atomically.
+Dependencies:
+    asyncio, time.monotonic, utils.logger.
 """
 
 import asyncio
@@ -35,39 +34,41 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-class TokenBucket:
-    """Async-safe token bucket for rate limiting.
 
-    Tracks one rate window (either rpm or rpd). For both windows,
-    instantiate two TokenBucket objects in LLMRateLimiter.
+class TokenBucket:
+    """Async-safe token bucket for a single rate window (RPM or RPD).
+
+    Instantiate two TokenBucket objects in LLMRateLimiter to enforce
+    both per-minute and per-day limits independently.
 
     Attributes:
-        _capacity: Max tokens the bucket can hold.
+        _capacity: Maximum tokens the bucket can hold.
         _refill_rate: Tokens added per second.
-        _tokens: Current token count (float for fractional accumulation).
-        _last_refill: Timestamp of last refill calculation.
-        _lock: asyncio.Lock ensuring atomic check-and-consume.
+        _tokens: Current token count (float to accumulate fractional tokens).
+        _last_refill: Monotonic timestamp of the last refill calculation.
+        _lock: asyncio.Lock serializing check-and-consume operations.
     """
 
     def __init__(self, capacity: float, refill_rate: float) -> None:
-        """Initialize a full bucket.
+        """Initialize a full bucket ready to serve requests immediately.
 
         Args:
-            capacity: Max tokens the bucket holds. Requests burst upto this many before throttling kicks in.
-
-            refill_rate: Tokens added per second. Set to rpm/60 for a per-minute window.
+            capacity: Max tokens the bucket holds. Requests may burst up to
+                this many before throttling begins.
+            refill_rate: Tokens added per second. Set to rpm/60 for a
+                per-minute window, or rpd/86400 for a per-day window.
         """
         self._capacity = capacity
         self._refill_rate = refill_rate
-        self._tokens = capacity  # Start full
+        self._tokens = capacity  # Start full so the first requests are not delayed
         self._last_refill = monotonic()
         self._lock = asyncio.Lock()
 
     def _refill(self) -> None:
-        """Add tokens based on elapsed time since last refill.
+        """Add tokens proportional to elapsed time since the last refill.
 
-        Called inside the lock before every acquire(). Uses monotonic 
-        clock (never goes backwards, unaffected by system clock changes).
+        Called inside the lock before every acquire(). Uses the monotonic
+        clock so the calculation is unaffected by system clock adjustments.
 
         Formula:
             new_tokens = elapsed_seconds * refill_rate
@@ -80,44 +81,45 @@ class TokenBucket:
         self._last_refill = now
 
     async def acquire(self) -> None:
-        """Wait until a token is available, then consume it.
+        """Wait until one token is available, then consume it.
 
-        This is the key method — callers await this before every LLM
-        request. It blocks (yields to the event loop) until the rate
-        allows the request through.
+        Callers await this before every LLM request. If a token is available
+        immediately, the call returns without sleeping. If not, it calculates
+        the exact wait duration and yields to the event loop for that period.
 
-        The wait time is calculated precisely:
-            tokens_needed = 1 - current_tokens  (if tokens < 1)
-            wait = tokens_needed / refill_rate
+        The sleep happens outside the lock so other coroutines can check the
+        bucket concurrently while this one waits, rather than queuing behind
+        the lock.
         """
         async with self._lock:
-            self._refill() 
+            self._refill()
 
-            # if tokens >= 1, consume immediately
             if self._tokens >= 1:
+                # Token available — consume immediately without sleeping
                 self._tokens -= 1
                 return
 
-            # Calculate wait time for 1 token to accumulate
+            # Calculate the exact time needed for one token to accumulate
             tokens_needed = 1 - self._tokens
             wait_seconds = tokens_needed / self._refill_rate
 
-        # Wait OUTSIDE the lock — other coroutines can check in parallel
-        # while we wait. Without this, all other requests would block
-        # waiting for the lock, not just waiting for tokens.
-         
+        # Release the lock before sleeping — other coroutines must not block
+        # waiting for the lock while this one is sleeping for rate recovery
         logger.debug("Rate limit: waiting %.2fs for token", wait_seconds)
         await asyncio.sleep(wait_seconds)
 
-        # Reacquire the lock and consume the token we waited for
+        # Reacquire the lock to consume the token we waited for
         async with self._lock:
             self._refill()
             self._tokens = max(self._tokens - 1, 0)
 
     @property
     def available_tokens(self) -> float:
-        """Current token count (snapshot, not lock-protected).
+        """Current token count snapshot for monitoring and logging.
 
-        For monitoring/logging only — do NOT use for flow control.
+        Not lock-protected — for observability only. Do not use for flow control.
+
+        Returns:
+            Current token count rounded to 2 decimal places.
         """
         return round(self._tokens, 2)

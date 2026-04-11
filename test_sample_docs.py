@@ -1,13 +1,18 @@
 """
-Minimal pipeline test — chunking to embeddings.
-Processes one document at a time (large files).
+Pipeline smoke test: chunking and embedding for all files in data/sample_docs.
+
+Test scope:
+    Smoke test (no pytest) for the document ingestion pipeline applied to real
+    files. Processes each supported file (PDF, DOCX, TXT, MD, HTML) one at a
+    time through DocumentCleaner → StructurePreserver → Chunker → Embeddings.
 
 Flow:
-    raw file
-        → DocumentCleaner   (load + clean)
-        → StructurePreserver (detect structure)
-        → Chunker            (split into chunks)
-        → Embeddings         (embed each chunk)
+    For each file: load/clean → structure detection → chunking → embed all
+    chunks one by one. Unsupported extensions (e.g. .xlsx) are skipped.
+
+Dependencies:
+    BGE-small-en-v1.5 embedding model; files in data/sample_docs/; no external
+    services (Qdrant, Redis, LLM API).
 """
 
 import time
@@ -21,18 +26,11 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ------------------------------------------------------------------ #
-#  Config                                                             #
-# ------------------------------------------------------------------ #
-
 DOCS_DIR = Path("data/sample_docs")
 
-# Supported by DocumentCleaner only
+# Extensions supported by DocumentCleaner
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".html", ".htm"}
 
-# ------------------------------------------------------------------ #
-#  Helpers                                                            #
-# ------------------------------------------------------------------ #
 
 def separator(label: str) -> None:
     print(f"\n{'=' * 60}")
@@ -40,22 +38,13 @@ def separator(label: str) -> None:
     print(f"{'=' * 60}")
 
 
-# ------------------------------------------------------------------ #
-#  Step 1 — DocumentCleaner                                           #
-# ------------------------------------------------------------------ #
-
 def test_cleaner(filepath: Path, filename: str) -> list:
-    """
-    DocumentCleaner loads AND cleans the file.
-    Pass filepath — NOT raw text.
-    Returns List[Document].
-    """
+    """Load and clean the file via DocumentCleaner, returning a List[Document]."""
     separator(f"[1] DocumentCleaner — {filename}")
 
     cleaner = DocumentCleaner()
     start = time.monotonic()
 
-    # ✅ correct method — takes file path, returns List[Document]
     docs = cleaner.load_and_clean(str(filepath))
 
     elapsed = (time.monotonic() - start) * 1000
@@ -74,26 +63,17 @@ def test_cleaner(filepath: Path, filename: str) -> list:
     return docs
 
 
-# ------------------------------------------------------------------ #
-#  Step 2 — StructurePreserver                                        #
-# ------------------------------------------------------------------ #
-
 def test_structure(docs: list, filename: str) -> list:
-    """
-    StructurePreserver takes List[Document] — NOT raw text.
-    Returns List[Document] with enriched metadata.
-    """
+    """Run StructurePreserver on cleaned docs, returning List[Document] with enriched metadata."""
     separator(f"[2] StructurePreserver — {filename}")
 
     preserver = StructurePreserver()
     start = time.monotonic()
 
-    # ✅ correct — takes List[Document], returns List[Document]
     structured_docs = preserver.preserve(docs)
 
     elapsed = (time.monotonic() - start) * 1000
 
-    # Count structure types found
     types = {}
     for d in structured_docs:
         t = d.metadata.get("structure_type", "unknown")
@@ -109,21 +89,13 @@ def test_structure(docs: list, filename: str) -> list:
     return structured_docs
 
 
-# ------------------------------------------------------------------ #
-#  Step 3 — Chunker                                                   #
-# ------------------------------------------------------------------ #
-
 def test_chunker(structured_docs: list, filename: str) -> list:
-    """
-    Chunker takes List[Document] — NOT raw text.
-    Returns List[Document] chunks ready for embedding.
-    """
+    """Split structured docs into chunks via Chunker, returning List[Document]."""
     separator(f"[3] Chunker — {filename}")
 
     chunker = Chunker()
     start = time.monotonic()
 
-    # ✅ correct — takes List[Document], returns List[Document]
     chunks = chunker.split_documents(structured_docs)
 
     elapsed = (time.monotonic() - start) * 1000
@@ -143,13 +115,10 @@ def test_chunker(structured_docs: list, filename: str) -> list:
     return chunks
 
 
-# ------------------------------------------------------------------ #
-#  Step 4 — Embeddings                                                #
-# ------------------------------------------------------------------ #
-
 # ...existing code...
 
 def test_embeddings(chunks: list, filename: str) -> None:
+    """Embed each chunk using the BGE model and assert non-empty vectors."""
     separator(f"[4] Embeddings — {filename}")
 
     embedder = get_embeddings()
@@ -163,12 +132,10 @@ def test_embeddings(chunks: list, filename: str) -> None:
         text = chunk.page_content if hasattr(chunk, "page_content") else chunk
         start = time.monotonic()
 
-        # ✅ correct method on HuggingFaceEmbeddings
         embedding = embedder.embed_query(text)
 
         elapsed = (time.monotonic() - start) * 1000
 
-        # Print progress every 10 chunks
         if i % 10 == 0 or i == total - 1:
             print(
                 f"  [{i+1}/{total}] "
@@ -176,7 +143,6 @@ def test_embeddings(chunks: list, filename: str) -> None:
                 f"time={elapsed:.1f}ms | "
                 f"preview={text[:50]!r}"
             )
-            # ✅ Print first 10 embedding values only
             print(
                 f"  embedding[:10] : "
                 f"{[round(v, 6) for v in embedding[:10]]}"
@@ -196,12 +162,9 @@ def test_embeddings(chunks: list, filename: str) -> None:
 
 # ...existing code...
 
-# ------------------------------------------------------------------ #
-#  Main — Process one doc at a time                                   #
-# ------------------------------------------------------------------ #
 
 def process_document(filepath: Path) -> None:
-    """Full pipeline for a single document."""
+    """Run all four pipeline steps for a single document and report pass/fail."""
     filename = filepath.name
 
     separator(f"DOCUMENT: {filename}")
@@ -209,16 +172,9 @@ def process_document(filepath: Path) -> None:
     print(f"  Size : {filepath.stat().st_size / 1024:.1f} KB")
 
     try:
-        # Step 1 — load + clean (pass filepath not raw text)
-        docs = test_cleaner(filepath, filename)
-
-        # Step 2 — structure detection (pass List[Document])
+        docs          = test_cleaner(filepath, filename)
         structured_docs = test_structure(docs, filename)
-
-        # Step 3 — chunking (pass List[Document])
-        chunks = test_chunker(structured_docs, filename)
-
-        # Step 4 — embeddings (pass List[Document])
+        chunks        = test_chunker(structured_docs, filename)
         test_embeddings(chunks, filename)
 
         separator(f"✅ PASSED — {filename}")
@@ -245,7 +201,6 @@ def main() -> None:
         print(f"  - {d.name} ({d.stat().st_size / 1024:.1f} KB)")
 
     for filepath in docs:
-        # ✅ Skip unsupported files (xlsx etc.)
         if filepath.suffix.lower() not in SUPPORTED_EXTENSIONS:
             print(f"\n  ⚠️  SKIPPED — unsupported format: {filepath.name}")
             logger.warning("Skipping unsupported file | file=%s", filepath.name)

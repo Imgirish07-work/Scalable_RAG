@@ -1,21 +1,20 @@
 """
-TTL Classifier + Quality Gate Pipeline Test — Phase 7 validation.
+End-to-end tests for the TTL classifier and quality gate pipeline.
 
-Run from project root:
-    python test_cache_ttl_pipeline.py
+Test scope:
+    Unit and integration tests (no Redis, no Qdrant, no embedding model)
+    covering TTLClassifier query-type detection and TTL assignment,
+    QualityGate acceptance/rejection logic, and CacheManager integration
+    with both components.
 
-No external dependencies — pure CPU tests, no Redis, no Qdrant, no model.
+Flow:
+    Query type detection → TTL assignment → edge cases → custom overrides
+    → quality gate rejection → quality gate acceptance → CacheManager TTL
+    integration → CacheManager quality gate integration → full stats.
 
-Sections:
-    1. TTL classifier — query type detection
-    2. TTL classifier — TTL assignment per type
-    3. TTL classifier — edge cases
-    4. TTL classifier — custom overrides
-    5. Quality gate — rejection cases
-    6. Quality gate — acceptance cases
-    7. CacheManager integration — TTL varies by query type
-    8. CacheManager integration — quality gate with reason
-    9. Full stats include TTL and quality gate info
+Dependencies:
+    CacheManager (in-memory L1 only, Redis disabled), TTLClassifier,
+    QualityGate, mocked Settings.
 """
 
 import asyncio

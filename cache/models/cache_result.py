@@ -1,25 +1,30 @@
 """
-CacheResult — returned by cache_manager.get() to the caller.
+Result object returned from a cache lookup by CacheManager.get().
 
-Contains:
-    - The LLMResponse (or None on miss)
-    - Whether it was a hit or miss
-    - Which layer served the hit (L1 memory / L2 Redis / miss)
-    - Which strategy matched (exact / semantic / none)
-    - Similarity score (for semantic hits, useful for observability)
-    - Lookup latency (how long the cache check took)
+Design:
+    Immutable Pydantic model (frozen=True) carrying the outcome of a
+    single cache lookup. Two factory methods — miss() and from_hit() —
+    enforce correct construction for the two possible outcomes.
+    The caller inspects result.hit to decide whether to invoke the LLM;
+    the remaining fields feed into metrics, logging, and API responses.
 
-The caller uses `result.hit` to decide whether to call the LLM.
-The rest of the fields feed into metrics and logging.
+    CacheLayer, CacheStrategy, and SemanticTier are str-enums so they
+    serialize to plain strings in JSON without extra configuration.
 
-Sync — pure Pydantic data class, no I/O.
+Chain of Responsibility:
+    Created by CacheManager._try_get_from_l1(), _try_get_from_l2(),
+    and _try_semantic_lookup(). Returned to RAGPipeline / BaseRAG.query().
+    Metrics fields are consumed by CacheManager._record_hit_metrics().
+
+Dependencies:
+    pydantic, llm.LLMResponse
 """
-
 
 from enum import Enum
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from llm import LLMResponse
+
 
 class CacheLayer(str, Enum):
     """Which cache layer served the response."""
@@ -28,6 +33,7 @@ class CacheLayer(str, Enum):
     L2_REDIS = "l2_redis"
     MISS = "miss"
 
+
 class CacheStrategy(str, Enum):
     """Which strategy produced the cache key match."""
 
@@ -35,13 +41,15 @@ class CacheStrategy(str, Enum):
     SEMANTIC = "semantic"
     NONE = "none"
 
+
 class SemanticTier(str, Enum):
     """Confidence tier for semantic matches.
 
-    DIRECT  — cosine >= 0.98, serve as-is
-    HIGH    — cosine 0.93-0.98, serve with internal flag
-    PARTIAL — cosine 0.88-0.93, use as LLM seed (cheaper call)
-    MISS    — cosine < 0.88, no semantic match
+    Attributes:
+        DIRECT:  cosine >= 0.98 — serve as-is, high confidence.
+        HIGH:    cosine 0.93-0.98 — serve with internal monitoring flag.
+        PARTIAL: cosine 0.88-0.93 — use as LLM seed (cheaper call).
+        MISS:    cosine < 0.88 — no semantic match.
     """
 
     DIRECT = "direct"
@@ -49,8 +57,24 @@ class SemanticTier(str, Enum):
     PARTIAL = "partial"
     MISS = "miss"
 
+
 class CacheResult(BaseModel):
-    """Outcome of a cache lookup — returned to the caller."""
+    """Outcome of a cache lookup — returned to the caller.
+
+    Attributes:
+        hit: True if cache returned a usable response.
+        response: Cached LLM response, None on miss.
+        layer: Which backend layer served this result.
+        strategy: Which key strategy matched.
+        semantic_tier: Confidence tier for semantic matches.
+        similarity_score: Cosine similarity score (0.0 for exact or miss).
+        lookup_latency_ms: Total time spent on cache lookup.
+        cache_age_seconds: Age of the cached entry at read time.
+        cache_key: The key that matched (empty on miss).
+        sources: Serialized RetrievedChunk dicts, populated on cache hit.
+        confidence_value: Retrieval confidence stored at write time.
+    """
+
     model_config = {"strict": False, "frozen": True}
 
     hit: bool = Field(
@@ -106,8 +130,15 @@ class CacheResult(BaseModel):
     )
 
     @staticmethod
-    def miss(latency_ms: float =0.0) -> "CacheResult":
-        """Factory method for cache miss results."""
+    def miss(latency_ms: float = 0.0) -> "CacheResult":
+        """Factory method for cache miss results.
+
+        Args:
+            latency_ms: Time spent on the failed lookup.
+
+        Returns:
+            CacheResult with hit=False.
+        """
         return CacheResult(hit=False, lookup_latency_ms=latency_ms)
 
     @staticmethod
@@ -123,7 +154,23 @@ class CacheResult(BaseModel):
         semantic_tier: SemanticTier = SemanticTier.MISS,
         confidence_value: float = 0.0,
     ) -> "CacheResult":
-        """Factory for a cache hit with full metadata."""
+        """Factory for a cache hit with full metadata.
+
+        Args:
+            response: The cached LLMResponse to return to the caller.
+            layer: Backend that served the hit.
+            strategy: Strategy that matched.
+            latency_ms: Time spent on the cache lookup.
+            cache_key: The matched cache key.
+            sources: Serialized source chunks associated with the entry.
+            cache_age_seconds: Age of the entry at read time.
+            similarity_score: Cosine score for semantic hits.
+            semantic_tier: Confidence tier for semantic hits.
+            confidence_value: Retrieval confidence stored at write time.
+
+        Returns:
+            CacheResult with hit=True and all metadata populated.
+        """
         return CacheResult(
             hit=True,
             response=response,

@@ -1,28 +1,23 @@
 """
-Context assembler — formats retrieved chunks into a prompt-ready string.
+Assembles retrieved chunks into a prompt-ready, token-bounded context string.
 
 Design:
-    - Takes ranked RetrievedChunks and assembles them into a single context
-      string that fits within the token budget (max_context_tokens).
-    - Chunks are added in rank order (highest relevance first). When the
-      token budget is exhausted, remaining chunks are excluded.
-    - Chunks that make it into the context get used_in_context=True on
-      a new RetrievedChunk instance (originals are frozen/immutable).
-    - Token counting uses BaseLLM.count_tokens() — async because Gemini's
-      implementation makes an API call. This is an I/O-bound operation
-      (Rule 1: async def).
+    Takes a ranked list of RetrievedChunks and greedily adds them in rank
+    order (highest relevance first) until the token budget is exhausted.
+    Whole chunks only — never truncates mid-chunk, because a clause cut in
+    half is worse than omitting it entirely. Chunks included in the final
+    context are flagged with used_in_context=True on a new (frozen)
+    RetrievedChunk instance. Token counting uses BaseLLM.count_tokens(),
+    which is async because Gemini's implementation makes an API call.
 
-Why not just concatenate and truncate:
-    - Truncating mid-chunk destroys context. A legal clause cut in half
-      is worse than omitting it entirely. This assembler includes whole
-      chunks or excludes them — never partial chunks.
-    - Source attribution requires knowing WHICH chunks were used. The
-      used_in_context flag enables this.
+Chain of Responsibility:
+    Called by BaseRAG.assemble_context() after ContextRanker.rank()
+    → passes (context_str, updated_chunks, tokens_used) back to BaseRAG
+    → context_str is forwarded to BaseRAG._generate().
 
-Integration points:
-    - RetrievedChunk from rag/models/rag_response.py
-    - BaseLLM.count_tokens() from llm/contracts/base_llm.py
-    - rag_prompt_templates.py for context formatting patterns
+Dependencies:
+    rag.models.rag_response (RetrievedChunk)
+    rag.exceptions.rag_exceptions (RAGContextError)
 """
 
 from rag.models.rag_response import RetrievedChunk
@@ -31,14 +26,13 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Separator between chunks in assembled context
+# Separator rendered between chunks in the assembled context string
 _CHUNK_SEPARATOR = "\n\n---\n\n"
 
-# Overhead tokens for separators, source labels, numbering
-# Conservative estimate — actual overhead varies by chunk count
+# Conservative token overhead per chunk for separators, labels, and numbering
 _OVERHEAD_PER_CHUNK = 20
 
-# Minimum useful context — below this, generation quality degrades
+# Minimum useful context budget — below this, generation quality degrades severely
 _MIN_CONTEXT_TOKENS = 20
 
 
@@ -48,11 +42,11 @@ class ContextAssembler:
     Takes a ranked list of RetrievedChunks and produces a formatted
     context string that fits within the configured token budget.
     Returns both the context string and updated chunks with the
-    used_in_context flag set.
+    used_in_context flag set for source attribution.
 
     Attributes:
-        _llm: BaseLLM instance for token counting.
-        _max_tokens: Maximum tokens allowed for assembled context.
+        _llm: BaseLLM instance used for token counting.
+        _max_tokens: Maximum tokens allowed for the assembled context.
         _include_source_labels: Whether to prepend source info to each chunk.
     """
 
@@ -62,19 +56,19 @@ class ContextAssembler:
         max_tokens: int = 3072,
         include_source_labels: bool = True,
     ) -> None:
-        """Initialize context assembler.
+        """Initialize the context assembler.
 
         Args:
             llm: BaseLLM instance for token counting. Must implement
                 async count_tokens(text) -> int.
-            max_tokens: Maximum token budget for assembled context.
-                Must be >= _MIN_CONTEXT_TOKENS.
-            include_source_labels: Whether to prepend [Source: file.pdf]
-                labels to each chunk. Helps LLM cite sources but uses
-                a few extra tokens per chunk.
+            max_tokens: Maximum token budget for the assembled context.
+                Must be >= _MIN_CONTEXT_TOKENS (20).
+            include_source_labels: Whether to prepend [Source N: file.pdf]
+                labels to each chunk. Helps the LLM cite sources, but
+                costs a few extra tokens per chunk.
 
         Raises:
-            ValueError: If max_tokens is below minimum threshold.
+            ValueError: If max_tokens is below the minimum threshold.
         """
         if max_tokens < _MIN_CONTEXT_TOKENS:
             raise ValueError(
@@ -101,23 +95,23 @@ class ContextAssembler:
 
         Adds chunks in rank order (caller must pre-sort by relevance).
         Stops when adding the next chunk would exceed the token budget.
-        Whole chunks only — never truncates mid-chunk.
+        Includes whole chunks only — never truncates mid-chunk.
 
         Args:
-            chunks: List of RetrievedChunk, ordered by relevance
-                (highest first). Typically output of ContextRanker.
+            chunks: List of RetrievedChunk ordered by relevance (highest
+                first). Typically the output of ContextRanker.rank().
 
         Returns:
             Tuple of:
                 - context_str: Formatted context string for the LLM prompt.
                 - updated_chunks: New chunk list with used_in_context flags set.
-                    Chunks included in context have used_in_context=True.
-                    Excluded chunks retain used_in_context=False.
+                    Included chunks have used_in_context=True; excluded
+                    chunks retain used_in_context=False.
                 - tokens_used: Actual token count of the assembled context.
 
         Raises:
-            RAGContextError: If no chunks can fit within the token budget,
-                or if the chunks list is empty.
+            RAGContextError: If the chunks list is empty, or if no chunk
+                fits within the token budget.
         """
         if not chunks:
             raise RAGContextError(
@@ -131,10 +125,10 @@ class ContextAssembler:
         included_count = 0
 
         for i, chunk in enumerate(chunks):
-            # Format this chunk
+            # Format this chunk with optional source label
             formatted = self._format_chunk(chunk, index=i + 1)
 
-            # Count tokens for this chunk + separator overhead
+            # Count tokens for this chunk plus the separator that precedes it
             chunk_tokens = await self._llm.count_tokens(formatted)
             separator_tokens = (
                 await self._llm.count_tokens(_CHUNK_SEPARATOR)
@@ -143,7 +137,7 @@ class ContextAssembler:
             )
             total_addition = chunk_tokens + separator_tokens
 
-            # Check if adding this chunk would exceed the budget
+            # Stop adding when the next chunk would exceed the budget
             if tokens_used + total_addition > self._max_tokens:
                 logger.info(
                     "Token budget reached | included=%d | excluded=%d | "
@@ -157,7 +151,7 @@ class ContextAssembler:
                 updated_chunks.append(chunk)
                 continue
 
-            # Add chunk to context
+            # Append chunk to context
             if context_parts:
                 context_parts.append(_CHUNK_SEPARATOR)
             context_parts.append(formatted)
@@ -211,17 +205,17 @@ class ContextAssembler:
         return context_str, updated_chunks, tokens_used
 
     def _format_chunk(self, chunk: RetrievedChunk, index: int) -> str:
-        """Format a single chunk for inclusion in the context.
+        """Format a single chunk for inclusion in the context string.
 
         Optionally prepends a source label with file name and section.
-        Numbering helps the LLM reference specific sources in its answer.
+        The 1-based index lets the LLM reference sources by number.
 
         Args:
             chunk: RetrievedChunk to format.
-            index: 1-based position number for source reference.
+            index: 1-based position number used in the source label.
 
         Returns:
-            Formatted chunk string.
+            Formatted chunk string ready for concatenation into context.
         """
         parts = []
 
@@ -237,15 +231,14 @@ class ContextAssembler:
         """Build a source attribution label for a chunk.
 
         Format: [Source 1: report.pdf | Section: Introduction | Page: 3]
-
-        Only includes section and page if they exist in the chunk metadata.
+        Section and page are omitted when not present in the chunk metadata.
 
         Args:
             chunk: RetrievedChunk with source metadata.
             index: 1-based source number.
 
         Returns:
-            Source label string.
+            Formatted source label string.
         """
         label_parts = [f"[Source {index}: {chunk.source_file}"]
 

@@ -1,25 +1,20 @@
 """
-Document loader and cleaner — first step in the ingestion pipeline.
+Loads and cleans raw documents as the first step in the ingestion pipeline.
 
-Loads documents from disk (PDF, DOCX, TXT, MD, HTML), cleans raw text
-by fixing encoding issues, removing boilerplate, and normalizing whitespace.
-Filters out pages that are too short or empty after cleaning.
+Design:
+    Single-responsibility class (DocumentCleaner) that handles format detection,
+    loader selection, and multi-step text cleaning. Loader choice is driven by
+    a settings flag (prefer_pdfplumber) with automatic fallback for PDFs.
 
-Pipeline position:
-    DocumentCleaner.load_and_clean()         ← here
-        → StructurePreserver.preserve()
-            → Chunker.split_documents()
-                → VectorStore.add_documents()
+Chain of Responsibility:
+    Called by the ingestion pipeline → passes cleaned List[Document] to
+    StructurePreserver.preserve() → then Chunker.split_documents() →
+    then VectorStore.add_documents().
 
-Supported formats:
-    .pdf  → PyMuPDFLoader (default) or PDFPlumberLoader (settings toggle)
-    .docx → Docx2txtLoader
-    .txt  → TextLoader (utf-8)
-    .md   → UnstructuredMarkdownLoader
-    .html → UnstructuredHTMLLoader
-
-Sync — file I/O only, LangChain loaders are sync-only.
-Wrapped in asyncio.to_thread() when called from async context.
+Dependencies:
+    ftfy, langchain_community (PyMuPDFLoader, PDFPlumberLoader, Docx2txtLoader,
+    TextLoader, UnstructuredMarkdownLoader, UnstructuredHTMLLoader),
+    langchain_core.documents.Document, config.settings, utils.logger.
 """
 
 import re
@@ -47,22 +42,21 @@ class DocumentCleaner:
     """Loads documents from disk and cleans extracted text.
 
     Attributes:
-        _min_chars_per_page: Minimum characters to keep a page (filters noise).
+        _min_chars_per_page: Minimum characters required to keep a page.
         _prefer_pdfplumber: If True, use PDFPlumberLoader instead of PyMuPDF.
     """
 
     SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".html", ".htm"}
 
-    # Boilerplate patterns for removal during cleaning
-    # Only standalone URL lines are stripped (not inline URLs in content)
+    # Only standalone URL lines are stripped — inline URLs within content are kept.
     _BOILERPLATE_PATTERNS = [
         r"all rights reserved",
         r"confidential",
         r"do not distribute",
         r"page\s+\d+\s+of\s+\d+",       # "Page 1 of 10"
         r"^\s*\d+\s*$",                   # standalone page numbers
-        r"^\s*http[s]?://[^\s]+\s*$",     # standalone URL lines (not inline)
-        r"^\s*www\.[^\s]+\s*$",           # standalone www lines (not inline)
+        r"^\s*http[s]?://[^\s]+\s*$",     # standalone URL lines
+        r"^\s*www\.[^\s]+\s*$",           # standalone www lines
     ]
 
     _BOILERPLATE_REGEX = re.compile(
@@ -81,7 +75,7 @@ class DocumentCleaner:
         )
 
     def load_and_clean(self, file_path: str) -> List[Document]:
-        """Load a document from disk and clean all pages.
+        """Load a document from disk and return cleaned pages.
 
         Args:
             file_path: Absolute or relative path to the document.
@@ -105,16 +99,16 @@ class DocumentCleaner:
         return cleaned_docs
 
     def _detect_type(self, file_path: str) -> str:
-        """Detect file type from extension.
+        """Return the lowercase file extension, raising if unsupported.
 
         Args:
             file_path: Path to the file.
 
         Returns:
-            Lowercase file extension (e.g. '.pdf').
+            Lowercase file extension e.g. '.pdf'.
 
         Raises:
-            ValueError: If extension is not in SUPPORTED_EXTENSIONS.
+            ValueError: If the extension is not in SUPPORTED_EXTENSIONS.
         """
         ext = Path(file_path).suffix.lower()
         if ext not in self.SUPPORTED_EXTENSIONS:
@@ -124,12 +118,10 @@ class DocumentCleaner:
         return ext
 
     def _load_document(self, file_path: str) -> List[Document]:
-        """Load document using the correct LangChain loader per file type.
+        """Select the correct LangChain loader and load the document.
 
         Loader selection:
-            .pdf   → PyMuPDFLoader (default, fastest, best layout)
-                     PDFPlumberLoader (if prefer_pdfplumber=True)
-                     PDFPlumberLoader (fallback if PyMuPDF fails)
+            .pdf   → PyMuPDFLoader (default) or PDFPlumberLoader (settings flag)
             .docx  → Docx2txtLoader
             .txt   → TextLoader (utf-8)
             .md    → UnstructuredMarkdownLoader
@@ -139,10 +131,10 @@ class DocumentCleaner:
             file_path: Path to the document.
 
         Returns:
-            List of raw Document objects (one per page/section).
+            List of raw Document objects, one per page or section.
 
         Raises:
-            FileNotFoundError: If file does not exist.
+            FileNotFoundError: If the file does not exist.
             ValueError: If no loader matches the extension.
         """
         if not os.path.exists(file_path):
@@ -166,7 +158,7 @@ class DocumentCleaner:
             elif ext in {".html", ".htm"}:
                 docs = UnstructuredHTMLLoader(file_path).load()
             else:
-                # Defensive guard — _detect_type already validates
+                # _detect_type already validates — this branch is unreachable
                 raise ValueError(f"No loader for extension: {ext}")
 
             logger.info("Loaded %d page(s): file=%s", len(docs), file_name)
@@ -177,17 +169,17 @@ class DocumentCleaner:
             raise
 
     def _load_pdf(self, file_path: str) -> List[Document]:
-        """Load PDF with loader preference from settings.
+        """Load a PDF using the preferred loader, with automatic fallback.
 
-        Primary:   PyMuPDFLoader (fast, layout-aware)
-        Alternate: PDFPlumberLoader (MIT license, better tables)
-        Fallback:  PDFPlumberLoader (if primary fails)
+        Primary:   PyMuPDFLoader (fast, layout-aware).
+        Alternate: PDFPlumberLoader (better table extraction, MIT license).
+        Fallback:  PDFPlumberLoader when PyMuPDF raises any exception.
 
         Args:
             file_path: Path to the PDF file.
 
         Returns:
-            List of Document objects (one per page).
+            List of Document objects, one per page.
         """
         file_name = Path(file_path).name
 
@@ -206,40 +198,39 @@ class DocumentCleaner:
             return PDFPlumberLoader(file_path).load()
 
     def _clean_text(self, text: str) -> str:
-        """Clean raw extracted text from a single page.
+        """Apply multi-step cleaning to raw extracted text from a single page.
 
-        Steps (in order):
-            1. ftfy — fix broken unicode, mojibake, encoding issues
-            2. Hyphens — fix hyphenated line breaks "retriev-\\nal" → "retrieval"
-            3. Boilerplate — remove standalone page numbers, URLs, copyright
-            4. Whitespace — normalize multiple newlines, collapse spaces
-            5. Strip — remove leading/trailing whitespace
+        Steps applied in order:
+            1. ftfy — fix broken unicode and mojibake encoding issues.
+            2. Hyphens — rejoin hyphenated line breaks ('retriev-\\nal' → 'retrieval').
+            3. Boilerplate — remove page numbers, standalone URLs, copyright lines.
+            4. Whitespace — collapse 3+ newlines to 2, collapse repeated spaces.
+            5. Strip — remove leading and trailing whitespace.
 
         Args:
             text: Raw text extracted from a document page.
 
         Returns:
-            Cleaned text string. Empty string if input was empty/whitespace.
+            Cleaned text string. Empty string if input was empty or whitespace-only.
         """
         if not text or not text.strip():
             logger.warning("Received empty or whitespace-only text for cleaning")
             return ""
 
         try:
-            # Fix encoding issues (mojibake, broken unicode)
+            # Fix encoding issues such as mojibake and broken unicode
             cleaned = ftfy.fix_text(text)
 
-            # Fix hyphenated line breaks: "retriev-\nal" → "retrieval"
+            # Rejoin hyphenated line breaks introduced by PDF line wrapping
             cleaned = re.sub(r"(\w+)-\n(\w+)", r"\1\2", cleaned)
 
-            # Remove boilerplate (standalone URLs, page numbers, copyright)
+            # Remove boilerplate: page numbers, standalone URLs, copyright notices
             cleaned = self._BOILERPLATE_REGEX.sub("", cleaned)
 
-            # Normalize whitespace: collapse 3+ newlines to 2, collapse spaces
+            # Normalize whitespace: collapse excess newlines and spaces
             cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
             cleaned = re.sub(r"[ \t]+", " ", cleaned)
 
-            # Strip leading/trailing whitespace
             cleaned = cleaned.strip()
 
             return cleaned
@@ -249,15 +240,15 @@ class DocumentCleaner:
             return ""
 
     def _clean_documents(self, documents: List[Document]) -> List[Document]:
-        """Apply _clean_text() to every document page.
+        """Apply _clean_text() to every page and filter low-quality results.
 
-        Filters:
-            - Skips pages that are empty after cleaning
-            - Skips pages shorter than min_chars_per_page
-            - Preserves all original metadata
+        Filters applied:
+            - Skips pages that are empty after cleaning.
+            - Skips pages shorter than min_chars_per_page.
+            - Preserves all original metadata on kept pages.
 
         Args:
-            documents: List of raw Document objects from loader.
+            documents: List of raw Document objects from the loader.
 
         Returns:
             List of cleaned Document objects.
@@ -267,7 +258,6 @@ class DocumentCleaner:
         for doc in documents:
             cleaned_text = self._clean_text(doc.page_content)
 
-            # Skip empty pages
             if not cleaned_text:
                 logger.info(
                     "Page empty after cleaning — skipping: source=%s, page=%s",
@@ -276,7 +266,6 @@ class DocumentCleaner:
                 )
                 continue
 
-            # Skip pages below minimum length
             if len(cleaned_text) < self._min_chars_per_page:
                 logger.info(
                     "Page too short (%d chars) — skipping: source=%s, page=%s",

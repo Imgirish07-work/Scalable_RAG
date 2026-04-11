@@ -1,32 +1,29 @@
 """
-SimpleRAG — baseline RAG variant.
+SimpleRAG — the baseline single-pass RAG variant.
 
 Design:
-    - Overrides ONLY retrieve(). Everything else uses BaseRAG defaults:
-      pre_process (normalize/refine), rank (MMR), assemble_context
-      (token-bounded), generate (grounded LLM call), cache (automatic).
-    - This is the production default. For 80% of queries — factual
-      lookups, document Q&A, summarization — SimpleRAG is the right
-      answer. It's not a stepping stone; it's the workhorse.
-    - Must pass tests before any other variant is built. Every bug
-      found here (cache integration, doc format, prompt template shape)
-      is cheaper to fix now than after CorrectiveRAG is built on top.
+    Overrides only retrieve(). All other pipeline steps use BaseRAG defaults:
+    pre_process (normalize/refine via conversation context), rank (MMR),
+    assemble_context (token-bounded), generate (grounded LLM call), and
+    cache (automatic on both read and write).
 
-Pipeline flow (inherited from BaseRAG.query()):
-    1. Cache check       → hit? return immediately
-    2. pre_process()     → normalize query, resolve pronouns if history
-    3. retrieve()        → ★ SimpleRAG: call retriever directly
-    4. rank()            → MMR diversification
-    5. assemble_context() → token-bounded assembly
-    6. generate()        → grounded LLM call with context
-    7. Cache write       → store for future hits
+    SimpleRAG is the production default — the workhorse for 80% of queries.
+    Factual lookups, document Q&A, and summarization all perform well here.
+    It is not a stepping stone; it is a complete, production-ready variant.
 
-Cost: 1 retrieval call + 1 LLM call (+ 1 LLM call for query
-refinement only if conversation_history is present).
+    Minimum cost: 1 retrieval call + 1 LLM generation call. An extra LLM
+    call is incurred only when conversation_history is present (query
+    refinement in pre_process).
 
-Integration:
-    - BaseRetriever.retrieve() from rag/retrieval/
-    - All other steps inherited from BaseRAG
+Chain of Responsibility:
+    Created by RAGFactory → BaseRAG.query() calls retrieve()
+    → delegates directly to BaseRetriever.retrieve()
+    → returns list[RetrievedChunk] to the rank step.
+
+Dependencies:
+    rag.base_rag (BaseRAG)
+    rag.retrieval.base_retriever (BaseRetriever)
+    rag.exceptions.rag_exceptions (RAGRetrievalError)
 """
 
 from rag.base_rag import BaseRAG
@@ -40,12 +37,12 @@ logger = get_logger(__name__)
 
 
 class SimpleRAG(BaseRAG):
-    """Baseline RAG variant — direct retrieval, no evaluation or retry.
+    """Baseline RAG variant — direct retrieval with no evaluation or retry.
 
-    Overrides only retrieve(). Delegates directly to the injected
+    Overrides only retrieve() to delegate directly to the injected
     BaseRetriever. The simplest possible RAG pipeline.
 
-    When to use:
+    When to use SimpleRAG:
         - Direct factual questions ("What does section 4.2 say?")
         - Document summarization ("Summarize the Q3 report")
         - Concept explanations ("Explain the CAP theorem")
@@ -53,8 +50,8 @@ class SimpleRAG(BaseRAG):
 
     When to use CorrectiveRAG instead:
         - High-stakes queries where wrong answers are costly
-        - Domains where retrieval often returns similar-but-wrong chunks
-        - Queries where you need confidence that retrieval was relevant
+        - Domains where retrieval often returns plausible but irrelevant chunks
+        - When confidence in retrieval quality must be verified explicitly
     """
 
     @property
@@ -74,8 +71,8 @@ class SimpleRAG(BaseRAG):
     ) -> list[RetrievedChunk]:
         """Retrieve relevant chunks via direct retriever call.
 
-        No evaluation, no retry, no query rewriting. Delegates
-        directly to the injected BaseRetriever.
+        No evaluation, no retry, no query rewriting. Delegates directly to
+        the injected BaseRetriever (dense or hybrid).
 
         Args:
             query: Processed query string (output of pre_process).

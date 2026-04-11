@@ -1,28 +1,21 @@
 """
-RAG layer test suite — no external dependencies required.
+Unit tests for the RAG layer — no external services required.
 
-Uses in-memory mock implementations for all infrastructure:
-    - MockRetriever: returns pre-built RetrievedChunks
-    - MockLLM: returns pre-built LLMResponses, tracks call count
-    - No Qdrant, no Redis, no API keys, no embedding model
+Test scope:
+    Unit tests (no pytest) covering RAGRequest/RAGConfig/RAGResponse models,
+    the RAG exception hierarchy, prompt template builders, ContextRanker
+    strategies, ContextAssembler token budgeting, SimpleRAG end-to-end pipeline,
+    CorrectiveRAG pass/retry/low-confidence branches, and RAGFactory creation,
+    registration, and validation.
 
-Test phases:
-    Phase 1: Models (RAGRequest, RAGConfig, RAGResponse, RetrievedChunk)
-    Phase 2: Exceptions (hierarchy, details dict, catch-all)
-    Phase 3: Prompt templates (builder functions, formatting)
-    Phase 4: Context ranker (none, MMR fallback)
-    Phase 5: Context assembler (token budgeting, used_in_context flags)
-    Phase 6: SimpleRAG (full pipeline end-to-end)
-    Phase 7: CorrectiveRAG (pass, retry, low_confidence branches)
-    Phase 8: RAGFactory (create, registry, validation, from_request)
+Flow:
+    Phases 1-8 run sequentially; each phase calls _report() for each assertion
+    and exits with sys.exit(1) if any test fails.
 
-Run:
-    python test_rag_pipeline.py
-
-Requirements:
-    - No external services
-    - No API keys
-    - Fast (< 3 seconds)
+Dependencies:
+    MockLLM (canned responses, call-count tracking), MockRetriever (pre-built
+    chunks), MockRelevanceEvalLLM (configurable relevance scores); no Qdrant,
+    Redis, API keys, or embedding model.
 """
 
 import asyncio
@@ -73,16 +66,12 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-# ================================================================
-# Test helpers
-# ================================================================
-
 _pass_count = 0
 _fail_count = 0
 
 
 def _report(test_name: str, passed: bool, detail: str = "") -> None:
-    """Log test result and update counters."""
+    """Update pass/fail counters and print a labelled result line."""
     global _pass_count, _fail_count
     if passed:
         _pass_count += 1
@@ -94,7 +83,7 @@ def _report(test_name: str, passed: bool, detail: str = "") -> None:
 
 
 def separator(label: str) -> None:
-    """Print a visual section separator."""
+    """Print a visual phase separator."""
     print(f"\n{'=' * 60}")
     print(f"  {label}")
     print(f"{'=' * 60}")
@@ -106,7 +95,7 @@ def _make_chunk(
     score: float = 0.85,
     chunk_id: str = "abc123",
 ) -> RetrievedChunk:
-    """Create a test RetrievedChunk."""
+    """Build a minimal RetrievedChunk for use in tests."""
     return RetrievedChunk(
         content=content,
         source_file=source,
@@ -116,7 +105,7 @@ def _make_chunk(
 
 
 def _make_chunks(count: int = 5) -> list[RetrievedChunk]:
-    """Create a list of test chunks with decreasing scores."""
+    """Build a list of test chunks with decreasing relevance scores."""
     chunks = []
     for i in range(count):
         chunks.append(_make_chunk(
@@ -128,14 +117,10 @@ def _make_chunks(count: int = 5) -> list[RetrievedChunk]:
     return chunks
 
 
-# ================================================================
-# Mock implementations
-# ================================================================
-
 class MockLLM(BaseLLM):
-    """Mock LLM that returns configurable responses without API calls.
+    """Mock LLM returning configurable canned responses without API calls.
 
-    Tracks call count for verifying how many LLM calls a variant makes.
+    Tracks call_count so tests can assert how many times the LLM was invoked.
     """
 
     def __init__(
@@ -215,10 +200,10 @@ class MockRetriever(BaseRetriever):
 
 
 class MockRelevanceEvalLLM(BaseLLM):
-    """Mock LLM that returns relevance scores for CorrectiveRAG testing.
+    """Mock LLM for CorrectiveRAG that returns configurable relevance scores.
 
-    Returns configurable relevance scores for eval calls, and normal
-    text for generation calls. Distinguishes call type by message content.
+    Distinguishes eval, rewrite, and generation calls by inspecting system
+    message content, and increments per-type counters for assertion.
     """
 
     def __init__(
@@ -255,7 +240,7 @@ class MockRelevanceEvalLLM(BaseLLM):
         last_content = messages[-1].get("content", "")
         system_content = messages[0].get("content", "") if messages else ""
 
-        # Detect call type from prompt content
+        # Route by system message keywords
         if "relevance" in system_content.lower() and "evaluator" in system_content.lower():
             self.eval_count += 1
             text = f'{{"relevance": {self._relevance_score}, "reason": "test eval"}}'
@@ -265,7 +250,6 @@ class MockRelevanceEvalLLM(BaseLLM):
             self.rewrite_count += 1
             return self._build_response(self._rewrite_text, len(last_content.split()))
 
-        # Default: generation call
         self.generation_count += 1
         return self._build_response(self._generation_text, len(last_content.split()))
 
@@ -290,15 +274,23 @@ class MockRelevanceEvalLLM(BaseLLM):
         )
 
 
-# ================================================================
-# Phase 1: Model validation
-# ================================================================
-
 def test_models():
-    """Test RAGRequest, RAGConfig, RAGResponse, and supporting models."""
+    """Verifies RAGRequest, RAGConfig, RAGResponse, and supporting model validation rules.
+
+    Tests:
+        - Valid RAGRequest construction; empty and whitespace queries are rejected.
+        - RAGConfig defaults; invalid variant, zero/out-of-bound top_k, and negative temperature raise.
+        - ConversationTurn is frozen and rejects empty content.
+        - MetadataFilter rejects unsupported operators.
+        - RetrievedChunk is frozen and converts from a document via from_document().
+        - RAGResponse.from_generation sets expected fields; from_cache sets cache_hit=True.
+        - cache_layer without cache_hit=True is rejected.
+        - get_chat_messages() returns message dicts or None when no history present.
+    """
     separator("Phase 1: Model Validation")
 
-    # RAGRequest — valid construction
+    # Valid construction
+
     req = RAGRequest(query="What is RAG?", collection_name="docs")
     _report(
         "request_valid",
@@ -308,21 +300,18 @@ def test_models():
         and len(req.request_id) > 0,
     )
 
-    # RAGRequest — empty query rejected
     try:
         RAGRequest(query="", collection_name="docs")
         _report("request_empty_query", False)
     except (ValidationError, ValueError):
         _report("request_empty_query", True)
 
-    # RAGRequest — whitespace query rejected
     try:
         RAGRequest(query="   \n", collection_name="docs")
         _report("request_whitespace_query", False)
     except (ValidationError, ValueError):
         _report("request_whitespace_query", True)
 
-    # RAGConfig — defaults
     cfg = RAGConfig()
     _report(
         "config_defaults",
@@ -335,27 +324,22 @@ def test_models():
         and cfg.confidence_method == "retrieval",
     )
 
-    # RAGConfig — invalid variant
     try:
         RAGConfig(rag_variant="nonexistent")
         _report("config_invalid_variant", False)
     except (ValidationError, ValueError):
         _report("config_invalid_variant", True)
 
-    # RAGConfig — valid variant
     cfg2 = RAGConfig(rag_variant="corrective")
     _report("config_valid_variant", cfg2.rag_variant == "corrective")
 
-    # RAGConfig — resolve_variant with None (smart default)
     cfg3 = RAGConfig()
     resolved = cfg3.resolve_variant()
     _report("config_resolve_default", resolved in SUPPORTED_RAG_VARIANTS or resolved == "simple")
 
-    # RAGConfig — resolve_variant with explicit
     cfg4 = RAGConfig(rag_variant="corrective")
     _report("config_resolve_explicit", cfg4.resolve_variant() == "corrective")
 
-    # RAGConfig — top_k bounds
     try:
         RAGConfig(top_k=0)
         _report("config_top_k_zero", False)
@@ -368,54 +352,45 @@ def test_models():
     except (ValidationError, ValueError):
         _report("config_top_k_over", True)
 
-    # RAGConfig — temperature bounds
     try:
         RAGConfig(temperature=-0.1)
         _report("config_temp_negative", False)
     except (ValidationError, ValueError):
         _report("config_temp_negative", True)
 
-    # ConversationTurn — valid
     turn = ConversationTurn(role="user", content="Hello")
     _report("conv_turn_valid", turn.role == "user" and turn.content == "Hello")
 
-    # ConversationTurn — frozen
     try:
         turn.role = "assistant"
         _report("conv_turn_frozen", False)
     except (ValidationError, AttributeError, TypeError):
         _report("conv_turn_frozen", True)
 
-    # ConversationTurn — empty content rejected
     try:
         ConversationTurn(role="user", content="  ")
         _report("conv_turn_empty", False)
     except (ValidationError, ValueError):
         _report("conv_turn_empty", True)
 
-    # MetadataFilter — valid
     mf = MetadataFilter(field="source", value="test.pdf")
     _report("meta_filter_valid", mf.field == "source" and mf.operator == "eq")
 
-    # MetadataFilter — invalid operator
     try:
         MetadataFilter(field="source", value="x", operator="regex")
         _report("meta_filter_bad_op", False)
     except (ValidationError, ValueError):
         _report("meta_filter_bad_op", True)
 
-    # RetrievedChunk — valid
     chunk = _make_chunk()
     _report("chunk_valid", chunk.content == "Test chunk content" and chunk.used_in_context is False)
 
-    # RetrievedChunk — frozen
     try:
         chunk.used_in_context = True
         _report("chunk_frozen", False)
     except (ValidationError, AttributeError, TypeError):
         _report("chunk_frozen", True)
 
-    # RetrievedChunk — from_document mock
     class FakeDoc:
         page_content = "Document text"
         metadata = {"source_file": "report.pdf", "page_number": 3, "extra_field": "value"}
@@ -430,7 +405,6 @@ def test_models():
         and "extra_field" in converted.metadata,
     )
 
-    # RAGResponse — from_generation
     llm_resp = LLMResponse(
         text="Test answer", model="test", provider="gemini",
         finish_reason="stop", prompt_tokens=10, completion_tokens=5, tokens_used=15,
@@ -453,7 +427,6 @@ def test_models():
         and len(rag_resp.sources) == 1,
     )
 
-    # RAGResponse — from_cache
     cached_resp = RAGResponse.from_cache(
         cached_response=llm_resp,
         request_id="test-456",
@@ -467,7 +440,6 @@ def test_models():
         and cached_resp.confidence.method == "cache",
     )
 
-    # RAGResponse — cache_layer without cache_hit rejected
     try:
         RAGResponse(
             answer="test", confidence=ConfidenceScore(value=0.5, method="test"),
@@ -477,7 +449,6 @@ def test_models():
     except (ValidationError, ValueError):
         _report("response_cache_consistency", True)
 
-    # RAGRequest — get_chat_messages
     req_with_history = RAGRequest(
         query="Tell me more",
         collection_name="docs",
@@ -494,17 +465,19 @@ def test_models():
         and msgs[0]["role"] == "user",
     )
 
-    # RAGRequest — no history returns None
     req_no_hist = RAGRequest(query="Hello", collection_name="docs")
     _report("request_no_history", req_no_hist.get_chat_messages() is None)
 
 
-# ================================================================
-# Phase 2: Exceptions
-# ================================================================
-
 def test_exceptions():
-    """Test RAG exception hierarchy."""
+    """Verifies the RAG exception hierarchy and details dict propagation.
+
+    Tests:
+        - All specific error classes inherit from RAGError.
+        - RAGError inherits from Exception.
+        - details dict is preserved on the exception instance.
+        - All subclasses are caught by a bare except RAGError handler.
+    """
     separator("Phase 2: Exception Hierarchy")
 
     subclasses = [RAGConfigError, RAGRetrievalError, RAGContextError,
@@ -515,11 +488,9 @@ def test_exceptions():
 
     _report("rag_error_is_exception", issubclass(RAGError, Exception))
 
-    # Details dict
     exc = RAGRetrievalError("retrieval failed", details={"top_k": 5})
     _report("exception_details", exc.details == {"top_k": 5})
 
-    # Catch-all
     all_caught = True
     for cls in subclasses:
         try:
@@ -531,15 +502,18 @@ def test_exceptions():
     _report("exception_catch_all", all_caught)
 
 
-# ================================================================
-# Phase 3: Prompt templates
-# ================================================================
-
 def test_prompts():
-    """Test prompt builder functions and formatting."""
+    """Verifies that prompt builder functions produce correctly formatted output.
+
+    Tests:
+        - build_rag_prompt includes the query and context; adds history section when present.
+        - build_relevance_eval_prompt includes the query and document.
+        - build_query_rewrite_prompt includes the query.
+        - format_conversation_history renders role/content pairs; returns empty string for [].
+        - max_turns limit discards older turns and retains recent ones.
+    """
     separator("Phase 3: Prompt Templates")
 
-    # build_rag_prompt — without history
     sys, user = build_rag_prompt(query="What is RAG?", context="RAG is a technique.")
     _report(
         "rag_prompt_basic",
@@ -548,7 +522,6 @@ def test_prompts():
         and "RAG is a technique." in user,
     )
 
-    # build_rag_prompt — with history
     sys2, user2 = build_rag_prompt(
         query="Tell me more",
         context="More details here.",
@@ -556,7 +529,6 @@ def test_prompts():
     )
     _report("rag_prompt_with_history", "Conversation so far" in user2)
 
-    # build_relevance_eval_prompt
     sys3, user3 = build_relevance_eval_prompt(
         query="What is RAG?",
         document="RAG combines retrieval with generation.",
@@ -568,11 +540,9 @@ def test_prompts():
         and "RAG combines" in user3,
     )
 
-    # build_query_rewrite_prompt
     sys4, user4 = build_query_rewrite_prompt("What is RAG?")
     _report("query_rewrite_prompt", "rewrite" in sys4.lower() and "What is RAG?" in user4)
 
-    # format_conversation_history
     turns = [
         {"role": "user", "content": "Hello"},
         {"role": "assistant", "content": "Hi there"},
@@ -580,90 +550,88 @@ def test_prompts():
     formatted = format_conversation_history(turns)
     _report("format_history", "User: Hello" in formatted and "Assistant: Hi there" in formatted)
 
-    # format_conversation_history — empty
     _report("format_history_empty", format_conversation_history([]) == "")
 
-    # format_conversation_history — max_turns limit
     many_turns = [{"role": "user", "content": f"Turn {i}"} for i in range(20)]
     limited = format_conversation_history(many_turns, max_turns=5)
     _report("format_history_limited", "Turn 15" in limited and "Turn 0" not in limited)
 
 
-# ================================================================
-# Phase 4: Context ranker
-# ================================================================
-
 def test_ranker():
-    """Test context ranker strategies."""
+    """Verifies ContextRanker strategy selection, fallback behaviour, and per-call overrides.
+
+    Tests:
+        - 'none' strategy preserves input order.
+        - Empty and single-chunk inputs are handled without error.
+        - 'mmr' without an embeddings function falls back to 'none'.
+        - 'cross_encoder' and unknown strategies fall back to 'none'.
+        - mmr_lambda outside [0, 1] raises ValueError.
+        - A per-call strategy override takes precedence over the instance default.
+    """
     separator("Phase 4: Context Ranker")
 
     chunks = _make_chunks(5)
 
-    # Strategy: none — preserves order
     ranker_none = ContextRanker(strategy="none")
     result_none = asyncio.run(ranker_none.rank(chunks, "test query"))
     _report("ranker_none_preserves_order", result_none == chunks)
 
-    # Empty input
     result_empty = asyncio.run(ranker_none.rank([], "test"))
     _report("ranker_empty_input", result_empty == [])
 
-    # Single chunk
     result_single = asyncio.run(ranker_none.rank([chunks[0]], "test"))
     _report("ranker_single_chunk", len(result_single) == 1)
 
-    # MMR without embeddings — falls back to none
+    # MMR falls back to 'none' when no embeddings function is provided
     ranker_mmr = ContextRanker(strategy="mmr", embeddings_fn=None)
     result_mmr = asyncio.run(ranker_mmr.rank(chunks, "test query"))
     _report("ranker_mmr_fallback", len(result_mmr) == 5)
 
-    # cross_encoder — falls back to none
     ranker_ce = ContextRanker(strategy="cross_encoder")
     result_ce = asyncio.run(ranker_ce.rank(chunks, "test query"))
     _report("ranker_cross_encoder_fallback", len(result_ce) == 5)
 
-    # Unknown strategy — falls back to none
     ranker_unk = ContextRanker(strategy="unknown_strategy")
     result_unk = asyncio.run(ranker_unk.rank(chunks, "test"))
     _report("ranker_unknown_fallback", len(result_unk) == 5)
 
-    # Invalid lambda
     try:
         ContextRanker(mmr_lambda=1.5)
         _report("ranker_invalid_lambda", False)
     except ValueError:
         _report("ranker_invalid_lambda", True)
 
-    # Per-call strategy override
     ranker_default_mmr = ContextRanker(strategy="mmr")
     result_override = asyncio.run(ranker_default_mmr.rank(chunks, "test", strategy="none"))
     _report("ranker_per_call_override", result_override == chunks)
 
 
-# ================================================================
-# Phase 5: Context assembler
-# ================================================================
-
 def test_assembler():
-    """Test context assembler token budgeting and formatting."""
+    """Verifies ContextAssembler token budgeting, source labels, and error handling.
+
+    Tests:
+        - Normal assembly produces a non-empty context string with positive token count.
+        - used_in_context flags are set on at least one chunk.
+        - [Source N:] labels appear in the output by default.
+        - A very tight token budget restricts the number of included chunks.
+        - Assembling an empty list raises RAGContextError.
+        - max_tokens below the minimum raises ValueError at construction time.
+        - include_source_labels=False omits the [Source] prefix.
+    """
     separator("Phase 5: Context Assembler")
 
     llm = MockLLM(token_count=10)
     chunks = _make_chunks(5)
 
-    # Normal assembly
     assembler = ContextAssembler(llm=llm, max_tokens=500)
     ctx_str, updated, tokens = asyncio.run(assembler.assemble(chunks))
     _report("assembler_basic", len(ctx_str) > 0 and tokens > 0)
 
-    # used_in_context flags set
     used_count = sum(1 for c in updated if c.used_in_context)
     _report("assembler_used_in_context", used_count > 0)
 
-    # Source labels included
     _report("assembler_source_labels", "[Source 1:" in ctx_str)
 
-    # Token budget enforcement — very tight budget
     tight_assembler = ContextAssembler(llm=llm, max_tokens=25)
     ctx_tight, updated_tight, tokens_tight = asyncio.run(
         tight_assembler.assemble(chunks)
@@ -671,46 +639,45 @@ def test_assembler():
     used_tight = sum(1 for c in updated_tight if c.used_in_context)
     _report("assembler_budget_limits", used_tight < len(chunks))
 
-    # Empty chunks raises
     try:
         asyncio.run(assembler.assemble([]))
         _report("assembler_empty_raises", False)
     except RAGContextError:
         _report("assembler_empty_raises", True)
 
-    # Min tokens validation
     try:
         ContextAssembler(llm=llm, max_tokens=10)
         _report("assembler_min_tokens", False)
     except ValueError:
         _report("assembler_min_tokens", True)
 
-    # Without source labels
     no_label_asm = ContextAssembler(llm=llm, max_tokens=500, include_source_labels=False)
     ctx_no_label, _, _ = asyncio.run(no_label_asm.assemble(chunks))
     _report("assembler_no_labels", "[Source" not in ctx_no_label)
 
 
-# ================================================================
-# Phase 6: SimpleRAG full pipeline
-# ================================================================
-
 def test_simple_rag():
-    """Test SimpleRAG end-to-end pipeline."""
+    """Verifies SimpleRAG end-to-end retrieval→generation pipeline with mock infrastructure.
+
+    Tests:
+        - variant_name is 'simple'; repr contains class and provider name.
+        - Full pipeline returns a RAGResponse with non-empty answer, correct variant,
+          matching request_id, cache_hit=False, sources, confidence, timings, and model_name.
+        - Retriever and LLM are each called at least once.
+        - include_sources=False omits sources from the response.
+        - used_in_context is set on at least one source chunk.
+    """
     separator("Phase 6: SimpleRAG Pipeline")
 
     llm = MockLLM(response_text="RAG is a technique for grounded generation.", token_count=10)
     retriever = MockRetriever()
     rag = SimpleRAG(retriever=retriever, llm=llm)
 
-    # Variant name
     _report("simple_variant_name", rag.variant_name == "simple")
 
-    # repr
     repr_str = repr(rag)
     _report("simple_repr", "SimpleRAG" in repr_str and "mock" in repr_str)
 
-    # Full pipeline — no cache
     request = RAGRequest(query="What is RAG?", collection_name="docs")
     response = asyncio.run(rag.query(request))
 
@@ -725,13 +692,9 @@ def test_simple_rag():
     _report("simple_model_name", response.model_name == "mock-model-v1")
     _report("simple_low_confidence_false", response.low_confidence is False)
 
-    # Retriever was called
     _report("simple_retriever_called", retriever.call_count == 1)
-
-    # LLM was called (at least 1 for generation)
     _report("simple_llm_called", llm.call_count >= 1)
 
-    # With config overrides
     request2 = RAGRequest(
         query="Explain RAG",
         collection_name="docs",
@@ -740,22 +703,23 @@ def test_simple_rag():
     response2 = asyncio.run(rag.query(request2))
     _report("simple_no_sources", len(response2.sources) == 0)
 
-    # used_in_context on sources
     request3 = RAGRequest(query="Test", collection_name="docs")
     response3 = asyncio.run(rag.query(request3))
     used = [s for s in response3.sources if s.used_in_context]
     _report("simple_used_in_context_set", len(used) > 0)
 
 
-# ================================================================
-# Phase 7: CorrectiveRAG
-# ================================================================
-
 def test_corrective_rag():
-    """Test CorrectiveRAG branching logic."""
+    """Verifies CorrectiveRAG PASS, RETRY, and LOW_CONFIDENCE branch behaviour.
+
+    Tests:
+        - PASS branch (relevance=0.85): no rewrite, retriever called once, low_confidence=False.
+        - RETRY branch (relevance=0.50): rewrite attempted, retriever called at least twice.
+        - LOW_CONFIDENCE branch (relevance=0.15): low_confidence=True, no rewrite attempted.
+        - _parse_relevance_score handles JSON, markdown-fenced JSON, raw float, clamping, and None.
+    """
     separator("Phase 7: CorrectiveRAG")
 
-    # --- Branch 1: PASS (high relevance) ---
     high_llm = MockRelevanceEvalLLM(relevance_score=0.85)
     retriever = MockRetriever()
     crag_pass = CorrectiveRAG(
@@ -784,12 +748,10 @@ def test_corrective_rag():
     )
     _report("crag_pass_no_rewrite", high_llm.rewrite_count == 0)
 
-    # --- Branch 2: RETRY (medium relevance → rewrite → pass) ---
     med_llm = MockRelevanceEvalLLM(relevance_score=0.50)
     retriever2 = MockRetriever()
 
-    # After rewrite, we want higher relevance. Mock can't change between
-    # calls easily, so we test that rewrite was attempted.
+    # Mock stays at 0.50 throughout; we verify that a rewrite was attempted
     crag_retry = CorrectiveRAG(
         retriever=retriever2,
         llm=med_llm,
@@ -818,7 +780,6 @@ def test_corrective_rag():
         f"| eval_count={med_llm.eval_count}",
     )
 
-    # --- Branch 3: LOW CONFIDENCE (very low relevance) ---
     low_llm = MockRelevanceEvalLLM(relevance_score=0.15)
     retriever3 = MockRetriever()
 
@@ -842,83 +803,74 @@ def test_corrective_rag():
         f"| call_count={retriever3.call_count}",
     )
 
-    # --- Relevance score parsing ---
     crag_test = CorrectiveRAG(
         retriever=MockRetriever(),
         llm=MockLLM(),
     )
 
-    # JSON parsing
     score_json = crag_test._parse_relevance_score('{"relevance": 0.85, "reason": "good"}')
     _report("parse_score_json", score_json == 0.85)
 
-    # JSON with markdown fences
     score_fenced = crag_test._parse_relevance_score('```json\n{"relevance": 0.72}\n```')
     _report("parse_score_fenced", score_fenced == 0.72)
 
-    # Fallback float extraction
     score_raw = crag_test._parse_relevance_score("The relevance is 0.65")
     _report("parse_score_fallback", score_raw == 0.65)
 
-    # Clamping
     score_over = crag_test._parse_relevance_score('{"relevance": 1.5}')
     _report("parse_score_clamp", score_over == 1.0)
 
-    # Unparseable
     score_none = crag_test._parse_relevance_score("no numbers here")
     _report("parse_score_none", score_none is None)
 
-    # Empty
     score_empty = crag_test._parse_relevance_score("")
     _report("parse_score_empty", score_empty is None)
 
 
-# ================================================================
-# Phase 8: RAGFactory
-# ================================================================
-
 def test_factory():
-    """Test RAGFactory creation, registry, and validation."""
+    """Verifies RAGFactory variant creation, registration, and input validation.
+
+    Tests:
+        - available_variants() and available_retrieval_modes() include expected keys.
+        - create() returns SimpleRAG or CorrectiveRAG for matching variant names.
+        - Variant names are case-insensitive.
+        - Unknown or empty variant names raise RAGConfigError.
+        - create_from_request() selects the correct class from config.rag_variant.
+        - create_retriever() constructs a dense retriever; unknown mode raises RAGConfigError.
+        - register_variant() adds and can later be cleaned up; non-BaseRAG class raises RAGConfigError.
+    """
     separator("Phase 8: RAGFactory")
 
     llm = MockLLM()
     retriever = MockRetriever()
 
-    # Available variants
     variants = RAGFactory.available_variants()
     _report("factory_variants", "simple" in variants and "corrective" in variants)
 
-    # Available modes
     modes = RAGFactory.available_retrieval_modes()
     _report("factory_modes", "dense" in modes and "hybrid" in modes)
 
-    # Create SimpleRAG
     simple = RAGFactory.create("simple", retriever=retriever, llm=llm)
     _report("factory_create_simple", isinstance(simple, SimpleRAG))
 
-    # Create CorrectiveRAG
     corrective = RAGFactory.create("corrective", retriever=retriever, llm=llm)
     _report("factory_create_corrective", isinstance(corrective, CorrectiveRAG))
 
-    # Case insensitive
     upper = RAGFactory.create("SIMPLE", retriever=retriever, llm=llm)
     _report("factory_case_insensitive", isinstance(upper, SimpleRAG))
 
-    # Unknown variant
     try:
         RAGFactory.create("nonexistent", retriever=retriever, llm=llm)
         _report("factory_unknown_variant", False)
     except RAGConfigError:
         _report("factory_unknown_variant", True)
 
-    # Empty variant
     try:
         RAGFactory.create("", retriever=retriever, llm=llm)
         _report("factory_empty_variant", False)
     except RAGConfigError:
         _report("factory_empty_variant", True)
 
-    # create_from_request — simple
     req_simple = RAGRequest(
         query="test",
         collection_name="docs",
@@ -931,7 +883,6 @@ def test_factory():
     )
     _report("factory_from_request_simple", isinstance(from_req, SimpleRAG))
 
-    # create_from_request — corrective
     req_corrective = RAGRequest(
         query="test",
         collection_name="docs",
@@ -944,7 +895,6 @@ def test_factory():
     )
     _report("factory_from_request_corrective", isinstance(from_req2, CorrectiveRAG))
 
-    # create_from_request — smart default (None variant)
     req_default = RAGRequest(query="test", collection_name="docs")
     from_req3 = RAGFactory.create_from_request(
         request=req_default,
@@ -953,18 +903,15 @@ def test_factory():
     )
     _report("factory_from_request_default", isinstance(from_req3, BaseRAG))
 
-    # create_retriever — dense
     dense = RAGFactory.create_retriever(store=None, mode="dense")
     _report("factory_create_dense_retriever", dense.retriever_type == "dense")
 
-    # create_retriever — unknown mode
     try:
         RAGFactory.create_retriever(store=None, mode="quantum")
         _report("factory_unknown_mode", False)
     except RAGConfigError:
         _report("factory_unknown_mode", True)
 
-    # register_variant — valid
     class _TestRAG(BaseRAG):
         @property
         def variant_name(self):
@@ -986,6 +933,7 @@ def test_factory():
     except RAGConfigError:
         _report("factory_register_invalid", True)
 
+
 # # My CUstom test case
 #     try:
 #         print(f"="*40)
@@ -1004,12 +952,8 @@ def test_factory():
 #         _report("custom_test_case", False)
 #         logger.error("Custom test case failed: %s", e)
 
-# ================================================================
-# Runner
-# ================================================================
-
 def run_all_tests():
-    """Execute all test phases and report results."""
+    """Run all test phases sequentially and exit with a non-zero code on any failure."""
     global _pass_count, _fail_count
     _pass_count = 0
     _fail_count = 0

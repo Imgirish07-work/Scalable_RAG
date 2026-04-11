@@ -1,16 +1,19 @@
 """
-Real end-to-end RAG pipeline test with a real PDF.
+End-to-end RAG pipeline test using a real PDF with no mocks.
 
-Uses:
-    - redis_commands_reference.pdf  (real document, no mocks)
-    - DocumentCleaner + StructurePreserver + Chunker (full ingestion pipeline)
-    - QdrantStore      (in-memory, no server needed)
-    - DenseRetriever   (BGE embeddings)
-    - GeminiProvider   (real LLM)
-    - CacheManager     (L1 memory + L2 Redis)
+Test scope:
+    End-to-end integration test covering the full ingestion and query pipeline:
+    DocumentCleaner → StructurePreserver → Chunker → QdrantStore (in-memory,
+    hybrid mode) → HybridRetriever → SimpleRAG with CacheManager (L1+L2).
+    Each query is run twice: first call is a cache miss, second is a cache hit.
 
-Run:
-    python test_real_pipeline.py
+Flow:
+    Load PDF → chunk → upsert to Qdrant → initialize cache → pre-warm LLM
+    → run queries (miss + hit pairs) → print structured response summaries.
+
+Dependencies:
+    GEMINI_API_KEY (and optionally GROQ_API_KEY) in .env; BGE embedding model;
+    sample PDF at data/sample_docs/Attention is all you need.pdf.
 """
 
 import asyncio
@@ -31,15 +34,15 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 PDF_PATH = "./data/sample_docs/Attention is all you need.pdf"
-# Run 1: originals — populate cache with query_text stored
-# Run 2: paraphrases — should hit semantic cache on startup
+# Original queries (Run 1): populate the semantic cache with canonical forms.
+# Paraphrases (Run 2): verify cross-restart semantic cache hits on startup.
 # QUERIES = [
 #     "what is the transformer architecture?",
 #     "how does multi-head attention work?",
 #     "what are the results on WMT translation tasks?",
 # ]
 
-# Paraphrases — testing semantic cache cross-restart (Run 2):
+# Paraphrases for Run 2 semantic cache validation
 QUERIES = [
     "explain the transformer model architecture",
     "describe how multi-headed attention works",
@@ -47,7 +50,8 @@ QUERIES = [
 ]
 
 def _print_response(response, query_num: int) -> None:
-    # Build the label from the actual response — not from pre-run assumptions.
+    """Print a structured summary of a RAGResponse for manual inspection."""
+    # Derive the execution path label from actual response fields
     if response.cache_hit:
         execution_path = f"cache HIT ({response.cache_layer})"
         model_label = f"[cached] {response.model_name}"
@@ -78,7 +82,8 @@ def _print_response(response, query_num: int) -> None:
 
 
 async def run():
-    # ── 1. Load + clean PDF ──────────────────────────────────────────────────
+    """Load the PDF, ingest it into Qdrant, initialize the cache, and run all queries."""
+    # Step 1: Load and clean the PDF
     logger.info("Loading PDF: %s", PDF_PATH)
     cleaner   = DocumentCleaner()
     preserver = StructurePreserver()
@@ -91,7 +96,7 @@ async def run():
     chunks      = await asyncio.to_thread(chunker.split_documents, structured)
     logger.info("Split into %d chunks", len(chunks))
 
-    # ── 2. Vector store ───────────────────────────────────────────────────────
+    # Step 2: Build in-memory Qdrant store and ingest chunks
     store = QdrantStore(
         collection_name="attention_paper",
         in_memory=False,
@@ -102,8 +107,7 @@ async def run():
     ids = await store.add_documents(chunks)
     logger.info("Ingested %d chunks into Qdrant", len(ids))
 
-    # Post-ingest HNSW warmup — loads HNSW graph into RAM so Q1 pays no cold-start.
-    # Skipped when all chunks were duplicates (ids is empty) since data was already warm.
+    # Warm up HNSW index in RAM; skip if all chunks were already present (duplicates)
     if ids:
         try:
             await store.similarity_search_with_vectors("warmup", k=1)
@@ -111,11 +115,11 @@ async def run():
         except Exception:
             pass
 
-    # ── 3. Cache ──────────────────────────────────────────────────────────────
+    # Step 3: Initialize the cache
     cache = CacheManager(settings)
     await cache.initialize()
 
-    # ── 4. RAG pipeline ───────────────────────────────────────────────────────
+    # Step 4: Build the RAG pipeline
     retriever = HybridRetriever(store)
     try:
         llm = LLMFactory.create_rate_limited("groq")
@@ -126,9 +130,7 @@ async def run():
         llm = LLMFactory.create_rate_limited("gemini")
         fallback_llm = None
 
-    # LLM pre-warm — opens TCP+TLS connection now so Q1 doesn't pay the cold-start penalty.
-    # This test builds components directly (no RAGPipeline.initialize()), so _run_warmup()
-    # never fires — we must warm up manually here.
+    # Pre-warm the LLM to open TCP+TLS before Q1 (no RAGPipeline.initialize() here)
     async def _pre_warm_llm(provider, name):
         try:
             await provider.generate("Reply with: OK", max_tokens=2)
@@ -136,8 +138,7 @@ async def run():
         except Exception as exc:
             err = str(exc)
             if "<html" in err.lower() or "<!doctype" in err.lower():
-                # Zscaler/proxy intercepted the request and returned an HTML block page.
-                # Log a clean message — the full HTML body is not useful here.
+                # Zscaler/proxy returned an HTML block page — log cleanly
                 logger.warning(
                     "LLM pre-warm skipped (%s): blocked by corporate proxy/firewall "
                     "(request to provider API was intercepted)", name,
@@ -145,10 +146,8 @@ async def run():
             else:
                 logger.warning("LLM pre-warm failed (%s): %s", name, err[:200])
 
-    # Only pre-warm the fallback (Gemini) — Groq is blocked by Zscaler on the
-    # corporate network so warming it would always fail and log a warning.
-    # Groq will attempt its own connection on the first real query and fall
-    # back to Gemini (already warm) if it fails.
+    # Only warm Gemini; Groq is Zscaler-blocked on corp network and will
+    # self-attempt on first query then fall back to the warm Gemini provider.
     if fallback_llm:
         await _pre_warm_llm(fallback_llm, fallback_llm.model_name)
 
@@ -160,7 +159,7 @@ async def run():
         fallback_llm=fallback_llm,
     )
 
-    # ── 5. Run each query: first call (miss) then second call (hit) ───────────
+    # Step 5: Run each query twice — first call is a miss, second is a cache hit
     for q_idx, query_text in enumerate(QUERIES, start=1):
         request = RAGRequest(
             query=query_text,

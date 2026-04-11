@@ -1,9 +1,19 @@
-"""Agent response models.
+"""
+Agent response models.
 
-AgentResponse wraps the synthesized final answer with full transparency
-into what happened: which sub-queries ran, which succeeded, which failed,
-and how the final answer was assembled. Provides to_rag_response() for
-callers that don't need agent internals.
+Design:
+    SubQueryResult captures the outcome of a single sub-query execution,
+    including answer text, confidence, sources, and failure metadata.
+    AgentResponse aggregates all sub-results with synthesis output and
+    exposes to_rag_response() for callers that don't need agent internals.
+
+Chain of Responsibility:
+    ParallelRetriever produces List[SubQueryResult] → ResultVerifier updates
+    them → AnswerSynthesizer reads them → AgentOrchestrator assembles
+    AgentResponse → RAGPipeline calls to_rag_response().
+
+Dependencies:
+    pydantic, rag.models.rag_response
 """
 
 # stdlib
@@ -163,7 +173,7 @@ class AgentResponse(BaseModel):
         Returns:
             RAGResponse with the synthesized answer and aggregate metadata.
         """
-        # collect all sources from successful sub-queries
+        # Collect sources only from successful sub-queries.
         all_sources = []
         for sr in self.sub_results:
             if sr.success:

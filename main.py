@@ -1,18 +1,35 @@
+"""
+Top-level entry point for layer-by-layer validation.
+
+Design:
+    Script runner that exercises the foundation (Layer 1) and vector
+    store (Layer 2) subsystems in isolation. Not production traffic —
+    used to validate that each layer works correctly after a fresh
+    install or environment change.
+
+Chain of Responsibility:
+    __main__ → main() (Layer 1 sync) or main_layer2() (Layer 2 async).
+    Neither function is wired to the FastAPI app — they are standalone
+    smoke tests.
+
+Dependencies:
+    config.settings, utils.helpers, chunking.chunker, vectorstore.qdrant_store
+"""
+
 import asyncio
 import os
-# Corporate network SSL Fix
+
+# Corporate network SSL fix — must be set before any HTTP library is imported.
 os.environ["HF_HUB_DISABLE_SSL_VERIFICATION"] = "1"
 os.environ["CURL_CA_BUNDLE"] = ""
 os.environ["REQUESTS_CA_BUNDLE"] = ""
 
-#imports
 import time
 from config.settings import settings
 from utils.logger import get_logger
 from utils.helpers import generate_unique_id, hash_text, truncate_text, chunk_list, retry
 from chunking.chunker import Chunker
 
-#layer2
 from langchain_core.documents import Document
 from vectorstore.qdrant_store import QdrantStore
 
@@ -23,7 +40,7 @@ def main():
     try:
         t0 = time.perf_counter()
 
-        # ─── Settings Validation ──────────────────────────────────
+        # Settings Validation
         logger.info("=" * 60)
         logger.info("LAYER 1 — FOUNDATION VALIDATION")
         logger.info("=" * 60)
@@ -42,7 +59,7 @@ def main():
         logger.info(f"Log Level         : {settings.log_level}")
         logger.info(f"⏱ Settings        : {time.perf_counter() - t0:.3f}s")
 
-        # ─── Helpers Validation ───────────────────────────────────
+        # Helpers Validation
         logger.info("-" * 60)
         logger.info("HELPERS VALIDATION")
         logger.info("-" * 60)
@@ -61,7 +78,7 @@ def main():
         logger.info(f"Chunked list       : {batches}")
         logger.info(f"⏱ Helpers          : {time.perf_counter() - t1:.3f}s")
 
-        # ─── Retry Decorator Validation ───────────────────────────
+        # Retry Decorator Validation
         t2 = time.perf_counter()
         attempt_count = {"count": 0}
 
@@ -76,7 +93,7 @@ def main():
         logger.info(f"Retry decorator    : {result} after {attempt_count['count']} attempts")
         logger.info(f"⏱ Retry            : {time.perf_counter() - t2:.3f}s")
 
-        # ─── Text Splitter Validation ─────────────────────────────
+        # Text Splitter Validation
         logger.info("-" * 60)
         logger.info("TEXT SPLITTER VALIDATION")
         logger.info("-" * 60)
@@ -93,21 +110,21 @@ def main():
             "Gemini are revolutionizing how we interact with technology. "
         ) * 20
 
-        # ─── Strategy B ───────────────────────────────────────────
+        # Strategy B — character-based splitting
         t4 = time.perf_counter()
         char_chunks = splitter.split_by_character(sample_text)
         stats_b = splitter.chunk_stats(char_chunks)
         logger.info(f"Character Split    : {stats_b}")
         logger.info(f"⏱ Char split       : {time.perf_counter() - t4:.3f}s")
 
-        # ─── Strategy D ───────────────────────────────────────────
+        # Strategy D — RLM-optimised splitting
         t5 = time.perf_counter()
         rlm_chunks = splitter.split_for_rlm(sample_text)
         stats_rlm = splitter.chunk_stats(rlm_chunks)
         logger.info(f"RLM Split          : {stats_rlm}")
         logger.info(f"⏱ RLM split        : {time.perf_counter() - t5:.3f}s")
 
-        # ─── Edge Case ────────────────────────────────────────────
+        # Edge case — empty input should return empty list, not raise.
         empty_result = splitter.split_by_character("")
         logger.info(f"Empty input test   : {empty_result}")
 
@@ -119,13 +136,14 @@ def main():
     except Exception as e:
         logger.exception(f"Layer 1 validation failed: {e}")
 
+
 async def main_layer2():
-     # ── Layer 2 — Vector Store ─────────────────────────────────────
+    # Layer 2 — Vector Store
     logger.info("=" * 55)
     logger.info("LAYER 2 — VECTOR STORE")
     logger.info("=" * 55)
 
-    # Simulate documents coming from Chunker.split_documents()
+    # Simulate documents coming from Chunker.split_documents().
     # page_content → will be embedded
     # metadata     → stored as payload, never embedded
     sample_docs = [
@@ -182,6 +200,7 @@ async def main_layer2():
     await store.close()
     logger.info(f"⏱ Layer 2 | {time.perf_counter() - t:.3f}s")
     logger.info("Layer 2 ✅")
+
 
 if __name__ == "__main__":
     # main()

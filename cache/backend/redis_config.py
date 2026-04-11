@@ -1,14 +1,25 @@
 """
-Redis connection configuration + environment-based factory.
+Redis connection configuration and environment-based factory.
 
-Separates WHAT to connect to (config) from HOW to use it (backend).
-RedisCacheBackend stays a single class — this module just feeds it
-the right connection parameters based on environment.
+Design:
+    Separates WHAT to connect to (config) from HOW to use it (backend).
+    RedisCacheBackend stays a single class — this module feeds it the
+    correct connection parameters based on the REDIS_ENV setting.
+    RedisConnectionConfig is a frozen dataclass — immutable after creation.
+    RedisConfigFactory uses a builder pattern keyed by environment name.
 
-Environments:
-    local  — redis://localhost:6379/0, no TLS, dev prefix
-    cloud  — rediss://user:pass@host:port/0, TLS, prod prefix
-    test   — redis://localhost:6379/1, separate DB, test prefix
+    Environments:
+        local  — redis://localhost:6379/0, no TLS, dev prefix
+        cloud  — rediss://user:pass@host:port/0, TLS, prod prefix
+        test   — redis://localhost:6379/1, separate DB, test prefix
+
+Chain of Responsibility:
+    Called by CacheManager._initialize_l2(). The resulting config is
+    passed to RedisCacheBackend.from_config() to create the L2 backend.
+    All connection details come from Settings (environment variables).
+
+Dependencies:
+    dataclasses (stdlib only — no third-party dependencies at this level)
 
 Usage:
     from cache.backend.redis_config import RedisConfigFactory
@@ -16,13 +27,6 @@ Usage:
     config = RedisConfigFactory.create(settings)
     backend = RedisCacheBackend.from_config(config)
     await backend.initialize()
-
-The .env file drives everything:
-    REDIS_ENV=local                  → local defaults
-    REDIS_ENV=cloud                  → reads REDIS_CLOUD_URL
-    REDIS_ENV=test                   → test defaults
-
-Sync — pure config construction, no I/O (Rule 2).
 """
 
 from dataclasses import dataclass
@@ -31,6 +35,7 @@ from typing import Optional
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
 
 @dataclass(frozen=True)
 class RedisConnectionConfig:
@@ -49,6 +54,7 @@ class RedisConnectionConfig:
         circuit_breaker_reset_seconds: Seconds before retry after trip.
         environment: Environment name for logging (local/cloud/test).
     """
+
     url: str
     prefix: str = "llmcache:"
     max_connections: int = 20
@@ -72,6 +78,7 @@ class RedisConnectionConfig:
             return self.url[:protocol_end] + "***@" + self.url[at_pos + 1:]
         return self.url
 
+
 class RedisConfigFactory:
     """Creates RedisConnectionConfig from application settings.
 
@@ -79,13 +86,15 @@ class RedisConfigFactory:
     then builds the appropriate config. All connection details come
     from .env — zero hardcoded URLs.
 
+    Attributes:
+        VALID_ENVIRONMENTS: Accepted values for REDIS_ENV.
+
     Supported environments:
         local — Development against local Redis
         cloud — Production against Redis Cloud / ElastiCache / Upstash
         test  — Isolated test database on local Redis
-
-    Sync — object creation only, no I/O (Rule 2).
     """
+
     VALID_ENVIRONMENTS = {"local", "cloud", "test"}
 
     @classmethod
@@ -141,7 +150,7 @@ class RedisConfigFactory:
 
         if not url:
             url = "redis://localhost:6379/0"
-        
+
         return RedisConnectionConfig(
             url=url,
             prefix="llmcache_dev:",

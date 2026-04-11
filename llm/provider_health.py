@@ -1,21 +1,22 @@
 """
-LLM provider health tracker.
+In-process health tracker for LLM providers.
 
-Tracks which LLM providers are currently available based on recent call
-failures. When a provider fails (Zscaler block, timeout, network error),
-it is marked as unavailable for _COOLDOWN_SECONDS. During that window the
-pipeline skips it entirely and routes directly to the configured fallback,
-avoiding repeated timeout waits on every query.
+Design:
+    Module-level singleton pattern. A single _ProviderHealthTracker instance
+    (provider_health) is shared across all BaseRAG instances in the process.
+    Failed providers are held in cooldown for _COOLDOWN_SECONDS, during which
+    the pipeline skips them and routes directly to the configured fallback.
+    Auto-recovery: once the cooldown expires the provider is retried on the
+    next request without any external reset or background task.
+    Thread-safe via threading.Lock.
 
-Auto-recovery: once _COOLDOWN_SECONDS passes the provider is retried.
-A successful call clears the failure state immediately.
+Chain of Responsibility:
+    BaseRAG.generate() queries is_available() before each LLM call →
+    on failure calls mark_failed() → LLMFactory selects fallback provider →
+    on success calls mark_recovered() to clear the cooldown.
 
-Design: module-level singleton — one shared instance across all BaseRAG
-instances in the process. Thread-safe via threading.Lock.
-
-Note: Zscaler HTML responses are already sanitised in openai_provider.py
-(_handle_error / _call_api). This module only tracks health *state* and
-produces clean routing log messages — no HTML ever reaches these logs.
+Dependencies:
+    threading.Lock, utils.logger.
 """
 
 import time
@@ -26,16 +27,17 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 # How long to skip a failed provider before attempting recovery.
-# 60s gives one retry per minute while a corporate proxy blocks the provider.
+# 60s allows one retry per minute while a corporate proxy intermittently blocks.
 _COOLDOWN_SECONDS: float = 60.0
 
 
 class _ProviderHealthTracker:
-    """In-process health state for LLM providers.
+    """In-process health state tracker for LLM providers.
 
-    Failed providers are held in a dict keyed by provider name with the
-    monotonic timestamp of their last failure. is_available() auto-clears
-    expired entries so no background task is needed.
+    Maintains a dict of provider names to their last-failure monotonic timestamps.
+    is_available() auto-clears expired entries so no background task is needed.
+    Repeated failures during an active cooldown reset the clock, preventing
+    premature recovery while the underlying issue persists.
     """
 
     def __init__(self) -> None:
@@ -43,12 +45,13 @@ class _ProviderHealthTracker:
         self._lock = Lock()
 
     def mark_failed(self, provider: str) -> None:
-        """Record a call failure for provider.
+        """Record a call failure and start or extend the cooldown window.
 
-        Provider will be skipped for _COOLDOWN_SECONDS. Repeated calls
-        during an existing cooldown extend the timestamp so the clock
-        resets — prevents premature recovery while the issue persists.
-        Logs only on the first failure to avoid per-query log spam.
+        Logs only on the first failure in a cooldown window to suppress
+        per-query log spam when a provider is persistently unavailable.
+
+        Args:
+            provider: Provider name string e.g. 'groq', 'gemini'.
         """
         with self._lock:
             is_new = provider not in self._failed_at
@@ -63,7 +66,11 @@ class _ProviderHealthTracker:
             )
 
     def mark_recovered(self, provider: str) -> None:
-        """Clear failure state after a successful call."""
+        """Clear the failure state after a successful call.
+
+        Args:
+            provider: Provider name string e.g. 'groq', 'gemini'.
+        """
         with self._lock:
             was_failed = self._failed_at.pop(provider, None) is not None
 
@@ -71,10 +78,17 @@ class _ProviderHealthTracker:
             logger.info("LLM provider '%s' recovered after successful call.", provider)
 
     def is_available(self, provider: str) -> bool:
-        """Return True if provider is healthy or cooldown has expired.
+        """Return True if the provider is healthy or its cooldown has expired.
 
-        Auto-clears the failure record on expiry so the provider gets one
-        retry attempt per _COOLDOWN_SECONDS without any external reset.
+        Auto-clears the failure record on expiry, giving the provider one retry
+        attempt per _COOLDOWN_SECONDS without requiring an external reset.
+
+        Args:
+            provider: Provider name string e.g. 'groq', 'gemini'.
+
+        Returns:
+            True if provider is healthy or cooldown has expired.
+            False if provider is in an active cooldown window.
         """
         with self._lock:
             failed_at = self._failed_at.get(provider)
@@ -97,5 +111,5 @@ class _ProviderHealthTracker:
         return False
 
 
-# Module-level singleton shared by all BaseRAG instances in the process.
+# Singleton shared by all BaseRAG instances in the process
 provider_health = _ProviderHealthTracker()

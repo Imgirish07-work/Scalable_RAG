@@ -1,28 +1,34 @@
 """
-CacheManager — multi-layer LLM response cache with hybrid strategy.
+Multi-layer LLM response cache orchestrator with hybrid lookup strategy.
 
-Hybrid flow (exact + semantic):
-    Read:  exact L1 → exact L2 → semantic Qdrant → fetch by semantic key → miss
-    Write: L1 + L2 (exact key) → Qdrant index (semantic embedding)
+Design:
+    CacheManager is the single entry point for all cache operations.
+    It composes two lookup strategies — exact (SHA-256) and semantic
+    (BGE + Qdrant) — over two storage backends: L1 (in-memory LRU)
+    and L2 (Redis). Strategy selection is driven by CACHE_STRATEGY
+    in settings. Quality gate and TTL classifier run on the write path
+    to prevent cache poisoning and tune entry lifetime.
 
-When CACHE_STRATEGY='exact':  exact only (Phases 1-5 behavior)
-When CACHE_STRATEGY='semantic': hybrid — exact first, semantic fallback
+    Hybrid read flow (exact + semantic):
+        L1 exact → L2 exact → Qdrant semantic → miss
+    Write flow:
+        quality gate → L1 set → L2 set → Qdrant index
 
-Usage:
-    from cache import CacheManager
+    When CACHE_STRATEGY='exact':    exact-only (L1 + L2)
+    When CACHE_STRATEGY='semantic': exact first, semantic fallback
 
-    cache = CacheManager(settings)
-    await cache.initialize()
+Chain of Responsibility:
+    RAGPipeline / BaseRAG.query() calls CacheManager.get() before LLM
+    invocation and CacheManager.set() after. CacheManager delegates to
+    ExactCacheStrategy or SemanticCacheStrategy, which in turn call
+    MemoryCacheBackend (L1) and/or RedisCacheBackend (L2) via
+    CircuitBreaker. QualityGate.check() and TTLClassifier.get_ttl()
+    are called on every write. JsonSerializer encodes/decodes entries.
 
-    result = await cache.get(query, model, temperature, system_prompt)
-    if result.hit:
-        return result.response
-
-    llm_response = await llm.generate(query)
-    await cache.set(query, model, temperature, llm_response, system_prompt)
-    await cache.resolve_in_flight(query, model, temperature, system_prompt)
-
-    await cache.close()
+Dependencies:
+    cache.backend, cache.strategies, cache.serializers,
+    cache.normalizers, cache.quality, cache.models,
+    llm.models.llm_response, utils.helpers, utils.logger
 """
 
 import asyncio
@@ -76,7 +82,7 @@ class CacheManager:
         _serializer: Entry serializer.
         _normalizer: Query normalization chain.
         _metrics: Cumulative performance counters.
-        _in_flight: Request coalescing map.
+        _in_flight: Request coalescing map keyed by cache key.
         _initialized: Whether initialize() has been called.
     """
 
@@ -93,6 +99,7 @@ class CacheManager:
         )
         self._l2: Optional[RedisCacheBackend] = None
 
+        # Exact strategy starts with L1 only; L2 is added in initialize()
         self._exact_strategy: ExactCacheStrategy = ExactCacheStrategy(
             normalizer=self._normalizer,
             backends=[self._l1],
@@ -338,6 +345,7 @@ class CacheManager:
             logger.warning("Semantic seeding failed — semantic cache starts cold", exc_info=True)
 
     # Read path
+
     async def get(
         self,
         query: str,
@@ -378,7 +386,7 @@ class CacheManager:
                 system_prompt_hash=system_prompt_hash,
             )
 
-            # Exact match: L1 
+            # Exact match: L1
             result = await self._try_get_from_l1(key, start)
             if result is not None:
                 self._record_hit_metrics(result)
@@ -746,7 +754,22 @@ class CacheManager:
         system_prompt: str = "",
         timeout: float = 10.0,
     ) -> CacheResult:
-        """Cache lookup with request coalescing."""
+        """Cache lookup with request coalescing.
+
+        If a cache miss occurs and another coroutine is already fetching
+        the same key from the LLM, this method waits for that coroutine
+        to complete (up to `timeout` seconds) and then re-checks the cache.
+
+        Args:
+            query: Raw user query.
+            model_name: LLM model identifier.
+            temperature: Generation temperature.
+            system_prompt: System prompt text.
+            timeout: Maximum seconds to wait for an in-flight request.
+
+        Returns:
+            CacheResult — may be a hit if the in-flight request completed.
+        """
         if not self._enabled:
             return CacheResult.miss()
 
@@ -793,7 +816,17 @@ class CacheManager:
         temperature: float,
         system_prompt: str = "",
     ) -> None:
-        """Signal that an in-flight LLM call has completed."""
+        """Signal that an in-flight LLM call has completed.
+
+        Unblocks any coroutines waiting in get_or_wait() for this key
+        so they can re-check the cache instead of making duplicate LLM calls.
+
+        Args:
+            query: Raw user query.
+            model_name: LLM model identifier.
+            temperature: Generation temperature.
+            system_prompt: System prompt text.
+        """
         system_prompt_hash = hash_text(system_prompt) if system_prompt else ""
 
         try:
@@ -826,7 +859,12 @@ class CacheManager:
         return self._metrics.summary()
 
     async def get_full_stats(self) -> dict:
-        """Return comprehensive stats including backend details."""
+        """Return comprehensive stats including backend details.
+
+        Returns:
+            Dict with enabled state, strategy, per-backend stats,
+            semantic collection info, TTL map, and quality gate thresholds.
+        """
         stats = {
             "enabled": self._enabled,
             "initialized": self._initialized,
@@ -866,7 +904,17 @@ class CacheManager:
         temperature: float,
         system_prompt: str = "",
     ) -> bool:
-        """Delete a specific cached entry from all backends."""
+        """Delete a specific cached entry from all backends.
+
+        Args:
+            query: Raw user query to invalidate.
+            model_name: LLM model identifier.
+            temperature: Generation temperature.
+            system_prompt: System prompt text.
+
+        Returns:
+            True if the key was found and deleted from at least one backend.
+        """
         system_prompt_hash = hash_text(system_prompt) if system_prompt else ""
 
         try:
@@ -901,7 +949,11 @@ class CacheManager:
         return deleted
 
     async def clear_all(self) -> dict:
-        """Clear ALL cached entries from ALL backends."""
+        """Clear ALL cached entries from ALL backends.
+
+        Returns:
+            Dict mapping backend name to number of entries removed (-1 on error).
+        """
         result = {}
 
         try:
@@ -940,6 +992,7 @@ class CacheManager:
             except Exception:
                 logger.exception("Semantic strategy close failed")
 
+        # Release any coroutines blocked in get_or_wait() before exiting
         async with self._in_flight_lock:
             for event in self._in_flight.values():
                 event.set()
@@ -954,6 +1007,14 @@ class CacheManager:
     # Private helpers
 
     def _estimate_cost(self, response: LLMResponse) -> float:
+        """Estimate token cost in USD for a given LLM response.
+
+        Args:
+            response: LLMResponse containing provider and token count.
+
+        Returns:
+            Estimated cost in USD, or 0.0 for unknown providers.
+        """
         tokens = response.tokens_used
         if response.provider == "openai":
             return tokens * self._settings.COST_PER_TOKEN_OPENAI
@@ -964,6 +1025,11 @@ class CacheManager:
         return 0.0
 
     def _record_hit_metrics(self, result: CacheResult) -> None:
+        """Compute token/cost savings from a cache hit and update counters.
+
+        Args:
+            result: The CacheResult that was served from cache.
+        """
         tokens_saved = 0
         cost_saved = 0.0
 
@@ -985,6 +1051,18 @@ class CacheManager:
         )
 
     def _build_entry_from_result(self, key: str, result: CacheResult) -> CacheEntry:
+        """Construct a CacheEntry for L1 promotion from an existing CacheResult.
+
+        Uses the default TTL from settings since the original TTL is not
+        carried in CacheResult. Intended for L2 → L1 copy only.
+
+        Args:
+            key: The cache key for the entry.
+            result: CacheResult carrying the response to promote.
+
+        Returns:
+            CacheEntry ready for serialization and L1 storage.
+        """
         ttl = self._settings.cache_ttl_seconds
         now = datetime.now(timezone.utc)
 
@@ -1004,6 +1082,7 @@ class CacheManager:
         )
 
     def _get_active_backend_names(self) -> list[str]:
+        """Return names of all currently active backends."""
         names = [self._l1.name]
         if self._l2 is not None:
             names.append(self._l2.name)
@@ -1011,4 +1090,5 @@ class CacheManager:
 
     @staticmethod
     def _elapsed_ms(start: float) -> float:
+        """Compute elapsed milliseconds since a perf_counter start time."""
         return (time.perf_counter() - start) * 1000

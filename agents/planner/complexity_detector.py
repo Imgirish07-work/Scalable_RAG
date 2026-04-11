@@ -1,13 +1,20 @@
-"""Rule-based complexity detector.
+"""
+Rule-based complexity detector.
 
-Decides whether a query needs agent decomposition or can go directly
-to a single RAG variant. Uses heuristic signals — no LLM calls.
+Design:
+    Additive scoring heuristic — each signal adds points. When the
+    total meets _COMPLEXITY_THRESHOLD the query is routed to the agent
+    layer. Deliberately conservative: a false positive (simple query
+    decomposed unnecessarily) wastes ~2 LLM calls but still yields a
+    good answer; a false negative (complex query sent to single RAG)
+    produces a worse answer.
 
-The detector is deliberately conservative: it's better to send a
-borderline query through the cheaper RAG path than to waste tokens
-on unnecessary decomposition. False negatives (complex query goes
-to RAG) produce a worse answer. False positives (simple query goes
-to agent) waste ~2 extra LLM calls but still produce a good answer.
+Chain of Responsibility:
+    RAGPipeline._execute_query() calls should_decompose() before deciding
+    whether to invoke AgentOrchestrator. No LLM calls are made here.
+
+Dependencies:
+    re (stdlib only).
 """
 
 # stdlib
@@ -18,25 +25,25 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ── Heuristic thresholds ──
+# Heuristic thresholds
 
-# queries shorter than this are almost never complex enough for decomposition
+# Queries shorter than this are almost never complex enough for decomposition.
 _MIN_QUERY_LENGTH = 40
 
-# multiple explicit conjunctions suggest multi-part questions
+# Multiple explicit conjunctions suggest multi-part questions.
 _CONJUNCTION_PATTERN = re.compile(
     r"\b(and also|as well as|in addition to|along with|furthermore)\b",
     re.IGNORECASE,
 )
 
-# comparison language strongly signals multi-entity queries
+# Comparison language strongly signals multi-entity queries.
 _COMPARISON_PATTERN = re.compile(
     r"\b(compare|comparison|versus|vs\.?|differ|difference|contrast"
     r"|across|between|relative to|compared to|how does .+ stack up)\b",
     re.IGNORECASE,
 )
 
-# multi-part question markers
+# Multi-part question markers: double question marks, ordinals, numbered lists, repeated conjunctions.
 _MULTI_QUESTION_PATTERN = re.compile(
     r"(\?.*\?)"
     r"|(\b(firstly|secondly|thirdly)\b)"
@@ -45,13 +52,13 @@ _MULTI_QUESTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# signals that the query targets multiple entities
+# Signals that the query targets multiple entities simultaneously.
 _MULTI_ENTITY_PATTERN = re.compile(
     r"\b(each|every|all|both|respective|individually)\b",
     re.IGNORECASE,
 )
 
-# minimum score to trigger agent decomposition
+# Minimum score to trigger agent decomposition.
 _COMPLEXITY_THRESHOLD = 3
 
 
@@ -74,27 +81,27 @@ def should_decompose(query: str) -> bool:
     score = 0
     signals = []
 
-    # signal 1 — comparison language (strong signal, +3)
+    # Comparison language — strong signal (+3).
     if _COMPARISON_PATTERN.search(query):
         score += 3
         signals.append("comparison")
 
-    # signal 2 — explicit conjunctions suggesting multiple parts (+2)
+    # Explicit conjunctions suggesting multiple distinct parts (+2).
     if _CONJUNCTION_PATTERN.search(query):
         score += 2
         signals.append("conjunction")
 
-    # signal 3 — multiple questions or enumerated parts (+2)
+    # Multiple questions or enumerated parts (+2).
     if _MULTI_QUESTION_PATTERN.search(query):
         score += 2
         signals.append("multi_question")
 
-    # signal 4 — multi-entity language (+2)
+    # Multi-entity language (+2).
     if _MULTI_ENTITY_PATTERN.search(query):
         score += 2
         signals.append("multi_entity")
 
-    # signal 5 — query length suggests complexity (+1)
+    # Long queries often contain multiple implicit sub-questions (+1).
     if len(query) > 150:
         score += 1
         signals.append("long_query")

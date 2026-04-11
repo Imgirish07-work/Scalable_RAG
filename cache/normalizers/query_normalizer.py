@@ -1,17 +1,30 @@
 """
-Query normalization chain — Chain of Responsibility pattern.
+Concrete query normalizer chain for cache key generation.
 
-Transforms raw user queries into a canonical form before cache key
-generation. The goal is to maximize cache hits by ensuring that
-semantically identical queries produce identical cache keys.
+Design:
+    Implements the Chain of Responsibility pattern over four stateless
+    normalizer steps. The goal is to maximize cache hit rate by mapping
+    semantically identical queries to the same cache key, regardless of
+    minor surface variations (case, whitespace, trailing punctuation,
+    Unicode composition).
 
+    Step execution order matters:
+        1. WhitespaceNormalizer  — collapse spaces, strip edges
+        2. CaseNormalizer        — lowercase everything
+        3. PunctuationNormalizer — strip trailing punctuation
+        4. UnicodeNormalizer     — normalize unicode to NFC form
 
-Step execution order matters:
-    1. WhitespaceNormalizer  — collapse spaces, strip edges
-    2. CaseNormalizer        — lowercase everything
-    3. PunctuationNormalizer — strip trailing punctuation
-    4. UnicodeNormalizer     — normalize unicode to NFC form
-    5. (Applied externally)  — parameter canonicalization in make_key()
+    QueryNormalizerChain also provides build_cache_fingerprint(), which
+    combines the normalized query with model parameters into a pipe-delimited
+    string that ExactCacheStrategy hashes into a SHA-256 cache key.
+
+Chain of Responsibility:
+    Instantiated by CacheManager and injected into ExactCacheStrategy and
+    SemanticCacheStrategy. normalize() is called on every get() and set()
+    path. build_cache_fingerprint() is called by ExactCacheStrategy.make_key().
+
+Dependencies:
+    re, unicodedata (stdlib only)
 
 Usage:
     chain = QueryNormalizerChain()
@@ -36,19 +49,22 @@ from cache.normalizers.base_normalizer import BaseNormalizer
 
 logger = get_logger(__name__)
 
+
 class WhitespaceNormalizer(BaseNormalizer):
     """Collapse multiple whitespace characters into single spaces and strip edges."""
 
     @property
     def name(self) -> str:
-        return "whitespace" 
+        return "whitespace"
 
     def normalize(self, text: str) -> str:
+        """Replace runs of whitespace with a single space and strip leading/trailing."""
         if not text:
             return text
 
         result = re.sub(r"\s+", " ", text).strip()
         return result
+
 
 class CaseNormalizer(BaseNormalizer):
     """Convert text to lowercase for case-insensitive matching."""
@@ -58,11 +74,13 @@ class CaseNormalizer(BaseNormalizer):
         return "case"
 
     def normalize(self, text: str) -> str:
+        """Lowercase the entire input string."""
         if not text:
             return text
 
         return text.lower()
-    
+
+
 class PunctuationNormalizer(BaseNormalizer):
     """Strip trailing punctuation that doesn't change query semantics."""
 
@@ -73,12 +91,15 @@ class PunctuationNormalizer(BaseNormalizer):
         return "punctuation"
 
     def normalize(self, text: str) -> str:
+        """Remove trailing punctuation and whitespace. Returns original if result is empty."""
         if not text:
             return text
 
         result = re.sub(self.TRAILING_PATTERN, "", text)
 
+        # Guard against stripping a punctuation-only string to empty
         return result if result else text
+
 
 class UnicodeNormalizer(BaseNormalizer):
     """Normalize Unicode to NFC form for consistent byte representation.
@@ -96,6 +117,9 @@ class UnicodeNormalizer(BaseNormalizer):
         Zero-width non-joiner (U+200C)
         Zero-width joiner (U+200D)
         Byte order mark (U+FEFF)
+
+    Attributes:
+        ZERO_WIDTH_PATTERN: Compiled regex matching invisible Unicode characters.
     """
 
     ZERO_WIDTH_PATTERN = re.compile(r"[\u200b\u200c\u200d\ufeff]")
@@ -105,6 +129,7 @@ class UnicodeNormalizer(BaseNormalizer):
         return "unicode"
 
     def normalize(self, text: str) -> str:
+        """Apply NFC normalization and strip zero-width characters."""
         if not text:
             return text
 
@@ -115,24 +140,32 @@ class UnicodeNormalizer(BaseNormalizer):
         result = re.sub(self.ZERO_WIDTH_PATTERN, "", normalized)
 
         return result
-    
+
+
 class QueryNormalizerChain:
     """Composes normalization steps into a sequential pipeline.
 
     The chain runs each step in order on the query text.
-    Steps are stateless — the chain can be shared across threads safely.
+    Steps are stateless — the chain can be shared across coroutines safely.
 
-    The chain also provides build_cache_fingerprint() which combines
-    the normalized query with model parameters into a single string
-    suitable for hashing by the exact strategy.
+    Also provides build_cache_fingerprint(), which combines the normalized
+    query with model parameters into a single string suitable for hashing
+    by the exact strategy.
 
     Attributes:
         _steps: Ordered list of normalizer steps.
+        PARAM_SEPARATOR: Delimiter between fingerprint components.
     """
 
     PARAM_SEPARATOR = "|"
 
     def __init__(self, steps: Optional[list[BaseNormalizer]] = None):
+        """Initialize with an explicit step list or the default production chain.
+
+        Args:
+            steps: Optional custom list of normalizer steps. If None,
+                   the default four-step production chain is used.
+        """
         self._steps = steps or self._build_default_chain()
         step_names = [s.name for s in self._steps]
         logger.info(
@@ -157,9 +190,9 @@ class QueryNormalizerChain:
 
     @property
     def steps(self) -> list[BaseNormalizer]:
-        """Read-only access to the step list."""
+        """Read-only copy of the step list."""
         return list(self._steps)
-    
+
     def normalize(self, text: str) -> str:
         """Run the full normalization chain on a query string.
 
@@ -176,7 +209,7 @@ class QueryNormalizerChain:
         if not text:
             return text
 
-        result = text   
+        result = text
         for step in self._steps:
             try:
                 result = step.normalize(result)
@@ -187,7 +220,7 @@ class QueryNormalizerChain:
                     result[:100],
                 )
         return result
-    
+
     def build_cache_fingerprint(
         self,
         query: str,
@@ -196,6 +229,11 @@ class QueryNormalizerChain:
         system_prompt_hash: str = "",
     ) -> str:
         """Build the canonical string that gets hashed into a cache key.
+
+        Normalizes the query and joins it with model parameters using
+        PARAM_SEPARATOR. The resulting fingerprint is passed to hash_text()
+        by ExactCacheStrategy.make_key().
+
         Args:
             query: Raw user query (will be normalized).
             model_name: LLM model identifier.
@@ -206,10 +244,9 @@ class QueryNormalizerChain:
             Canonical fingerprint string like:
             "what is rag|gemini-2.5-flash|0.0|abc123def456..."
         """
-
         normalized_query = self.normalize(query)
         nanonical_model = model_name.strip().lower()
-        canonical_temp = f"{temperature:.1f}" 
+        canonical_temp = f"{temperature:.1f}"
 
         parts = [
             normalized_query,
@@ -220,7 +257,7 @@ class QueryNormalizerChain:
         if system_prompt_hash:
             parts.append(system_prompt_hash)
 
-        fingerprint  =  self.PARAM_SEPARATOR.join(parts)
+        fingerprint = self.PARAM_SEPARATOR.join(parts)
 
         logger.debug(
             "Cache fingerprint built: query='%s' → fingerprint='%s'",

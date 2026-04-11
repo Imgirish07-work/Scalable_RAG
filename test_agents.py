@@ -1,18 +1,18 @@
 """
-Real agent layer tests — no pytest, runs with: python test_agents.py
+Unit tests for the agent layer components.
 
-Tests every component with realistic mock dependencies:
-    - MockLLM:       canned JSON responses for planning, verification, synthesis
-    - MockPipeline:  returns pre-built RAGResponse for sub-query execution
+Test scope:
+    Unit tests (no pytest) covering ComplexityDetector, QueryPlanner,
+    ParallelRetriever, ResultVerifier, AnswerSynthesizer, AgentOrchestrator,
+    pipeline integration, and agent model classes.
 
-Test sections:
-    1. ComplexityDetector  — should_decompose() heuristics
-    2. QueryPlanner        — LLM call + JSON parsing + fallback
-    3. ParallelRetriever   — concurrent + sequential execution
-    4. ResultVerifier      — heuristic checks (length, confidence, non-answers)
-    5. AnswerSynthesizer   — synthesis call + empty-output guard
-    6. AgentOrchestrator   — full flow end-to-end with mocks
-    7. Pipeline integration — configure_agents() hook on RAGPipeline
+Flow:
+    setup (MockLLM + MockPipeline) → section runners → check() assertions
+    → printed pass/fail summary.
+
+Dependencies:
+    MockLLM (canned JSON responses), MockPipeline (pre-built RAGResponse),
+    no external services required.
 """
 
 import asyncio
@@ -39,9 +39,7 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Test result tracking
-# ──────────────────────────────────────────────────────────────────────────────
 
 _passed = 0
 _failed = 0
@@ -74,9 +72,7 @@ def section(title: str) -> None:
     print(f"{'─' * 60}")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Mock dependencies
-# ──────────────────────────────────────────────────────────────────────────────
 
 class MockLLM:
     """Minimal LLM mock. Returns canned responses keyed by scenario."""
@@ -157,9 +153,7 @@ def _make_planning_json(
     })
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Section 1 — ComplexityDetector
-# ──────────────────────────────────────────────────────────────────────────────
 
 def test_complexity_detector() -> None:
     section("1. ComplexityDetector — should_decompose()")
@@ -210,9 +204,7 @@ def test_complexity_detector() -> None:
           ))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Section 2 — QueryPlanner
-# ──────────────────────────────────────────────────────────────────────────────
 
 async def test_query_planner() -> None:
     section("2. QueryPlanner — decompose() + fallback")
@@ -222,7 +214,7 @@ async def test_query_planner() -> None:
         "finance_docs": "Financial reports and budgets",
     }
 
-    # ── 2a. Happy path — valid JSON response ──
+    # 2a. Happy path — valid JSON response
     plan_json = _make_planning_json([
         {"query": "Q3 Engineering hiring costs", "collection": "hr_docs", "purpose": "Engineering costs"},
         {"query": "Q3 Sales hiring costs", "collection": "hr_docs", "purpose": "Sales costs"},
@@ -241,21 +233,21 @@ async def test_query_planner() -> None:
           all(sq.collection == "hr_docs" for sq in plan.sub_queries))
     check("LLM called exactly once", llm._call_count == 1)
 
-    # ── 2b. Markdown-fenced JSON (common LLM behavior) ──
+    # 2b. Markdown-fenced JSON (common LLM behavior)
     fenced = f"```json\n{plan_json}\n```"
     llm2 = MockLLM([fenced])
     planner2 = QueryPlanner(llm=llm2, collections=collections)
     plan2 = await planner2.plan("Compare Q3 costs")
     check("fenced JSON parsed correctly", len(plan2.sub_queries) == 3)
 
-    # ── 2c. Unparseable response → fallback plan ──
+    # 2c. Unparseable response → fallback plan
     llm3 = MockLLM(["This is completely unparseable gobbledygook!!!"])
     planner3 = QueryPlanner(llm=llm3, collections=collections)
     plan3 = await planner3.plan("Compare Q3 costs across teams")
     check("unparseable → fallback plan (1 sub-query)", len(plan3.sub_queries) == 1)
     check("fallback collection is 'default'", plan3.sub_queries[0].collection == "default")
 
-    # ── 2d. Plan caps at 6 sub-queries ──
+    # 2d. Plan caps at 6 sub-queries
     big_plan_json = _make_planning_json([
         {"query": f"sub-query {i}", "collection": "hr_docs", "purpose": f"purpose {i}"}
         for i in range(10)
@@ -265,7 +257,7 @@ async def test_query_planner() -> None:
     plan4 = await planner4.plan("Extremely multi-part question across all teams")
     check("plan capped at 6 sub-queries", len(plan4.sub_queries) == 6)
 
-    # ── 2e. LLM failure → AgentPlanningError ──
+    # 2e. LLM failure → AgentPlanningError
     class FailingLLM:
         model_name = "fail"
         provider_name = "fail"
@@ -284,9 +276,7 @@ async def test_query_planner() -> None:
         _fail("LLM failure → raises AgentPlanningError", f"wrong exception: {type(e).__name__}")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Section 3 — ParallelRetriever
-# ──────────────────────────────────────────────────────────────────────────────
 
 async def test_parallel_retriever() -> None:
     section("3. ParallelRetriever — parallel + sequential + failure isolation")
@@ -310,20 +300,20 @@ async def test_parallel_retriever() -> None:
     pipeline = MockPipeline({"": _make_rag_response("Some hiring cost answer", 0.85)})
     retriever = ParallelRetriever(pipeline=pipeline, max_concurrent=3)
 
-    # ── 3a. Parallel execution — all succeed ──
+    # 3a. Parallel execution — all succeed
     results = await retriever.execute(plan_parallel, parent_request_id="test-001")
     check("parallel: 3 results returned", len(results) == 3)
     check("parallel: all successful", all(r.success for r in results))
     check("parallel: pipeline called 3 times", pipeline.call_count == 3)
 
-    # ── 3b. Sequential execution ──
+    # 3b. Sequential execution
     pipeline2 = MockPipeline({"": _make_rag_response("Sequential answer", 0.75)})
     retriever2 = ParallelRetriever(pipeline=pipeline2, max_concurrent=2)
     results2 = await retriever2.execute(plan_sequential, parent_request_id="test-002")
     check("sequential: 3 results returned", len(results2) == 3)
     check("sequential: all successful", all(r.success for r in results2))
 
-    # ── 3c. Partial failure — one sub-query fails, others succeed ──
+    # 3c. Partial failure — one sub-query fails, others succeed
     call_n = [0]
 
     class PartialFailPipeline:
@@ -342,7 +332,7 @@ async def test_parallel_retriever() -> None:
     check("partial failure: 1 failed", len(failed) == 1)
     check("failed result has failure_reason set", len(failed[0].failure_reason) > 0)
 
-    # ── 3d. SubQuery.to_rag_request() carries correct IDs ──
+    # 3d. SubQuery.to_rag_request() carries correct IDs
     sq = SubQuery(query="Test query", collection="test_col", purpose="testing")
     rag_req = sq.to_rag_request("parent-req-123")
     check("to_rag_request: query preserved", rag_req.query == "Test query")
@@ -351,9 +341,7 @@ async def test_parallel_retriever() -> None:
           "parent-req-123" in rag_req.request_id)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Section 4 — ResultVerifier
-# ──────────────────────────────────────────────────────────────────────────────
 
 async def test_result_verifier() -> None:
     section("4. ResultVerifier — heuristic quality gates")
@@ -377,7 +365,7 @@ async def test_result_verifier() -> None:
             latency_ms=50.0,
         )
 
-    # ── 4a. Good result passes ──
+    # 4a. Good result passes
     good = _make_result(
         answer="Engineering hiring costs in Q3 were $2.1M across 45 hires, "
                "averaging $46,666 per hire including recruiter fees.",
@@ -386,14 +374,14 @@ async def test_result_verifier() -> None:
     results = await verifier.verify([good])
     check("good result passes verification", results[0].success)
 
-    # ── 4b. Empty answer fails ──
+    # 4b. Empty answer fails
     empty = _make_result(answer="   ", confidence=0.8)
     # SubQueryResult min_length check would prevent truly empty — use short answer
     short = _make_result(answer="short", confidence=0.8)
     results2 = await verifier.verify([short])
     check("short answer (<20 chars) fails verification", not results2[0].success)
 
-    # ── 4c. Low confidence fails ──
+    # 4c. Low confidence fails
     low_conf = _make_result(
         answer="Engineering hiring costs were approximately $2.1 million for Q3.",
         confidence=0.1,
@@ -401,7 +389,7 @@ async def test_result_verifier() -> None:
     results3 = await verifier.verify([low_conf])
     check("low confidence (<0.3) fails verification", not results3[0].success)
 
-    # ── 4d. Non-answer phrase fails ──
+    # 4d. Non-answer phrase fails
     non_answer = _make_result(
         answer="I don't know the answer to this question about hiring costs.",
         confidence=0.8,
@@ -409,7 +397,7 @@ async def test_result_verifier() -> None:
     results4 = await verifier.verify([non_answer])
     check("non-answer phrase fails verification", not results4[0].success)
 
-    # ── 4e. Pre-failed results pass through unchanged ──
+    # 4e. Pre-failed results pass through unchanged
     already_failed = _make_result(
         answer="",
         success=False,
@@ -432,16 +420,14 @@ async def test_result_verifier() -> None:
     check("pre-failed result failure_reason preserved",
           results5[0].failure_reason == "pipeline error")
 
-    # ── 4f. Mixed batch ──
+    # 4f. Mixed batch
     mixed = [good, short, low_conf, non_answer]
     results6 = await verifier.verify(mixed)
     passed = sum(1 for r in results6 if r.success)
     check("mixed batch: only 1 passes out of 4", passed == 1)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Section 5 — AnswerSynthesizer
-# ──────────────────────────────────────────────────────────────────────────────
 
 async def test_answer_synthesizer() -> None:
     section("5. AnswerSynthesizer — synthesis call + error guards")
@@ -466,7 +452,7 @@ async def test_answer_synthesizer() -> None:
             latency_ms=50.0,
         )
 
-    # ── 5a. Happy path ──
+    # 5a. Happy path
     llm = MockLLM([synthesis_answer])
     synthesizer = AnswerSynthesizer(llm=llm)
     sub_results = [
@@ -482,7 +468,7 @@ async def test_answer_synthesizer() -> None:
     check("synthesis answer matches mock response", answer == synthesis_answer)
     check("LLM called once for synthesis", llm._call_count == 1)
 
-    # ── 5b. Failed sub-results included in prompt but synthesis still works ──
+    # 5b. Failed sub-results included in prompt but synthesis still works
     llm2 = MockLLM(["Partial answer noting gaps where data was unavailable."])
     synthesizer2 = AnswerSynthesizer(llm=llm2)
     mixed_results = [
@@ -495,7 +481,7 @@ async def test_answer_synthesizer() -> None:
     )
     check("synthesis with partial failures produces answer", len(answer2) > 0)
 
-    # ── 5c. All sub-results failed → AgentSynthesisError ──
+    # 5c. All sub-results failed → AgentSynthesisError
     synthesizer3 = AnswerSynthesizer(llm=MockLLM(["irrelevant"]))
     all_failed = [
         _make_sub_result("query 1", "placeholder", success=False),
@@ -518,7 +504,7 @@ async def test_answer_synthesizer() -> None:
     except Exception as e:
         _fail("all-failed → raises AgentSynthesisError", f"wrong exception: {type(e).__name__}: {e}")
 
-    # ── 5d. Empty synthesis output → AgentSynthesisError ──
+    # 5d. Empty synthesis output → AgentSynthesisError
     class EmptyLLM:
         model_name = "empty"
         provider_name = "gemini"
@@ -543,9 +529,7 @@ async def test_answer_synthesizer() -> None:
         _fail("empty synthesis output → AgentSynthesisError", f"{type(e).__name__}: {e}")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Section 6 — AgentOrchestrator (full flow)
-# ──────────────────────────────────────────────────────────────────────────────
 
 async def test_agent_orchestrator() -> None:
     section("6. AgentOrchestrator — full end-to-end flow with mocks")
@@ -590,32 +574,32 @@ async def test_agent_orchestrator() -> None:
 
     response = await orchestrator.execute(request)
 
-    # ── 6a. Basic response structure ──
+    # 6a. Basic response structure
     check("orchestrator returns AgentResponse", isinstance(response, AgentResponse))
     check("answer is non-empty", len(response.answer) > 0)
     check("answer matches synthesis output", response.answer == synthesis_answer)
     check("plan_reasoning non-empty", len(response.plan_reasoning) > 0)
 
-    # ── 6b. Sub-query accounting ──
+    # 6b. Sub-query accounting
     check("total_sub_queries == 3", response.total_sub_queries == 3)
     check("successful_sub_queries == 3", response.successful_sub_queries == 3)
     check("failed_sub_queries == 0", response.failed_sub_queries == 0)
 
-    # ── 6c. Confidence computed ──
+    # 6c. Confidence computed
     check("confidence value > 0", response.confidence.value > 0.0)
     check("confidence method == 'agent'", response.confidence.method == "agent")
 
-    # ── 6d. Timings populated ──
+    # 6d. Timings populated
     check("total_ms > 0", response.timings.total_ms > 0)
 
-    # ── 6e. request_id propagated ──
+    # 6e. request_id propagated
     check("request_id preserved", response.request_id == "orch-test-001")
 
-    # ── 6f. All sub-results present ──
+    # 6f. All sub-results present
     check("sub_results has 3 entries", len(response.sub_results) == 3)
     check("all sub_results successful", all(r.success for r in response.sub_results))
 
-    # ── 6g. AgentRetrievalError when all sub-queries fail ──
+    # 6g. AgentRetrievalError when all sub-queries fail
     class AlwaysFailPipeline:
         async def query_raw(self, request: RAGRequest) -> RAGResponse:
             raise RuntimeError("all pipeline calls fail")
@@ -636,21 +620,18 @@ async def test_agent_orchestrator() -> None:
               f"wrong exception: {type(e).__name__}: {e}")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Section 7 — Pipeline integration (configure_agents hook)
-# ──────────────────────────────────────────────────────────────────────────────
 
 async def test_pipeline_integration() -> None:
     section("7. Pipeline integration — configure_agents() + routing")
 
-    # We test the routing logic directly without a full pipeline init
-    # by checking that should_decompose() and the agent orchestrator
-    # are wired correctly via configure_agents().
+    # Test routing logic directly without a full pipeline init by checking
+    # that should_decompose() and the agent orchestrator are wired correctly.
 
     # Import here to avoid top-level pipeline init
     from pipeline.rag_pipeline import RAGPipeline
 
-    # ── 7a. configure_agents requires initialized pipeline ──
+    # 7a. configure_agents requires initialized pipeline
     pipeline = RAGPipeline()
     try:
         pipeline.configure_agents(collections={"docs": "test"})
@@ -658,8 +639,8 @@ async def test_pipeline_integration() -> None:
     except Exception:
         _ok("configure_agents before init → raises error")
 
-    # ── 7b. After configure_agents, _agent_orchestrator is set ──
-    # We patch _initialized to True and inject mock LLM + store
+    # 7b. After configure_agents, _agent_orchestrator is set
+    # Patch _initialized to True and inject mock LLM + store
     from unittest.mock import AsyncMock, MagicMock
 
     mock_llm = MockLLM(["irrelevant"])
@@ -681,7 +662,7 @@ async def test_pipeline_integration() -> None:
     check("orchestrator is AgentOrchestrator instance",
           isinstance(pipeline2._agent_orchestrator, AgentOrchestrator))
 
-    # ── 7c. Simple query skips agent (should_decompose=False) ──
+    # 7c. Simple query skips agent (should_decompose=False)
     simple_query = RAGRequest(
         query="What is our PTO policy?",
         collection_name="hr_docs",
@@ -689,7 +670,7 @@ async def test_pipeline_integration() -> None:
     check("simple query should NOT decompose",
           not should_decompose(simple_query.query))
 
-    # ── 7d. Complex query triggers agent (should_decompose=True) ──
+    # 7d. Complex query triggers agent (should_decompose=True)
     complex_query = RAGRequest(
         query="Compare Q3 hiring costs versus attrition costs across Engineering and Sales",
         collection_name="hr_docs",
@@ -698,14 +679,12 @@ async def test_pipeline_integration() -> None:
           should_decompose(complex_query.query))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Model unit tests
-# ──────────────────────────────────────────────────────────────────────────────
 
 def test_models() -> None:
     section("8. Models — SubQuery, DecompositionPlan, SubQueryResult")
 
-    # ── SubQuery.to_rag_request() ──
+    # SubQuery.to_rag_request()
     sq = SubQuery(
         query="Engineering Q3 attrition",
         collection="hr_docs",
@@ -719,7 +698,7 @@ def test_models() -> None:
     check("to_rag_request: request_id has parent prefix",
           req.request_id.startswith("parent-abc::"))
 
-    # ── SubQueryResult.from_rag_response() ──
+    # SubQueryResult.from_rag_response()
     rag_resp = _make_rag_response("Test answer for attrition data", 0.9)
     result = SubQueryResult.from_rag_response(
         sub_query_id=sq.sub_query_id,
@@ -734,7 +713,7 @@ def test_models() -> None:
     check("from_rag_response: latency preserved", abs(result.latency_ms - 123.4) < 0.01)
     check("from_rag_response: sources populated", len(result.sources) > 0)
 
-    # ── SubQueryResult.from_failure() ──
+    # SubQueryResult.from_failure()
     failed = SubQueryResult.from_failure(
         sub_query_id="sq-fail",
         query="Some query",
@@ -746,7 +725,7 @@ def test_models() -> None:
     check("from_failure: failure_reason set", failed.failure_reason == "Pipeline timeout")
     check("from_failure: answer is empty", failed.answer == "")
 
-    # ── DecompositionPlan frozen (immutable) ──
+    # DecompositionPlan frozen (immutable)
     plan = DecompositionPlan(
         sub_queries=[sq],
         reasoning="Test plan",
@@ -759,9 +738,7 @@ def test_models() -> None:
         _ok("DecompositionPlan is frozen (immutable)")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Runner
-# ──────────────────────────────────────────────────────────────────────────────
 
 async def run_all() -> None:
     print("\n" + "=" * 60)

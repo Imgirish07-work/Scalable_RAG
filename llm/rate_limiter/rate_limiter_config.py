@@ -1,33 +1,36 @@
 """
-Rate limiter configuration.
+Configuration model for the LLM rate limiter.
 
-Each field maps to a real Gemini quota dimension:
-    rpm              → requests per minute  (short window)
-    rpd              → requests per day     (long window)
-    max_concurrent   → how many requests can be IN-FLIGHT simultaneously
-    burst_multiplier → how much above rpm the bucket can momentarily spike
+Design:
+    Immutable Pydantic BaseModel. Holds all tuneable parameters for one
+    rate-limiter instance. Computed properties (refill_rate, bucket_capacity)
+    derive token bucket parameters from the human-readable rpm/burst values.
 
-Why two windows (rpm + rpd)?
-    Gemini enforces BOTH. Staying under rpm doesn't protect you from
-    hitting the daily cap mid-afternoon. The rate limiter tracks both.
+Chain of Responsibility:
+    get_rate_limit_config() in model_limits.py constructs this config →
+    passed to LLMRateLimiter.__init__() → used to initialize TokenBucket
+    instances and the asyncio.Semaphore.
+
+Dependencies:
+    pydantic (BaseModel, Field).
 """
 
 from pydantic import BaseModel, Field
 
 
 class RateLimiterConfig(BaseModel):
-    """Configuration for LLMRateLimiter.
+    """Configuration parameters for a single LLMRateLimiter instance.
 
     Attributes:
-        rpm: Max requests allowed per minute. Token bucket refills
-             at rpm/60 tokens per second.
-        rpd: Max requests allowed per day. A second bucket drains
-             once per request and refills at midnight (86400s window).
-        max_concurrent: asyncio.Semaphore size — limits in-flight
-             requests regardless of rate. Prevents thundering herd.
+        rpm: Max requests allowed per minute. The RPM token bucket refills
+            at rpm/60 tokens per second.
+        rpd: Max requests allowed per day. A second token bucket drains once
+            per request and refills over an 86400-second window.
+        max_concurrent: asyncio.Semaphore size — limits the number of in-flight
+            requests regardless of rate quota. Prevents thundering herd bursts.
         burst_multiplier: Bucket capacity = rpm * burst_multiplier.
-             1.0 = no burst allowed (strict). 1.5 = 50% burst above
-             sustained rate for short spikes.
+            1.0 = strict (no burst above sustained rate).
+            1.5 = allows 50% burst above the sustained rate for short spikes.
     """
 
     rpm: int = Field(gt=0, description="Requests per minute")
@@ -45,18 +48,20 @@ class RateLimiterConfig(BaseModel):
 
     @property
     def refill_rate(self) -> float:
-        """Tokens added to the rpm bucket per second.
+        """Tokens added to the RPM bucket per second.
 
-        Example: rpm=60 → 1.0 token/sec (one request per second sustained).
-                 rpm=15 → 0.25 token/sec (one request per 4 seconds).
+        Returns:
+            rpm / 60. Example: rpm=60 → 1.0 token/sec; rpm=15 → 0.25 token/sec.
         """
         return self.rpm / 60.0
 
     @property
     def bucket_capacity(self) -> float:
-        """Max tokens the rpm bucket can hold (controls burst size).
+        """Max tokens the RPM bucket can hold, controlling burst size.
 
-        Example: rpm=60, burst_multiplier=1.5 → capacity=90.
-                 Allows a short burst of 90 req/min before throttling.
+        Returns:
+            rpm * burst_multiplier.
+            Example: rpm=60, burst_multiplier=1.5 → capacity=90,
+            allowing a short burst of up to 90 req/min before throttling.
         """
         return self.rpm * self.burst_multiplier

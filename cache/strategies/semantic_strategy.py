@@ -1,42 +1,45 @@
 """
-Semantic cache strategy — BGE embedding + Qdrant vector similarity.
+Semantic cache strategy using BGE embeddings and Qdrant vector similarity.
 
-Catches paraphrased queries that exact matching misses:
+Design:
+    Catches paraphrased queries that exact matching misses by embedding
+    each query with the shared BGE model and searching an in-memory Qdrant
+    collection for the nearest cached vector. Tiered cosine thresholds
+    gate what confidence level qualifies as a hit.
+
     Cached:  "What is RAG?"
-    Hit:     "Explain RAG to me"        (cosine ~0.96)
-    Hit:     "Can you define RAG?"      (cosine ~0.95)
-    Miss:    "What is RLM?"             (cosine ~0.72)
+    Hit:     "Explain RAG to me"       (cosine ~0.96, tier=high)
+    Hit:     "Can you define RAG?"     (cosine ~0.95, tier=high)
+    Miss:    "What is RLM?"            (cosine ~0.72, below threshold)
 
-Architecture:
-    1. Incoming query is embedded using vectorstore/embeddings.py
-       → same BGE model instance used by RAG retrieval (no duplication)
-    2. Vector is searched against Qdrant cache_semantic collection
-    3. If nearest neighbor exceeds threshold → return its cache_key
-    4. CacheManager uses that cache_key to fetch the response from L1/L2
+    Tiered thresholds (configurable):
+        DIRECT  — cosine >= 0.98 → serve directly, high confidence
+        HIGH    — cosine >= 0.93 → serve with monitoring flag
+        MISS    — cosine <  0.93 → no match
 
-Tiered thresholds (configurable via settings):
-    DIRECT  — cosine >= 0.98 → serve directly, high confidence
-    HIGH    — cosine >= 0.93 → serve with monitoring flag
-    MISS    — cosine <  0.93 → no match
+    Embedding reuse:
+        Uses get_embeddings() from vectorstore/embeddings.py.
+        Same lru_cache instance as RAG retrieval — zero duplicate model
+        loading. embed_query() returns list[float] already L2-normalized.
 
-Qdrant collection stores:
-    vector  — BGE embedding of the query (384-dim for bge-small)
-    payload — {cache_key: str, query_text: str, model_name: str}
+    Qdrant collection stores:
+        vector  — BGE embedding of the query (384-dim for bge-small)
+        payload — {cache_key, query_text, model_name, system_prompt_hash}
 
-Embedding reuse:
-    Uses get_embeddings() from vectorstore/embeddings.py.
-    Same lru_cache instance, same model weights, same normalization.
-    RAG retrieval and semantic cache share one model — zero duplication.
-    embed_query() returns list[float] already L2-normalized.
+    Normalization:
+        Uses a LIGHTER normalizer chain (whitespace only) for embedding —
+        over-normalizing degrades semantic quality.
+        make_key() uses the FULL normalizer chain (same as exact strategy).
 
-Normalization:
-    Uses a LIGHTER normalizer chain (whitespace only) for embedding.
-    make_key() uses the FULL normalizer chain (same as exact).
+Chain of Responsibility:
+    Instantiated by CacheManager._initialize_semantic() when
+    CACHE_STRATEGY='semantic'. CacheManager calls find_similar() on the
+    read path after exact miss, and index_entry() on the write path.
+    All Qdrant I/O is offloaded via asyncio.to_thread() (sync client).
 
-Async:
-    find_similar() and index_entry() are async (Qdrant I/O via asyncio.to_thread)
-    make_key() is sync (CPU only — Rule 2)
-    embed_query() is sync CPU, wrapped in asyncio.to_thread()
+Dependencies:
+    qdrant_client, vectorstore.embeddings.get_embeddings,
+    cache.normalizers.query_normalizer, utils.helpers.hash_text
 """
 
 import asyncio
@@ -55,6 +58,7 @@ from cache.exceptions.cache_exceptions import CacheKeyError
 
 logger = get_logger(__name__)
 
+
 class SemanticCacheStrategy(BaseCacheStrategy):
     """BGE embedding + Qdrant vector similarity cache strategy.
 
@@ -71,26 +75,28 @@ class SemanticCacheStrategy(BaseCacheStrategy):
         _client: QdrantClient instance.
         _initialized: Whether initialize() has been called.
     """
+
     def __init__(
         self,
         collection_name: str = "cache_semantic",
         threshold_direct: float = 0.98,
         threshold_high: float = 0.93,
-        qdrant_client = None,
+        qdrant_client=None,
         qdrant_url: str = "",
         qdrant_api_key: str = "",
-        use_memory: bool = True, 
+        use_memory: bool = True,
     ) -> None:
         """Sync constructor — stores config, no I/O.
-    Args:
-        collection_name: Qdrant collection for cache vectors.
-        threshold_direct: Cosine >= this → direct serve.
-        threshold_high: Cosine >= this → high-confidence serve.
-        qdrant_client: Optional pre-built QdrantClient (for testing).
-        qdrant_url: Qdrant server URL (if no client provided).
-        qdrant_api_key: Qdrant API key (if no client provided).
-        use_memory: If True and no client/url, use in-memory Qdrant.
-    """
+
+        Args:
+            collection_name: Qdrant collection for cache vectors.
+            threshold_direct: Cosine >= this → direct serve.
+            threshold_high: Cosine >= this → high-confidence serve.
+            qdrant_client: Optional pre-built QdrantClient (for testing).
+            qdrant_url: Qdrant server URL (if no client provided).
+            qdrant_api_key: Qdrant API key (if no client provided).
+            use_memory: If True and no client/url, use in-memory Qdrant.
+        """
         self._embed_normalizer = QueryNormalizerChain(
             steps=[WhitespaceNormalizer()]
         )
@@ -113,7 +119,16 @@ class SemanticCacheStrategy(BaseCacheStrategy):
 
     @staticmethod
     def _create_client(url: str, api_key: str, use_memory: bool):
-        """Create a QdrantClient based on provided config."""
+        """Create a QdrantClient based on provided config.
+
+        Args:
+            url: Qdrant server URL. If non-empty, connects to remote server.
+            api_key: API key for authenticated remote Qdrant.
+            use_memory: If True and url is empty, use in-memory Qdrant.
+
+        Returns:
+            Configured QdrantClient instance.
+        """
         from qdrant_client import QdrantClient
 
         if url:
@@ -129,14 +144,16 @@ class SemanticCacheStrategy(BaseCacheStrategy):
 
     @property
     def name(self) -> str:
+        """Strategy identifier."""
         return "semantic"
 
     # Initialization
+
     async def initialize(self) -> None:
         """Create the Qdrant collection and verify embedding model.
 
         Must be called once before find_similar() or index_entry().
-        Safe to call multiple times.
+        Safe to call multiple times — subsequent calls are no-ops.
 
         Loads the embedding model via get_embeddings() (lru_cached —
         if already loaded by RAG layer, this is instant).
@@ -146,7 +163,7 @@ class SemanticCacheStrategy(BaseCacheStrategy):
         """
         if self._initialized:
             return
-        
+
         try:
             self._embedding_dim = await asyncio.to_thread(get_embedding_dimension)
             logger.info(
@@ -181,16 +198,16 @@ class SemanticCacheStrategy(BaseCacheStrategy):
 
         collections = self._client.get_collections().collections
         existing = {c.name for c in collections}
-        
-        # collection already exists
+
+        # Skip creation if the collection already exists from a prior run
         if self._collection in existing:
             logger.info(
                 "Semantic cache collection '%s' already exists",
                 self._collection,
             )
             return
-        
-        # create new collection
+
+        # Create with cosine distance to match L2-normalized BGE output
         self._client.create_collection(
             collection_name=self._collection,
             vectors_config=VectorParams(
@@ -205,7 +222,8 @@ class SemanticCacheStrategy(BaseCacheStrategy):
         )
 
     # Embeddings
-    def _embed_query(self, query : str) -> list[float]:
+
+    def _embed_query(self, query: str) -> list[float]:
         """Embed a query string using the shared BGE model.
 
         Uses LIGHT normalization (whitespace only) before embedding.
@@ -216,7 +234,7 @@ class SemanticCacheStrategy(BaseCacheStrategy):
         Returns list[float] already L2-normalized (normalize_embeddings=True
         is set in the embeddings module).
 
-        Sync — CPU only, runs inside asyncio.to_thread() from async.
+        Sync — CPU only, runs inside asyncio.to_thread() from async callers.
 
         Args:
             query: Raw user query.
@@ -227,17 +245,18 @@ class SemanticCacheStrategy(BaseCacheStrategy):
         normalized = self._embed_normalizer.normalize(query)
 
         if not normalized:
-            return [0.0]*self._embedding_dim # return type is list[float]
+            return [0.0] * self._embedding_dim
 
         embeddings = get_embeddings()
         vector = embeddings.embed_query(normalized)
         return vector
 
     async def _async_embed_query(self, query: str) -> list[float]:
-        """Async wrapper for embedding — offloads to thread pool."""
+        """Async wrapper for embedding — offloads CPU-bound work to thread pool."""
         return await asyncio.to_thread(self._embed_query, query)
 
     # Key generation
+
     def make_key(
         self,
         query: str,
@@ -248,9 +267,22 @@ class SemanticCacheStrategy(BaseCacheStrategy):
         """Generate SHA-256 cache key — identical to exact strategy.
 
         The semantic strategy still needs deterministic keys for L1/L2
-        storage. Uses the FULL normalizer chain (not the light one).
+        storage. Uses the FULL normalizer chain (not the light one used
+        for embedding).
 
-        Sync — CPU only (Rule 2).
+        Sync — CPU only.
+
+        Args:
+            query: Raw user query.
+            model_name: LLM model identifier.
+            temperature: Generation temperature.
+            system_prompt_hash: Pre-computed SHA-256 of system prompt.
+
+        Returns:
+            64-character SHA-256 hex digest.
+
+        Raises:
+            CacheKeyError: If normalization or hashing fails.
         """
         try:
             fingerprint = self._key_normalizer.build_cache_fingerprint(
@@ -275,7 +307,8 @@ class SemanticCacheStrategy(BaseCacheStrategy):
                 message=f"Key generation failed: {e}",
             ) from e
 
-    # Similarity serach
+    # Similarity search
+
     async def find_similar(
         self,
         query: str,
@@ -307,12 +340,12 @@ class SemanticCacheStrategy(BaseCacheStrategy):
         try:
             query_vector = await self._async_embed_query(query)
 
-            # check for zero vector
+            # Skip search for degenerate empty-query vectors
             if all(v == 0.0 for v in query_vector):
                 logger.debug("Semantic search skipped — zero vector from empty query")
                 return None
 
-            # search qdrant for nearest neighbor
+            # Qdrant search runs in a thread — client is sync
             results = await asyncio.to_thread(
                 self._search_qdrant,
                 query_vector=query_vector,
@@ -328,7 +361,7 @@ class SemanticCacheStrategy(BaseCacheStrategy):
                 )
                 return None
 
-            # Tiered threshold logic
+            # Apply tiered threshold to the single top result
             top = results[0]
             score = top.score
             cache_key = top.payload.get("cache_key", "")
@@ -365,7 +398,7 @@ class SemanticCacheStrategy(BaseCacheStrategy):
                 "Semantic find_similar failed: query='%s'", query[:60]
             )
             return None
-            
+
     def _search_qdrant(
         self,
         query_vector: list[float],
@@ -387,7 +420,6 @@ class SemanticCacheStrategy(BaseCacheStrategy):
         Returns:
             List of ScoredPoint results (0 or 1 items).
         """
-
         from qdrant_client.models import Filter, FieldCondition, MatchValue
 
         must_conditions = [
@@ -404,7 +436,7 @@ class SemanticCacheStrategy(BaseCacheStrategy):
                     match=MatchValue(value=system_prompt_hash),
                 )
             )
-        
+
         response = self._client.query_points(
             collection_name=self._collection,
             query=query_vector,
@@ -426,7 +458,6 @@ class SemanticCacheStrategy(BaseCacheStrategy):
         Returns:
             'direct', 'high', or 'miss'.
         """
-
         if score >= self._threshold_direct:
             return "direct"
         elif score >= self._threshold_high:
@@ -434,7 +465,8 @@ class SemanticCacheStrategy(BaseCacheStrategy):
         else:
             return "miss"
 
-    # Index Entry ( Write path ) 
+    # Index entry (write path)
+
     async def index_entry(
         self,
         query: str,
@@ -465,6 +497,7 @@ class SemanticCacheStrategy(BaseCacheStrategy):
         try:
             query_vector = await self._async_embed_query(query)
 
+            # Skip indexing for degenerate empty-query vectors
             if all(v == 0.0 for v in query_vector):
                 logger.debug("Semantic index skipped — zero vector from empty query")
                 return
@@ -499,7 +532,7 @@ class SemanticCacheStrategy(BaseCacheStrategy):
 
         Uses UUID as point ID. Duplicate queries get separate points.
         Qdrant returns nearest by vector similarity, so duplicates are
-        harmless — closest match wins.
+        harmless — the closest match always wins on search.
         """
         from qdrant_client.models import PointStruct
 
@@ -516,14 +549,26 @@ class SemanticCacheStrategy(BaseCacheStrategy):
             ]
         )
 
-    # helpers
+    # Helpers
+
     def get_query_hash(self, query: str) -> str:
-        """SHA-256 hash of normalized query for deduplication."""
+        """SHA-256 hash of normalized query for deduplication.
+
+        Args:
+            query: Raw user query.
+
+        Returns:
+            64-character SHA-256 hex digest.
+        """
         normalized = self._key_normalizer.normalize(query)
         return hash_text(normalized)
 
     async def get_collection_stats(self) -> dict:
-        """Return Qdrant collection statistics."""
+        """Return Qdrant collection statistics.
+
+        Returns:
+            Dict with collection name, point count, status, and embedding dim.
+        """
         if not self._initialized:
             return {"status": "not_initialized"}
 

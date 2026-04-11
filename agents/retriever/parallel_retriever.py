@@ -1,14 +1,21 @@
-"""Parallel retriever — executes sub-queries concurrently.
+"""
+Parallel retriever — executes sub-queries concurrently.
 
-Takes a DecompositionPlan and executes each sub-query as a RAG
-pipeline call. Independent sub-queries run in parallel via
-asyncio.gather() with a semaphore to respect rate limits.
-Sequential sub-queries run one at a time.
+Design:
+    Takes a DecompositionPlan and executes each sub-query as a RAG
+    pipeline call. Independent sub-queries run in parallel via
+    asyncio.gather() with a semaphore to respect rate limits.
+    Sequential sub-queries run one at a time when parallel_safe=False.
+    Individual failures are caught and recorded — they never abort the
+    entire batch.
 
-The retriever does NOT implement retrieval logic — it delegates
-to pipeline.query_raw() for each sub-query. This means every
-sub-query gets caching, ranking, context assembly, and all
-existing infrastructure for free.
+Chain of Responsibility:
+    AgentOrchestrator.execute() → ParallelRetriever.execute()
+    → pipeline.query_raw() (one call per sub-query)
+    → List[SubQueryResult] returned to orchestrator.
+
+Dependencies:
+    asyncio, agents.models.*, rag.models.*, config.settings
 """
 
 # stdlib
@@ -26,7 +33,7 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# default concurrency cap — prevents rate-limit storms
+# Default concurrency cap — prevents rate-limit storms on the LLM provider.
 _DEFAULT_MAX_CONCURRENT = 4
 
 
@@ -153,7 +160,7 @@ class ParallelRetriever:
     ) -> SubQueryResult:
         """Execute a single sub-query via the pipeline.
 
-        Catches all exceptions and converts them to failed
+        Catches all exceptions and converts them to a failed
         SubQueryResult — individual sub-query failures do NOT
         crash the entire agent execution.
 

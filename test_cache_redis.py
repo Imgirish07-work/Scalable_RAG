@@ -1,28 +1,20 @@
 """
-Redis L2 Cache Pipeline Test — Phase 5 validation.
+Integration tests for the Redis L2 cache layer.
 
-Run from project root:
-    python test_cache_redis_pipeline.py
+Test scope:
+    Integration tests (no pytest) covering Redis connectivity, the config factory
+    (local/cloud/test/disabled environments), the circuit breaker state machine,
+    Redis backend CRUD and native TTL, key-prefix isolation, L1+L2 cascade
+    behaviour, L2→L1 promotion with TTL preservation, graceful degradation when
+    Redis is unreachable, and full stats with both backends active.
 
-Prerequisites:
-    - Redis running locally: redis-server
-    - Or: already installed and running on localhost:6379
+Flow:
+    Section 1 probes Redis; if DOWN, sections 4-8 and 10 are skipped automatically.
+    Sections 2-3 and 9 run regardless of Redis availability.
 
-The test auto-detects Redis availability:
-    - Redis UP   → runs full L2 tests (Sections 1-10)
-    - Redis DOWN → runs config factory + circuit breaker + degradation tests only
-
-Sections:
-    1.  Redis connectivity
-    2.  Redis config factory (environment-based switching)
-    3.  Circuit breaker state machine
-    4.  Redis backend — basic operations
-    5.  Redis backend — TTL native expiry
-    6.  Redis backend — key prefix isolation
-    7.  CacheManager — L1 + L2 cascade
-    8.  CacheManager — L2 → L1 promotion
-    9.  Graceful degradation — L2 down
-    10. Full stats with both backend
+Dependencies:
+    Redis on localhost:6379 for full coverage; colorama for terminal output;
+    MagicMock for settings injection.
 """
 
 import asyncio
@@ -133,12 +125,8 @@ def make_settings(**overrides) -> MagicMock:
     return mock
 
 
-# ══════════════════════════════════════════════════
-# SECTION 1 — Redis connectivity
-# ══════════════════════════════════════════════════
-
-
 async def test_redis_connectivity() -> None:
+    """Verifies Redis is reachable and sets the REDIS_AVAILABLE flag for later sections."""
     global REDIS_AVAILABLE
     header("Redis Connectivity", 1)
 
@@ -165,12 +153,19 @@ async def test_redis_connectivity() -> None:
         info("Continuing with config factory + circuit breaker + degradation tests only")
 
 
-# ══════════════════════════════════════════════════
-# SECTION 2 — Redis Config Factory
-# ══════════════════════════════════════════════════
-
-
 def test_config_factory() -> None:
+    """Verifies RedisConfigFactory produces correct configs for each environment.
+
+    Tests:
+        - Local env: redis:// URL, dev prefix, TLS disabled.
+        - Cloud env: rediss:// URL, prod prefix, TLS enabled, password redacted in logs.
+        - Cloud without URL falls back to local.
+        - Test env: DB 1, small pool, fast timeout.
+        - Disabled and empty env return None.
+        - Unknown env falls back to local.
+        - from_config() constructs a backend with the correct name.
+        - Config is immutable (frozen dataclass).
+    """
     header("Redis Config Factory", 2)
 
     sub_header("Local environment")
@@ -248,12 +243,18 @@ def test_config_factory() -> None:
         check("Config is frozen", True, "FrozenInstanceError")
 
 
-# ══════════════════════════════════════════════════
-# SECTION 3 — Circuit breaker
-# ══════════════════════════════════════════════════
-
-
 def test_circuit_breaker() -> None:
+    """Verifies the CircuitBreaker CLOSED→OPEN→HALF_OPEN→CLOSED state machine.
+
+    Tests:
+        - Starts CLOSED and allows requests.
+        - Trips to OPEN after reaching the failure threshold.
+        - Transitions to HALF_OPEN after the reset period elapses.
+        - Probe success closes the breaker; probe failure re-opens it.
+        - A mid-streak success resets the failure counter.
+        - manual reset() returns the breaker to CLOSED immediately.
+        - stats() exposes name, state, total_trips, and total_rejected.
+    """
     header("Circuit Breaker State Machine", 3)
 
     sub_header("Initial state")
@@ -329,12 +330,15 @@ def test_circuit_breaker() -> None:
     info(f"Breaker stats: {stats}")
 
 
-# ══════════════════════════════════════════════════
-# SECTION 4 — Redis backend basic operations
-# ══════════════════════════════════════════════════
-
-
 async def test_redis_basic_ops() -> None:
+    """Verifies RedisCacheBackend CRUD operations against a live Redis instance.
+
+    Tests:
+        - set/get round-trip; missing key returns None.
+        - exists() and delete() return correct booleans.
+        - Overwrite replaces the stored value.
+        - size() reflects the number of stored keys; clear() removes all of them.
+    """
     header("Redis Backend — Basic Operations", 4)
 
     if not REDIS_AVAILABLE:
@@ -389,12 +393,14 @@ async def test_redis_basic_ops() -> None:
     await backend.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 5 — Redis TTL
-# ══════════════════════════════════════════════════
-
-
 async def test_redis_ttl() -> None:
+    """Verifies that Redis natively expires entries after their TTL.
+
+    Tests:
+        - Entry is readable before its TTL elapses.
+        - Entry returns None after the TTL elapses (server-side expiry).
+        - Zero and negative TTL values are not stored.
+    """
     header("Redis Backend — Native TTL", 5)
 
     if not REDIS_AVAILABLE:
@@ -429,12 +435,14 @@ async def test_redis_ttl() -> None:
     await backend.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 6 — Key prefix isolation
-# ══════════════════════════════════════════════════
-
-
 async def test_key_prefix_isolation() -> None:
+    """Verifies that different key prefixes provide full isolation between backends.
+
+    Tests:
+        - Two backends sharing a Redis instance but different prefixes store
+          values for the same logical key independently.
+        - clear() on one prefix does not affect the other prefix's keys.
+    """
     header("Redis — Key Prefix Isolation", 6)
 
     if not REDIS_AVAILABLE:
@@ -471,12 +479,15 @@ async def test_key_prefix_isolation() -> None:
     await backend_b.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 7 — CacheManager L1 + L2 cascade
-# ══════════════════════════════════════════════════
-
-
 async def test_cache_manager_cascade() -> None:
+    """Verifies the L1→L2 lookup cascade and cross-layer invalidation.
+
+    Tests:
+        - A write populates both L1 and L2; first read returns L1 hit.
+        - After clearing L1, the next read falls through to L2.
+        - The L2 hit promotes the entry back to L1 for subsequent reads.
+        - invalidate() removes the entry from both layers.
+    """
     header("CacheManager — L1 + L2 Cascade", 7)
 
     if not REDIS_AVAILABLE:
@@ -524,12 +535,14 @@ async def test_cache_manager_cascade() -> None:
     await cache.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 8 — L2 promotion with TTL preservation
-# ══════════════════════════════════════════════════
-
-
 async def test_l2_promotion() -> None:
+    """Verifies that L2→L1 promotion preserves remaining TTL.
+
+    Tests:
+        - After the L1 is cleared, a 2-second-old entry is still readable from L2.
+        - The L2 hit is promoted to L1 and the next read returns L1.
+        - After the full TTL (5s) elapses, the entry is gone from both layers.
+    """
     header("CacheManager — L2 → L1 Promotion", 8)
 
     if not REDIS_AVAILABLE:
@@ -563,12 +576,15 @@ async def test_l2_promotion() -> None:
     await cache.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 9 — Graceful degradation
-# ══════════════════════════════════════════════════
-
-
 async def test_graceful_degradation() -> None:
+    """Verifies the cache degrades gracefully to L1-only when Redis is unavailable.
+
+    Tests:
+        - Unreachable Redis causes L2 to be None; L1 set/get still work.
+        - REDIS_ENV=disabled sets L2 to None; only l1_memory backend is active.
+        - Empty REDIS_ENV also results in L2 being None.
+        - When Redis is available, an open circuit breaker causes GET to return None.
+    """
     header("Graceful Degradation — L2 Down", 9)
 
     sub_header("CacheManager with unreachable Redis")
@@ -635,12 +651,15 @@ async def test_graceful_degradation() -> None:
         await backend.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 10 — Full stats
-# ══════════════════════════════════════════════════
-
-
 async def test_full_stats() -> None:
+    """Verifies get_full_stats() includes accurate data for both L1 and L2 backends.
+
+    Tests:
+        - Top-level enabled, initialized, and strategy fields are correct.
+        - L1 backend stats include current_size.
+        - L2 backend stats include status/name and the correct environment tag.
+        - Metrics counters for lookups, hits, and misses match the operations performed.
+    """
     header("Full Stats — Both backend", 10)
 
     if not REDIS_AVAILABLE:
@@ -681,11 +700,6 @@ async def test_full_stats() -> None:
     info(f"Metrics: {m}")
 
     await cache.close()
-
-
-# ══════════════════════════════════════════════════
-# Main runner
-# ══════════════════════════════════════════════════
 
 
 async def run_all() -> None:

@@ -1,39 +1,36 @@
 """
-L1 in-memory cache backend — fastest layer in the cache hierarchy.
+L1 in-memory LRU cache backend — fastest layer in the cache hierarchy.
 
-Uses collections.OrderedDict for O(1) LRU eviction:
-    - get() moves accessed key to end (most recently used)
-    - set() appends to end, evicts from front (least recently used)
-    - Bounded by CACHE_L1_MAX_SIZE entries
+Design:
+    Uses collections.OrderedDict for O(1) LRU eviction:
+        - get() moves accessed key to end (most recently used)
+        - set() appends to end, evicts from front (least recently used)
+        - Bounded by CACHE_L1_MAX_SIZE entries
 
-Concurrency:
-    asyncio.Lock protects all dict mutations. This is correct because:
-    - FastAPI runs on a single event loop with concurrent coroutines
-    - asyncio.Lock is the right primitive for async context (not threading.Lock)
-    - Individual operations are fast enough that lock contention is negligible
-    - The lock is per-backend-instance, not global
+    Concurrency:
+        asyncio.Lock protects all dict mutations. This is correct because
+        FastAPI runs on a single event loop with concurrent coroutines.
+        asyncio.Lock is the right primitive (not threading.Lock).
+        Individual operations are fast enough that lock contention is negligible.
 
-TTL enforcement:
-    - Each entry stores its expiry timestamp alongside the value
-    - get() checks expiry BEFORE returning — expired entries return None
-    - Expired entries are lazily deleted on access (no background sweeper)
-    - _evict_expired() can be called periodically for proactive cleanup
+    TTL enforcement:
+        Each entry stores its expiry timestamp alongside the value.
+        get() checks expiry before returning — expired entries return None.
+        Expired entries are lazily deleted on access (no background sweeper).
+        evict_expired() can be called periodically for proactive cleanup.
 
-Memory:
-    - Stores raw JSON strings (not deserialized objects) — same as Redis
-    - Typical entry: 500-2000 bytes (LLMResponse JSON)
-    - 1000 entries ≈ 1-2 MB RAM — negligible for any server
+    Memory:
+        Stores raw JSON strings (not deserialized objects) — same as Redis.
+        Typical entry: 500-2000 bytes (LLMResponse JSON).
+        1000 entries ≈ 1-2 MB RAM — negligible for any server.
 
-Performance:
-    - get(): ~1-5 microseconds (dict lookup + move_to_end)
-    - set(): ~1-5 microseconds (dict insert + possible eviction)
-    - No network I/O, no serialization overhead on read path
+Chain of Responsibility:
+    Instantiated by CacheManager. Passed to ExactCacheStrategy as the
+    first backend in the lookup list. Not shared across processes — L2
+    Redis handles cross-instance sharing.
 
-Per application instance — not shared across processes.
-For shared caching across instances, L2 Redis handles that.
-
-Async — all public methods are async def (Rule 1 interface compliance).
-Internal operations are CPU-only but wrapped in async for the lock.
+Dependencies:
+    asyncio, collections.OrderedDict (stdlib only)
 """
 
 import asyncio
@@ -46,6 +43,7 @@ from cache.backend.base_backend import BaseCacheBackend
 from cache.exceptions.cache_exceptions import CacheBackendError
 
 logger = get_logger(__name__)
+
 
 class _CacheSlot:
     """Internal storage slot — holds value + expiry metadata.
@@ -62,14 +60,16 @@ class _CacheSlot:
 
     __slots__ = ("value", "expires_at", "created_at")
 
-    def __init__(self, value: str, expires_at:  datetime) -> None:
+    def __init__(self, value: str, expires_at: datetime) -> None:
         self.value = value
         self.expires_at = expires_at
         self.created_at = datetime.now(timezone.utc)
 
     @property
     def is_expired(self) -> bool:
+        """True if the current UTC time has passed expires_at."""
         return datetime.now(timezone.utc) >= self.expires_at
+
 
 class MemoryCacheBackend(BaseCacheBackend):
     """L1 in-memory LRU cache backend.
@@ -95,7 +95,7 @@ class MemoryCacheBackend(BaseCacheBackend):
 
         if max_size <= 0:
             raise ValueError(f"max_size must be greater than 0, got {max_size}")
-        
+
         self._max_size = max_size
         self._store : OrderedDict[str, _CacheSlot] = OrderedDict()
         self._lock = asyncio.Lock()
@@ -109,8 +109,9 @@ class MemoryCacheBackend(BaseCacheBackend):
 
     @property
     def name(self) -> str:
+        """Backend identifier used in logs and metrics."""
         return "l1_memory"
-        
+
     async def get(self, key: str) -> Optional[str]:
         """Retrieve a value by key, enforcing TTL and updating LRU order.
 
@@ -119,6 +120,7 @@ class MemoryCacheBackend(BaseCacheBackend):
 
         If the key exists and is valid, it is moved to the end of
         the OrderedDict (most recently used position).
+
         Args:
             key: Cache key (SHA-256 hex digest).
 
@@ -137,10 +139,10 @@ class MemoryCacheBackend(BaseCacheBackend):
                     key[:16] + "...",
                 )
                 return None
-            
+
             self._store.move_to_end(key)
             return slot.value
-            
+
     async def set(self, key: str, value: str, ttl_seconds: int) -> None:
         """Store a value with TTL, applying LRU eviction if at capacity.
 
@@ -157,7 +159,6 @@ class MemoryCacheBackend(BaseCacheBackend):
         Raises:
             CacheBackendError: If an unexpected error occurs during write.
         """
-             
         if ttl_seconds <= 0:
             logger.debug(
                 "L1 set skipped — TTL <= 0: key=%s, ttl=%d",
@@ -165,9 +166,9 @@ class MemoryCacheBackend(BaseCacheBackend):
                 ttl_seconds,
             )
             return
-        
-        # create a slot with the value and expiry time
-        expires_at = datetime.now(timezone.utc) 
+
+        # Compute absolute expiry before acquiring the lock to minimize contention
+        expires_at = datetime.now(timezone.utc)
         try:
             from datetime import timedelta
             expires_at += timedelta(seconds=ttl_seconds)
@@ -180,9 +181,10 @@ class MemoryCacheBackend(BaseCacheBackend):
             from datetime import timedelta
             expires_at += timedelta(days=30)
         _slot = _CacheSlot(value=value, expires_at=expires_at)
-        # insert logic
+
         async with self._lock:
             if key in self._store:
+                # Overwrite existing entry in-place, keeping LRU order fresh
                 self._store.move_to_end(key)
                 self._store[key] = _slot
                 logger.debug(
@@ -191,7 +193,7 @@ class MemoryCacheBackend(BaseCacheBackend):
                     ttl_seconds,
                 )
                 return
-            
+
             self._store[key] = _slot
             if len(self._store) > self._max_size:
                 evicted_key, _ = self._store.popitem(last=False)
@@ -217,9 +219,9 @@ class MemoryCacheBackend(BaseCacheBackend):
                 del self._store[key]
                 logger.debug("L1 entry deleted: key=%s", key[:16] + "...")
                 return True
-            
+
             return False
-        
+
     async def exists(self, key: str) -> bool:
         """Check if a key exists and has not expired.
 
@@ -238,14 +240,14 @@ class MemoryCacheBackend(BaseCacheBackend):
 
             if slot is None:
                 return False
-            
+
             if slot.is_expired:
                 del self._store[key]
                 self._total_expired_removals += 1
                 return False
-            
+
             return True
-        
+
     async def clear(self) -> int:
         """Remove all entries from the L1 cache.
 
@@ -257,7 +259,7 @@ class MemoryCacheBackend(BaseCacheBackend):
             self._store.clear()
             logger.info("L1 cache cleared: removed=%d entries", count)
             return count
-    
+
     async def size(self) -> int:
         """Return current number of entries (including potentially expired).
 
@@ -270,7 +272,7 @@ class MemoryCacheBackend(BaseCacheBackend):
         """
         async with self._lock:
             return len(self._store)
-         
+
     async def evict_expired(self) -> int:
         """Proactively scan and remove all expired entries.
 
@@ -298,7 +300,7 @@ class MemoryCacheBackend(BaseCacheBackend):
                 )
 
             return len(expired_keys)
-    
+
     async def stats(self) -> dict:
         """Return L1 backend statistics for observability.
 
@@ -323,7 +325,7 @@ class MemoryCacheBackend(BaseCacheBackend):
             "total_evictions": self._total_evictions,
             "total_expired_removals": self._total_expired_removals,
         }
-    
+
     async def close(self) -> None:
         """Graceful shutdown — clear the store and release resources.
 

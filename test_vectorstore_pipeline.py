@@ -1,37 +1,26 @@
 """
-Vector Store Pipeline Test — full ingestion + retrieval validation.
+Integration tests for QdrantStore ingestion and retrieval.
 
-Run from project root:
-    python test_vectorstore_pipeline.py
+Test scope:
+    Integration tests (no pytest) covering BGE model loading, QdrantStore
+    initialization (dense and hybrid modes), document ingestion with
+    embed_content swapping, similarity search with k/threshold/user-id
+    parameters, relevance score metadata, original content restoration,
+    collection stats, edge cases (empty query, k=0, long query), collection
+    deletion, and graceful close. Uses in-memory Qdrant — no server required.
 
-Prerequisites:
-    - BGE-small-en-v1.5 model configured in .env
-    - qdrant-client installed
-    - No Qdrant server needed (uses in-memory mode)
+Flow:
+    Section 1 loads the BGE model; if unavailable, sections 2-13 are skipped.
 
-Tests the complete pipeline:
-    Document creation → Chunker metadata → QdrantStore write → search → restore
-
-Sections:
-    1.  Embedding model + dimension check
-    2.  QdrantStore initialization (in-memory)
-    3.  Document ingestion — embed_content swap
-    4.  Similarity search — basic retrieval
-    5.  Similarity search — score threshold filtering
-    6.  Similarity search — relevance score in metadata
-    7.  Original content restoration (no embed prefix in results)
-    8.  User ID filtering
-    9.  Multiple documents — correct retrieval
-    10. Collection stats
-    11. Empty query and edge cases
-    12. Delete collection
-    13. Graceful close
+Dependencies:
+    BGE-small-en-v1.5 via EMBEDDING_MODEL_LOCAL_PATH in .env; colorama;
+    in-memory Qdrant (no server); no Redis, LLM API, or external services.
 """
 import os
 import ssl
 
-# Corporate network SSL Fix — disables SSL verification for HuggingFace downloads
-# (SPLADE model for hybrid mode). Remove once corporate CA cert is installed.
+# Disable SSL verification for HuggingFace downloads on corporate networks
+# (needed for SPLADE model in hybrid mode). Remove once corp CA is installed.
 os.environ["HF_HUB_DISABLE_SSL_VERIFICATION"] = "1"
 os.environ["CURL_CA_BUNDLE"] = ""
 os.environ["REQUESTS_CA_BUNDLE"] = ""
@@ -92,13 +81,11 @@ def info(msg: str) -> None:
     print(f"    {Fore.WHITE}ℹ {msg}{Style.RESET_ALL}")
 
 
-# Sample documents that simulate Chunker output
 def make_sample_documents() -> list[Document]:
-    """Create sample documents with metadata matching Chunker output.
+    """Build five sample documents that mimic Chunker output.
 
-    Each document has embed_content (title + section + text) and
-    page_content (clean text). This mimics what the Chunker produces
-    after _prepend_context().
+    Each document carries embed_content (title + section + text used for
+    embedding) and page_content (the clean text returned to the caller).
     """
     docs = [
         Document(
@@ -190,12 +177,8 @@ def make_sample_documents() -> list[Document]:
     return docs
 
 
-# ══════════════════════════════════════════════════
-# SECTION 1 — Embedding model check
-# ══════════════════════════════════════════════════
-
-
 def test_embedding_model() -> None:
+    """Verifies the BGE model loads, returns the correct dimension, and produces non-zero vectors."""
     global MODEL_AVAILABLE
     header("Embedding Model + Dimension", 1)
 
@@ -212,7 +195,6 @@ def test_embedding_model() -> None:
         dim = get_embedding_dimension()
         check("Dimension is 384", dim == 384, f"dim={dim}")
 
-        # Verify embedding works
         vector = embeddings.embed_query("test query")
         check("embed_query returns list", isinstance(vector, list))
         check("Vector has correct dimension", len(vector) == dim)
@@ -223,12 +205,14 @@ def test_embedding_model() -> None:
         check("Model loaded", False, str(e))
 
 
-# ══════════════════════════════════════════════════
-# SECTION 2 — QdrantStore initialization
-# ══════════════════════════════════════════════════
-
-
 async def test_initialization() -> None:
+    """Verifies QdrantStore initializes correctly in dense and hybrid modes.
+
+    Tests:
+        - Dense mode sets client and store; collection name and search mode are correct.
+        - Hybrid mode initializes if SPLADE is available; skipped otherwise.
+        - Double initialize() does not raise an error.
+    """
     header("QdrantStore Initialization (in-memory)", 2)
 
     if not MODEL_AVAILABLE:
@@ -277,12 +261,16 @@ async def test_initialization() -> None:
     await store2.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 3 — Document ingestion + embed_content
-# ══════════════════════════════════════════════════
-
-
 async def test_ingestion() -> None:
+    """Verifies add_documents() uses embed_content for embedding and restores clean page_content.
+
+    Tests:
+        - add_documents() returns one ID per document.
+        - Searching using the embed_content title prefix returns results.
+        - page_content in results does not start with 'Title:'.
+        - original_content is stored in metadata and matches the source document.
+        - Enriched metadata keys (doc_id, user_id, source, ingested_at, char_count) are present.
+    """
     header("Document Ingestion — embed_content Swap", 3)
 
     if not MODEL_AVAILABLE:
@@ -302,13 +290,12 @@ async def test_ingestion() -> None:
 
     sub_header("Verify embed_content was used for embedding")
 
-    # If embed_content swap works, searching for "Title: ml_guide.pdf"
-    # should return results (because embed_content includes the title)
+    # embed_content includes the title prefix, so this query should return results
     results = await store.similarity_search("ml_guide Introduction RAG", k=1)
     check("Search returns results", len(results) > 0)
 
     if results:
-        # page_content should be the ORIGINAL text, not embed_content
+        # page_content must be clean original text, not the embed_content prefix
         first = results[0]
         has_prefix = first.page_content.startswith("Title:")
         check(
@@ -319,7 +306,7 @@ async def test_ingestion() -> None:
 
     sub_header("Verify original_content in metadata")
 
-    # Retrieve raw from Qdrant to check metadata
+    # Raw search to inspect the stored metadata directly
     raw_results = await asyncio.to_thread(
         store._store.similarity_search, "RAG retrieval augmented", k=1
     )
@@ -349,12 +336,14 @@ async def test_ingestion() -> None:
     await store.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 4 — Basic similarity search
-# ══════════════════════════════════════════════════
-
-
 async def test_basic_search() -> None:
+    """Verifies similarity_search returns semantically relevant results and respects k.
+
+    Tests:
+        - Query about RAG returns a result whose content mentions RAG or retrieval.
+        - Query about transformers returns content mentioning attention or transformer.
+        - k=1 returns exactly 1 result; k=5 returns all 5 documents.
+    """
     header("Similarity Search — Basic Retrieval", 4)
 
     if not MODEL_AVAILABLE:
@@ -372,7 +361,6 @@ async def test_basic_search() -> None:
     check("Returns <= k results", len(results) <= 3)
 
     if results:
-        # RAG document should be most relevant
         top_content = results[0].page_content
         check(
             "Top result is about RAG",
@@ -403,12 +391,14 @@ async def test_basic_search() -> None:
     await store.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 5 — Score threshold filtering
-# ══════════════════════════════════════════════════
-
-
 async def test_score_threshold() -> None:
+    """Verifies that score_threshold filters results correctly.
+
+    Tests:
+        - A low threshold (0.3) returns at least one result.
+        - A high threshold (0.8) returns fewer results than the low threshold.
+        - An extreme threshold (0.9) on an unrelated query returns at most 1 result.
+    """
     header("Similarity Search — Score Threshold", 5)
 
     if not MODEL_AVAILABLE:
@@ -455,12 +445,14 @@ async def test_score_threshold() -> None:
     await store.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 6 — Relevance score in metadata
-# ══════════════════════════════════════════════════
-
-
 async def test_relevance_scores() -> None:
+    """Verifies relevance_score is attached to metadata when a threshold is used.
+
+    Tests:
+        - With score_threshold, results include a float relevance_score in [0, 1].
+        - Multiple results are returned in descending score order.
+        - Without score_threshold, relevance_score is not present in metadata.
+    """
     header("Relevance Score in Metadata", 6)
 
     if not MODEL_AVAILABLE:
@@ -488,7 +480,6 @@ async def test_relevance_scores() -> None:
             check("Score is between 0 and 1", 0.0 <= score <= 1.0, f"score={score}")
             info(f"Top result score: {score}")
 
-        # Scores should be descending
         if len(results) >= 2:
             scores = [r.metadata.get("relevance_score", 0) for r in results]
             is_sorted = all(scores[i] >= scores[i + 1] for i in range(len(scores) - 1))
@@ -509,12 +500,15 @@ async def test_relevance_scores() -> None:
     await store.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 7 — Original content restoration
-# ══════════════════════════════════════════════════
-
-
 async def test_content_restoration() -> None:
+    """Verifies that page_content in search results is the original clean text.
+
+    Tests:
+        - Retrieved page_content does not start with 'Title:'.
+        - Content matches one of the original source documents.
+        - embed_content is preserved in metadata and starts with 'Title:'.
+        - All results from a broad search have clean page_content.
+    """
     header("Original Content Restoration", 7)
 
     if not MODEL_AVAILABLE:
@@ -534,21 +528,18 @@ async def test_content_restoration() -> None:
     if results:
         content = results[0].page_content
 
-        # Should NOT start with "Title:" prefix
         check(
             "No 'Title:' prefix in page_content",
             not content.startswith("Title:"),
             f"starts='{content[:30]}...'",
         )
 
-        # Should match one of the original documents
         original_contents = [d.page_content for d in docs]
         check(
             "Content matches an original document",
             content in original_contents,
         )
 
-        # embed_content should still be in metadata (for reference)
         meta = results[0].metadata
         check(
             "embed_content still in metadata",
@@ -578,12 +569,16 @@ async def test_content_restoration() -> None:
     await store.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 8 — User ID filtering
-# ══════════════════════════════════════════════════
-
-
 async def test_user_filtering() -> None:
+    """Verifies filter_user_id restricts results to the specified user's documents.
+
+    Tests:
+        - All results for user_001 have user_id == 'user_001'.
+        - All results for user_002 have user_id == 'user_002'.
+        - The two users have different result counts (dataset has 3+2 split).
+        - A nonexistent user returns an empty result set.
+        - No filter returns more results than either user alone.
+    """
     header("User ID Filtering", 8)
 
     if not MODEL_AVAILABLE:
@@ -645,12 +640,13 @@ async def test_user_filtering() -> None:
     await store.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 9 — Multiple documents, correct retrieval
-# ══════════════════════════════════════════════════
-
-
 async def test_correct_retrieval() -> None:
+    """Verifies that topic-specific queries retrieve the correct document.
+
+    Tests:
+        - Five queries (RAG, attention, vector databases, fine-tuning, Python)
+          each return a result whose content contains at least one expected keyword.
+    """
     header("Multiple Documents — Correct Retrieval", 9)
 
     if not MODEL_AVAILABLE:
@@ -687,12 +683,14 @@ async def test_correct_retrieval() -> None:
     await store.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 10 — Collection stats
-# ══════════════════════════════════════════════════
-
-
 async def test_collection_stats() -> None:
+    """Verifies get_collection_stats() returns accurate metadata for the collection.
+
+    Tests:
+        - Stats dict contains backend, collection_name, document_count, search_mode, mode.
+        - document_count equals the number of ingested documents (5).
+        - mode is 'memory' for in-memory stores.
+    """
     header("Collection Stats", 10)
 
     if not MODEL_AVAILABLE:
@@ -718,12 +716,15 @@ async def test_collection_stats() -> None:
     await store.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 11 — Edge cases
-# ══════════════════════════════════════════════════
-
-
 async def test_edge_cases() -> None:
+    """Verifies edge-case inputs are handled without crashing.
+
+    Tests:
+        - Empty string and whitespace-only queries return zero results.
+        - Adding an empty document list returns zero IDs.
+        - k=0 returns zero results.
+        - A very long query (500+ words) does not raise an exception.
+    """
     header("Empty Query and Edge Cases", 11)
 
     if not MODEL_AVAILABLE:
@@ -761,12 +762,13 @@ async def test_edge_cases() -> None:
     await store.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 12 — Delete collection
-# ══════════════════════════════════════════════════
-
-
 async def test_delete_collection() -> None:
+    """Verifies delete_collection() removes all data and leaves the collection empty.
+
+    Tests:
+        - Data is present (document_count == 5) before deletion.
+        - After delete_collection(), stats return None or an empty dict.
+    """
     header("Delete Collection", 12)
 
     if not MODEL_AVAILABLE:
@@ -786,7 +788,6 @@ async def test_delete_collection() -> None:
 
     await store.delete_collection()
 
-    # Stats should fail or return empty after deletion
     stats_after = await store.get_collection_stats()
     check(
         "Collection gone after delete",
@@ -796,12 +797,13 @@ async def test_delete_collection() -> None:
     await store.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 13 — Graceful close
-# ══════════════════════════════════════════════════
-
-
 async def test_graceful_close() -> None:
+    """Verifies close() releases the client and store, and that double close() is safe.
+
+    Tests:
+        - After close(), _client and _store are set to None.
+        - A second call to close() does not raise an error.
+    """
     header("Graceful Close", 13)
 
     if not MODEL_AVAILABLE:
@@ -824,11 +826,6 @@ async def test_graceful_close() -> None:
     check("Double close — no error", True)
 
 
-# ══════════════════════════════════════════════════
-# Main runner
-# ══════════════════════════════════════════════════
-
-
 async def run_all() -> None:
     pipeline_start = time.perf_counter()
 
@@ -839,10 +836,8 @@ async def run_all() -> None:
     print(f"   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'═' * 70}{Style.RESET_ALL}")
 
-    # Sync test
     test_embedding_model()
 
-    # Async tests
     await test_initialization()
     await test_ingestion()
     await test_basic_search()

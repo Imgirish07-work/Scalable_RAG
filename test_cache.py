@@ -1,23 +1,18 @@
 """
-Cache Pipeline Test — Interactive validation of the entire L1 caching system.
+Unit tests for the full L1 caching system.
 
-Run from project root:
-    python test_cache_pipeline.py
+Test scope:
+    Unit tests (no pytest) covering the normalizer chain, exact cache strategy,
+    JSON serializer, memory backend (LRU + TTL), CacheManager end-to-end flow,
+    quality gate, request coalescing, cache invalidation, metrics/observability,
+    stress testing, and error resilience. No Redis, Qdrant, or LLM API calls.
 
-Tests every component in sequence with rich console output:
-    Section 1  — Normalizer Chain
-    Section 2  — Exact Strategy (Key Generation)
-    Section 3  — JSON Serializer (Round-Trip)
-    Section 4  — Memory Backend (L1 LRU + TTL)
-    Section 5  — CacheManager (End-to-End Flow)
-    Section 6  — Quality Gate
-    Section 7  — Request Coalescing (Thundering Herd)
-    Section 8  — Cache Invalidation
-    Section 9  — Metrics & Observability
-    Section 10 — Stress Test (500 cycles)
+Flow:
+    Sync sections (1-3) → async sections (4-11) → printed pass/fail summary.
+    All backends are in-memory with a mocked Settings object.
 
-No external dependencies — no Redis, no Qdrant, no LLM API calls.
-Everything runs in-memory with mocked Settings.
+Dependencies:
+    colorama for terminal output; MagicMock for settings; no external services.
 """
 
 import asyncio
@@ -26,10 +21,6 @@ import sys
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 from colorama import Fore, Style, init as colorama_init
-
-# ──────────────────────────────────────────────────
-# Imports from project
-# ──────────────────────────────────────────────────
 
 from llm.models.llm_response import LLMResponse
 from cache.models.cache_entry import CacheEntry
@@ -48,10 +39,6 @@ from cache.serializers.json_serializer import JSONSerializer
 from cache.exceptions.cache_exceptions import CacheSerializationError
 from cache.cache_manager import CacheManager
 
-
-# ──────────────────────────────────────────────────
-# Console helpers
-# ──────────────────────────────────────────────────
 
 colorama_init(autoreset=True)
 
@@ -98,11 +85,6 @@ def warn(msg: str) -> None:
 
 def divider() -> None:
     print(f"{Fore.CYAN}{'─' * 70}{Style.RESET_ALL}")
-
-
-# ──────────────────────────────────────────────────
-# Factories
-# ──────────────────────────────────────────────────
 
 
 def make_response(
@@ -152,12 +134,17 @@ def make_settings(**overrides) -> MagicMock:
     return mock
 
 
-# ══════════════════════════════════════════════════
-# SECTION 1 — Normalizer Chain
-# ══════════════════════════════════════════════════
-
-
 def test_normalizer_chain() -> None:
+    """Verifies that each normalizer step and the full chain produce canonical forms.
+
+    Tests:
+        - WhitespaceNormalizer collapses runs of whitespace.
+        - CaseNormalizer lowercases all input.
+        - PunctuationNormalizer strips trailing punctuation.
+        - UnicodeNormalizer applies NFC and removes zero-width characters.
+        - Full chain collapses five query variants to one normalized form.
+        - build_cache_fingerprint produces the expected pipe-delimited format.
+    """
     header("Normalizer Chain", 1)
     chain = QueryNormalizerChain()
 
@@ -237,12 +224,16 @@ def test_normalizer_chain() -> None:
     check("Fingerprint deterministic", fp_a == fp_b)
 
 
-# ══════════════════════════════════════════════════
-# SECTION 2 — Exact Strategy
-# ══════════════════════════════════════════════════
-
-
 def test_exact_strategy() -> None:
+    """Verifies that ExactCacheStrategy generates isolated, deterministic SHA-256 keys.
+
+    Tests:
+        - Same input always produces the same 64-char hex key.
+        - Whitespace/punctuation variants normalize to the same key.
+        - Different queries, models, temperatures, and system prompts yield different keys.
+        - get_query_hash ignores formatting differences.
+        - get_normalized_query returns the canonical form.
+    """
     header("Exact Strategy (Key Generation)", 2)
     strategy = ExactCacheStrategy()
 
@@ -289,12 +280,15 @@ def test_exact_strategy() -> None:
     check("get_normalized_query", norm == "what is rag", f"'{norm}'")
 
 
-# ══════════════════════════════════════════════════
-# SECTION 3 — JSON Serializer
-# ══════════════════════════════════════════════════
-
-
 def test_json_serializer() -> None:
+    """Verifies that JSONSerializer round-trips CacheEntry without data loss.
+
+    Tests:
+        - Serialize produces a non-empty JSON string.
+        - Deserialize restores response text, tokens, provider, cache key, and TTL.
+        - Hit count survives serialization.
+        - Invalid JSON, wrong schema, and empty string each raise CacheSerializationError.
+    """
     header("JSON Serializer (Round-Trip)", 3)
     serializer = JSONSerializer()
 
@@ -357,12 +351,19 @@ def test_json_serializer() -> None:
         check("Empty string raises CacheSerializationError", True)
 
 
-# ══════════════════════════════════════════════════
-# SECTION 4 — Memory Backend (L1)
-# ══════════════════════════════════════════════════
-
-
 async def test_memory_backend() -> None:
+    """Verifies MemoryCacheBackend behaviour: CRUD, LRU eviction, TTL expiry, and stats.
+
+    Tests:
+        - set/get/exists/delete round-trip correctly.
+        - Overwrite does not increase the stored count.
+        - LRU eviction removes the least-recently-used entry when max_size is exceeded.
+        - Accessed entries are promoted and survive subsequent eviction.
+        - Entries expire after their TTL and are removed by evict_expired().
+        - Zero TTL entries are not stored.
+        - stats() returns accurate utilization figures.
+        - 20 concurrent writes stay within max_size without corruption.
+    """
     header("Memory Backend (L1 LRU + TTL)", 4)
     backend = MemoryCacheBackend(max_size=5)
 
@@ -479,12 +480,16 @@ async def test_memory_backend() -> None:
     await backend.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 5 — CacheManager End-to-End
-# ══════════════════════════════════════════════════
-
-
 async def test_cache_manager_e2e() -> None:
+    """Verifies the CacheManager miss→set→hit flow and key-isolation guarantees.
+
+    Tests:
+        - First lookup returns a miss; subsequent lookup after set returns a hit.
+        - Hit result carries L1_MEMORY layer and EXACT strategy.
+        - Whitespace, case, and punctuation variants all hit the same cached entry.
+        - Different query, model, temperature, and system prompt each produce a miss.
+        - TTL expiry causes a previously cached entry to return as a miss.
+    """
     header("CacheManager (End-to-End Flow)", 5)
     cache = CacheManager(make_settings())
     await cache.initialize()
@@ -563,12 +568,15 @@ async def test_cache_manager_e2e() -> None:
     await cache.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 6 — Quality Gate
-# ══════════════════════════════════════════════════
-
-
 async def test_quality_gate() -> None:
+    """Verifies that the quality gate rejects low-quality responses before caching.
+
+    Tests:
+        - Responses below the minimum token threshold are rejected.
+        - Responses with suspiciously low latency are rejected.
+        - Responses meeting both thresholds are accepted.
+        - Rejection events are counted in the metrics.
+    """
     header("Quality Gate", 6)
     cache = CacheManager(make_settings())
     await cache.initialize()
@@ -622,12 +630,15 @@ async def test_quality_gate() -> None:
     await cache.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 7 — Request Coalescing
-# ══════════════════════════════════════════════════
-
-
 async def test_request_coalescing() -> None:
+    """Verifies that concurrent identical requests are coalesced to a single LLM call.
+
+    Tests:
+        - First caller receives a miss; subsequent callers wait for the result.
+        - Only one LLM call is made for five simultaneous identical requests.
+        - resolve_in_flight() makes the result available to all waiters.
+        - A coalescing timeout returns a miss without crashing.
+    """
     header("Request Coalescing (Thundering Herd)", 7)
     cache = CacheManager(make_settings())
     await cache.initialize()
@@ -687,12 +698,14 @@ async def test_request_coalescing() -> None:
     await cache.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 8 — Cache Invalidation
-# ══════════════════════════════════════════════════
-
-
 async def test_invalidation() -> None:
+    """Verifies that invalidate() and clear_all() remove entries as expected.
+
+    Tests:
+        - invalidate() returns True and removes an existing entry.
+        - invalidate() returns False for a key that was never cached.
+        - clear_all() returns per-layer counts and removes all entries.
+    """
     header("Cache Invalidation", 8)
     cache = CacheManager(make_settings())
     await cache.initialize()
@@ -731,12 +744,15 @@ async def test_invalidation() -> None:
     await cache.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 9 — Metrics & Observability
-# ══════════════════════════════════════════════════
-
-
 async def test_metrics() -> None:
+    """Verifies that CacheManager and CacheMetrics track hits, misses, and costs accurately.
+
+    Tests:
+        - Counters for lookups, hits, misses, hit rate, writes, and tokens saved.
+        - cost_saved_usd is positive after a cache hit.
+        - get_full_stats() includes backend details and in_flight_count.
+        - CacheMetrics.summary() computes per-layer and per-strategy breakdowns.
+    """
     header("Metrics & Observability", 9)
     cache = CacheManager(make_settings())
     await cache.initialize()
@@ -797,12 +813,16 @@ async def test_metrics() -> None:
     await cache.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 10 — Stress Test
-# ══════════════════════════════════════════════════
-
-
 async def test_stress() -> None:
+    """Verifies cache stability and LRU behaviour under 500 sequential and 100 concurrent writes.
+
+    Tests:
+        - All 500 immediate reads hit the cache (written then read in the same iteration).
+        - 500 cycles complete within 5 seconds.
+        - L1 size stays at or below max_size (50); at least 450 LRU evictions occur.
+        - After eviction, only the most recent entries remain (late_hits <= 50).
+        - 100 concurrent burst writes complete without data corruption.
+    """
     header("Stress Test (500 Write/Read Cycles)", 10)
     cache = CacheManager(make_settings(CACHE_L1_MAX_SIZE=50))
     await cache.initialize()
@@ -886,12 +906,15 @@ async def test_stress() -> None:
     await cache.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 11 — Error Resilience
-# ══════════════════════════════════════════════════
-
-
 async def test_error_resilience() -> None:
+    """Verifies that backend failures are absorbed gracefully without raising exceptions.
+
+    Tests:
+        - A broken get() returns a miss instead of propagating the exception.
+        - A broken set() returns False instead of propagating the exception.
+        - A disabled cache treats all gets as misses and all sets as no-ops.
+        - Double initialize() is safe and does not clear existing data.
+    """
     header("Error Resilience", 11)
     cache = CacheManager(make_settings())
     await cache.initialize()
@@ -958,11 +981,6 @@ async def test_error_resilience() -> None:
     await cache.close()
 
 
-# ══════════════════════════════════════════════════
-# Main runner
-# ══════════════════════════════════════════════════
-
-
 async def run_all() -> None:
     pipeline_start = time.perf_counter()
 
@@ -973,12 +991,12 @@ async def run_all() -> None:
     print(f"   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'═' * 70}{Style.RESET_ALL}")
 
-    # Sync tests
+    # Sync sections
     test_normalizer_chain()
     test_exact_strategy()
     test_json_serializer()
 
-    # Async tests
+    # Async sections
     await test_memory_backend()
     await test_cache_manager_e2e()
     await test_quality_gate()

@@ -1,26 +1,19 @@
 """
-Real rate limiter test — live Gemini API calls.
+Integration test for LLMRateLimiter using live Gemini API calls.
 
-What this test proves:
-    1. WITHOUT rate limiter  → requests fire at full LLM speed
-    2. WITH rate limiter     → token bucket throttles; each request beyond
-                               the first waits for a token to refill
+Test scope:
+    Integration test (no pytest) demonstrating that the token-bucket rate
+    limiter throttles requests to the configured RPM. The bucket is pre-drained
+    to 1 token so throttling is observable from request 2 onward.
 
-Key design choices:
-    TEST_RPM = 3  -> 1 token per 20 seconds
-                  -> safely BELOW free tier (5/min) so we never hit a real 429
-                  -> throttling is clearly visible in wall-clock timestamps
+Flow:
+    Phase 2 only (Phase 1 baseline is commented out to conserve quota):
+    req 1 fires immediately (1 pre-loaded token); req 2 waits ~20s for refill.
+    Total: 2 requests, safely within the free-tier limit of 5/min.
 
-    Bucket is PRE-DRAINED to 1 token so throttling kicks in from request 2.
-    (Production buckets start full for burst tolerance — in this test we want
-    to observe throttling immediately, not after burning through the burst.)
-
-    Phase 1: 1 request  — no limiter baseline
-    Phase 2: 3 requests — req 1 immediate, req 2 & 3 each wait ~20s
-    Total: 4 requests in ~40s -> well within 5/min free tier limit
-
-Run:
-    python test_rate_limiter_real.py
+Dependencies:
+    GEMINI_API_KEY in .env; network access to Gemini API.
+    TEST_RPM=3 (1 token per 20s) — must be below the API's free-tier limit.
 """
 
 import asyncio
@@ -32,8 +25,8 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Must be set BELOW the actual API limit (free tier = 5/min).
-# If TEST_RPM > API limit, the real API rejects before the limiter kicks in.
+# TEST_RPM must stay below the API's actual limit (free tier: 5/min) so the
+# limiter fires before the API returns a 429.
 TEST_RPM            = 3       # 1 token per 20s — safely below free tier 5/min
 TEST_RPD            = 10000   # daily cap high — not the constraint here
 TEST_MAX_CONCURRENT = 2       # max 2 requests in-flight simultaneously
@@ -56,7 +49,7 @@ def _section(title: str) -> None:
 
 
 async def run_without_limiter(llm) -> None:
-    """Single request with NO rate limiter — establishes baseline LLM latency."""
+    """Send a single request without the rate limiter to establish a baseline latency."""
     _section("Phase 1: WITHOUT rate limiter (raw Gemini provider)")
     print("  Sending 1 request — baseline LLM latency\n")
 
@@ -69,12 +62,11 @@ async def run_without_limiter(llm) -> None:
 
 
 async def run_with_limiter(llm) -> None:
-    """3 sequential requests through the token bucket rate limiter.
+    """Send NUM_REQUESTS sequential requests through the token-bucket rate limiter.
 
-    Bucket pre-drained to 1 token:
-        req 1 -> immediate (1 token available)
-        req 2 -> waits ~20s (bucket empty, refills at 1 token/20s)
-        req 3 -> waits ~20s
+    The bucket is pre-drained to 1 token so throttling is visible from request 2:
+        req 1 fires immediately (1 token available).
+        req 2 waits ~20s (bucket empty, refills at 1 token/20s).
     """
     _section(
         f"Phase 2: WITH rate limiter  "
@@ -97,12 +89,8 @@ async def run_with_limiter(llm) -> None:
 
     rate_limited_llm = LLMRateLimiter(provider=llm, config=config)
 
-    # Pre-drain the bucket to 1 token so throttling starts from request 2.
-    #
-    # Why: In production the bucket starts FULL (capacity = 3 tokens here),
-    # so requests 1, 2, 3 all fire immediately (that is the burst buffer).
-    # For this test we pre-drain to 1 so throttling is immediately visible.
-    # This is a test-only pattern — never do this in production code.
+    # Pre-drain to 1 token so throttling starts at request 2.
+    # In production the bucket starts full (burst buffer). This is test-only.
     rate_limited_llm._rpm_bucket._tokens = 1.0
 
     print(
@@ -126,7 +114,7 @@ async def run_with_limiter(llm) -> None:
         call_time = time.perf_counter() - t0
         wall_after = time.perf_counter() - test_start
 
-        # throttle_wait = total elapsed since req start minus actual LLM call time
+        # Total elapsed minus actual LLM call time gives the throttle wait
         wait_time = (wall_after - wall_before) - call_time
 
         print(
@@ -167,7 +155,7 @@ async def run() -> None:
     print(f"  Provider : {llm.provider_name}")
     print(f"  Model    : {llm.model_name}")
 
-    # await run_without_limiter(llm)  # commented out — saves quota
+    # await run_without_limiter(llm)  # omitted to conserve API quota
     # await asyncio.sleep(2)
     await run_with_limiter(llm)
 

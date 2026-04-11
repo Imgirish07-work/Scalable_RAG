@@ -1,17 +1,25 @@
 """
-CacheEntry — the value stored in every cache backend.
+Pydantic model for a single cached LLM response with full metadata.
 
-Wraps LLMResponse with cache-specific metadata:
-    - When it was created and when it expires
-    - Which query produced it (for deduplication on write)
-    - Hit counter for frequency-based eviction decisions
-    - Provider + model for cost-aware cache routing
+Design:
+    Wraps LLMResponse with cache-specific fields needed for lifecycle
+    management: expiry timestamps, hit counting, provider/model info
+    for cost attribution, and the original query text for semantic
+    re-seeding on restart. Stored as JSON via JSONSerializer and
+    deserialized back into this model on every cache read.
 
-Stored as JSON via json_serializer.py.
-Deserialized back into this model on cache read.
+    model_validator enforces that expires_at is strictly after created_at
+    to prevent zero-or-negative TTL entries from entering the cache.
 
-Sync — pure Pydantic data class, no I/O."""
+Chain of Responsibility:
+    Created by CacheManager.set() on the write path. Deserialized by
+    JSONSerializer and returned to CacheManager on the read path.
+    TTLClassifier determines ttl_seconds. CacheEntry.is_expired guards
+    stale reads in both MemoryCacheBackend and CacheManager.
 
+Dependencies:
+    pydantic, llm.LLMResponse
+"""
 
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -20,7 +28,24 @@ from llm import LLMResponse
 
 
 class CacheEntry(BaseModel):
-    """Single cached LLM response with metadata."""
+    """Single cached LLM response with metadata.
+
+    Attributes:
+        response: The LLM-generated response being cached.
+        sources: Serialized RetrievedChunk dicts from the RAG pipeline.
+        cache_key: The key this entry is stored under in the backend.
+        query_hash: SHA-256 of the normalized query for dedup matching.
+        query_text: Normalized query text for semantic Qdrant re-seeding.
+        created_at: UTC timestamp when this entry was first written.
+        expires_at: UTC timestamp when this entry should be evicted.
+        ttl_seconds: TTL assigned by TTLClassifier at write time.
+        hit_count: Number of cache hits served from this entry.
+        provider: LLM provider that generated this response.
+        model_name: Model name used for generation.
+        temperature: Temperature used for generation.
+        token_cost_estimate: Estimated USD cost saved per cache hit.
+        confidence_value: Retrieval confidence score at generation time.
+    """
 
     model_config = {"strict": False, "frozen": False}
 
@@ -95,6 +120,7 @@ class CacheEntry(BaseModel):
 
     @model_validator(mode="after")
     def validate_expiry_after_creation(self) -> "CacheEntry":
+        """Reject entries where expires_at is not strictly after created_at."""
         if self.expires_at <= self.created_at:
             raise ValueError(
                 f"expires_at ({self.expires_at}) must be after "
@@ -104,15 +130,15 @@ class CacheEntry(BaseModel):
 
     @property
     def is_expired(self) -> bool:
-        """Check if this entry has passed its TTL."""
+        """True if the current UTC time has passed expires_at."""
         return datetime.now(timezone.utc) >= self.expires_at
 
     @property
     def age_seconds(self) -> float:
-        """Seconds since this entry was created."""
+        """Seconds elapsed since this entry was created."""
         delta = datetime.now(timezone.utc) - self.created_at
         return delta.total_seconds()
 
     def record_hit(self) -> None:
-        """Increment hit counter. Called on every cache read."""
+        """Increment hit counter. Called on every successful cache read."""
         self.hit_count += 1

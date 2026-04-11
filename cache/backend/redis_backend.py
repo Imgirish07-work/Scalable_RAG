@@ -1,24 +1,25 @@
 """
-L2 Redis cache backend — shared, persistent, TTL-native.
+L2 Redis cache backend — shared, persistent, TTL-native production store.
 
-Provides:
-    - Shared cache across all application instances (FastAPI workers)
-    - Persistence across restarts (Redis RDB/AOF)
-    - Native TTL via SETEX — Redis handles expiry automatically
-    - Connection pooling via redis.asyncio.ConnectionPool
-    - Circuit breaker for graceful degradation when Redis is unhealthy
-    - Key prefixing to avoid collisions in shared Redis instances
-    - from_config() factory for environment-based construction
+Design:
+    Implements BaseCacheBackend over redis.asyncio (async Redis client).
+    Uses connection pooling for efficiency, key prefixing for namespace
+    isolation, SETEX for atomic TTL-aware writes, and SCAN (not KEYS)
+    for non-blocking key enumeration. A CircuitBreaker wraps every call
+    to prevent cascading failures when Redis becomes unhealthy.
 
-Performance:
-    - get():  ~0.5-2ms (network round-trip to Redis)
-    - set():  ~0.5-2ms (network round-trip)
-    - exists(): ~0.5-1ms (lightweight check)
+    Performance:
+        get():    ~0.5-2ms (network round-trip)
+        set():    ~0.5-2ms (network round-trip)
+        exists(): ~0.5-1ms (lightweight check)
 
-Async — all methods are async def (Rule 1).
+Chain of Responsibility:
+    Instantiated by CacheManager._initialize_l2() via from_config().
+    RedisConnectionConfig is provided by RedisConfigFactory. All calls
+    pass through the internal CircuitBreaker before reaching the network.
 
 Dependencies:
-    pip install redis>=5.0.0
+    redis>=5.0.0 (redis.asyncio)
 """
 
 import redis.asyncio as aioredis
@@ -40,6 +41,7 @@ from cache.exceptions.cache_exceptions import (
 
 logger = get_logger(__name__)
 
+
 class RedisCacheBackend(BaseCacheBackend):
     """L2 Redis cache backend with circuit breaker and connection pooling.
 
@@ -55,6 +57,7 @@ class RedisCacheBackend(BaseCacheBackend):
         _breaker: Circuit breaker instance.
         _initialized: Whether initialize() has been called.
     """
+
     def __init__(
         self,
         url: str = "redis://localhost:6379/0",
@@ -106,7 +109,7 @@ class RedisCacheBackend(BaseCacheBackend):
         )
 
     @classmethod
-    def from_config(cls, config : RedisConnectionConfig) -> "RedisCacheBackend":
+    def from_config(cls, config: RedisConnectionConfig) -> "RedisCacheBackend":
         """Factory method — create backend from RedisConnectionConfig.
 
         This is the preferred way to construct a RedisCacheBackend.
@@ -132,6 +135,7 @@ class RedisCacheBackend(BaseCacheBackend):
 
     @property
     def name(self) -> str:
+        """Backend identifier used in logs and metrics."""
         return "l2_redis"
 
     @property
@@ -160,7 +164,7 @@ class RedisCacheBackend(BaseCacheBackend):
             return
 
         try:
-            # Create connection pool
+            # Create the async connection pool
             self._pool = aioredis.ConnectionPool.from_url(
                 self._url,
                 max_connections=self._max_connections,
@@ -169,11 +173,11 @@ class RedisCacheBackend(BaseCacheBackend):
                 retry_on_timeout=self._retry_on_timeout,
                 decode_responses=True,
             )
-            
-            # Create Redis client
+
+            # Attach a client to the pool
             self._client = aioredis.Redis(connection_pool=self._pool)
 
-            # Test connectivity with a PING
+            # Verify the server is reachable before marking initialized
             await self._client.ping()
             self._initialized = True
 
@@ -213,6 +217,7 @@ class RedisCacheBackend(BaseCacheBackend):
             ) from e
 
     def _ensure_initialized(self) -> None:
+        """Guard all public methods — raises if initialize() was not called."""
         if not self._initialized or self._client is None:
             raise CacheConnectionError(
                 backend="l2_redis",
@@ -234,17 +239,15 @@ class RedisCacheBackend(BaseCacheBackend):
         Raises:
             CacheBackendError: On Redis communication failure.
         """
-
-        # ensure initialize() was called
         self._ensure_initialized()
 
-        # check circuit breaker before attempting Redis operation
+        # Short-circuit if the backend is known to be unhealthy
         if not self._breaker.allow_request():
-            return None  # Circuit is open, skip backend
+            return None
 
         try:
             result = await self._client.get(self._make_key(key))
-            self._breaker.record_success() 
+            self._breaker.record_success()
 
             if result is not None:
                 logger.debug("L2 Redis hit: key=%s", key[:16] + "...")
@@ -282,20 +285,20 @@ class RedisCacheBackend(BaseCacheBackend):
         Raises:
             CacheBackendError: On Redis communication failure.
         """
-        # ensure initialize() was called
         self._ensure_initialized()
 
-        # check circuit breaker before attempting Redis operation
+        # Short-circuit if the backend is known to be unhealthy
         if not self._breaker.allow_request():
-            return  # Circuit is open, skip backend
+            return
 
-        # setex need ttl>=1, so skip if ttl_seconds is 0 or negative. This allows caller to disable caching by setting ttl_seconds=0 without raising an error.
+        # SETEX requires ttl >= 1; skip rather than raise so callers can
+        # disable caching by passing ttl_seconds=0 without error handling.
         if ttl_seconds <= 0:
             logger.debug("Skipping set: ttl_seconds=%d <= 0 for key=%s", ttl_seconds, key[:16] + "...")
             return
 
         try:
-            # use SETEX to automatically set the value and TTL in one atomic operation
+            # SETEX atomically writes value + TTL in a single command
             await self._client.setex(
                 name=self._make_key(key),
                 time=ttl_seconds,
@@ -341,14 +344,12 @@ class RedisCacheBackend(BaseCacheBackend):
         Raises:
             CacheBackendError: On Redis communication failure.
         """
-
-        # ensure initialize() was called
         self._ensure_initialized()
 
-        # check circuit breaker before attempting Redis operation
+        # Short-circuit if the backend is known to be unhealthy
         if not self._breaker.allow_request():
-            return False  # Circuit is open, skip backend
-        
+            return False
+
         try:
             removed = await self._client.delete(self._make_key(key))
             self._breaker.record_success()
@@ -357,7 +358,7 @@ class RedisCacheBackend(BaseCacheBackend):
             if deleted:
                 logger.debug("L2 Redis deleted: key=%s", key[:16] + "...")
             return deleted
-        
+
         except (RedisConnectionError, RedisTimeoutError) as e:
             self._breaker.record_failure()
             raise CacheBackendError(
@@ -382,17 +383,16 @@ class RedisCacheBackend(BaseCacheBackend):
         Raises:
             CacheBackendError: On Redis communication failure.
         """
-        # ensure initialize() was called
         self._ensure_initialized()
-        
-        # check circuit breaker before attempting Redis operation
+
+        # Short-circuit if the backend is known to be unhealthy
         if not self._breaker.allow_request():
             return False
 
         try:
             result = await self._client.exists(self._make_key(key))
             self._breaker.record_success()
-            return result > 0 
+            return result > 0
 
         except (RedisConnectionError, RedisTimeoutError) as e:
             self._breaker.record_failure()
@@ -410,21 +410,19 @@ class RedisCacheBackend(BaseCacheBackend):
         """Remove all entries with the configured prefix.
 
         Uses SCAN + DELETE to avoid blocking Redis with KEYS *.
-        
-        KEYS * is blocking until all keys are returned, which can cause timeouts and instability in production.
-        
-        SCAN is non-blocking and allows us to iterate through keys in batches.
-        
+        KEYS * blocks until all keys are returned, which can cause
+        timeouts in production. SCAN iterates in batches without
+        blocking the server.
+
         Returns:
             Number of entries removed.
 
         Raises:
             CacheBackendError: On Redis communication failure.
         """
-        # ensure initialize() was called
         self._ensure_initialized()
 
-        # check circuit breaker before attempting Redis operation
+        # Short-circuit if the backend is known to be unhealthy
         if not self._breaker.allow_request():
             return 0
 
@@ -442,7 +440,7 @@ class RedisCacheBackend(BaseCacheBackend):
 
                 if cursor == 0:
                     break
-            
+
             self._breaker.record_success()
             logger.info("L2 Redis cleared: removed=%d entries", total_deleted)
             return total_deleted
@@ -465,10 +463,9 @@ class RedisCacheBackend(BaseCacheBackend):
         Returns:
             Approximate number of entries.
         """
-        # ensure initialize() was called
         self._ensure_initialized()
 
-        # check circuit breaker before attempting Redis operation
+        # Short-circuit if the backend is known to be unhealthy
         if not self._breaker.allow_request():
             return 0
 
@@ -484,7 +481,7 @@ class RedisCacheBackend(BaseCacheBackend):
                 count += len(keys)
                 if cursor == 0:
                     break
-            
+
             self._breaker.record_success()
             return count
         except RedisError as e:
@@ -493,7 +490,11 @@ class RedisCacheBackend(BaseCacheBackend):
             return -1  # Return -1 to indicate size is unavailable due to error
 
     async def stats(self) -> dict:
-        """Return Redis backend statistics."""
+        """Return Redis backend statistics.
+
+        Returns:
+            Dict with connection details, memory usage, and circuit breaker state.
+        """
         result = {
             "name": self.name,
             "backend_type": "redis",
@@ -531,15 +532,18 @@ class RedisCacheBackend(BaseCacheBackend):
         return result
 
     async def ping(self) -> bool:
-        """Health check — verify Redis is responsive."""
-        
+        """Health check — verify Redis is responsive.
+
+        Returns:
+            True if Redis responds to PING, False otherwise.
+        """
         if not self._initialized or self._client is None:
             return False
 
         try:
             result = await self._client.ping()
             self._breaker.record_success()
-            return result 
+            return result
 
         except RedisError as e:
             self._breaker.record_failure()

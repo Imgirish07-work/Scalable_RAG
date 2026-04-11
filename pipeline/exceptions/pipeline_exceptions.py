@@ -1,12 +1,21 @@
-"""Pipeline-layer exceptions.
-
-These are the outermost exceptions in the system. They catch and wrap
-errors from inner layers (RAG, LLM, cache) only when the pipeline
-needs to communicate a pipeline-specific failure (e.g., initialization,
-validation, fallback exhaustion). Inner-layer exceptions that are
-actionable by the caller (LLMAuthError, LLMRateLimitError) still
-propagate as-is — the pipeline does NOT blanket-wrap everything.
 """
+Pipeline-layer exceptions.
+
+Design:
+    Outermost exception hierarchy in the system. Wraps errors from inner
+    layers (RAG, LLM, cache) only when the pipeline needs to communicate
+    a pipeline-specific failure. Inner-layer exceptions that are actionable
+    by the caller (LLMAuthError, LLMRateLimitError) propagate as-is — the
+    pipeline does NOT blanket-wrap everything.
+
+Chain of Responsibility:
+    Raised by RAGPipeline; caught by FastAPI exception handlers or callers
+    of pipeline.query() / pipeline.ingest().
+
+Dependencies:
+    None (stdlib only).
+"""
+
 
 class PipelineError(Exception):
     """Base exception for all pipeline-layer errors.

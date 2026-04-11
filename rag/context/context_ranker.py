@@ -1,24 +1,28 @@
 """
-Context ranker — post-retrieval reranking and diversification.
+Post-retrieval reranking and diversification for retrieved chunks.
 
-Strategies:
-    none         — pass-through, retrieval order preserved.
-    mmr          — Maximal Marginal Relevance: diversity + relevance balance.
-    cross_encoder — ms-marco-MiniLM reranker for accurate relevance scoring,
-                   followed by MMR for diversity on the final set.
+Design:
+    Strategy pattern with three pluggable reranking modes:
+        none         — pass-through, preserves retrieval order.
+        mmr          — Maximal Marginal Relevance: balances relevance and
+                       diversity. Uses pre-fetched Qdrant vectors for the
+                       inter-chunk similarity term, avoiding re-embedding.
+        cross_encoder — ms-marco-MiniLM reranker for precise relevance
+                       scoring, followed by MMR for diversity on the result.
 
-MMR bug fix (vs original implementation):
-    Original: re-embedded ALL chunk texts + query on every query call (~3s).
-    Fixed:    uses chunk.relevance_score (already the cosine-sim from Qdrant)
-              as the query-chunk similarity — zero re-embedding for that step.
-              Only embeds chunks for inter-chunk similarity (the part MMR
-              actually needs embeddings for), saving the query embed entirely.
+    MMR optimization: the original implementation re-embedded all chunk
+    texts and the query on every call (~3s overhead). The fixed version
+    uses chunk.relevance_score (already the cosine-sim from Qdrant) as
+    the query-chunk similarity term. Only inter-chunk similarity requires
+    embeddings, and pre-fetched Qdrant vectors cover that at zero cost.
 
-Cross-encoder flow:
-    retrieve top RERANKER_COARSE_TOP_K (e.g. 10)
-        → cross-encoder scores all (query, chunk) pairs
-        → returns top_k with updated relevance_score
-        → MMR applied on top_k for diversity (fast, pre-computed embeddings)
+Chain of Responsibility:
+    Called by BaseRAG.rank() after BaseRetriever.retrieve()
+    → returns reranked list[RetrievedChunk] to BaseRAG.assemble_context().
+
+Dependencies:
+    numpy
+    rag.models.rag_response (RetrievedChunk)
 """
 
 import asyncio
@@ -35,15 +39,15 @@ _DEFAULT_MMR_LAMBDA = 0.7
 
 
 class ContextRanker:
-    """
-    Post-retrieval reranking with pluggable strategies.
+    """Post-retrieval reranker with pluggable MMR and cross-encoder strategies.
 
     Attributes:
-        _strategy:      Default reranking strategy.
-        _mmr_lambda:    Relevance-diversity tradeoff for MMR (0.0-1.0).
-        _embeddings_fn: Callable returning the embedding model (for MMR).
-        _reranker:      Optional CrossEncoderReranker instance.
-        _top_k:         Final number of chunks to return.
+        _strategy: Default reranking strategy name.
+        _mmr_lambda: Relevance-diversity tradeoff for MMR (0.0–1.0).
+            Higher values favour relevance; lower values favour diversity.
+        _embeddings_fn: Callable returning the embedding model (for MMR fallback).
+        _reranker: Optional CrossEncoderReranker instance.
+        _top_k: Final number of chunks to return after reranking.
     """
 
     def __init__(
@@ -54,6 +58,20 @@ class ContextRanker:
         reranker: object | None = None,
         top_k: int = 5,
     ) -> None:
+        """Initialize the context ranker.
+
+        Args:
+            strategy: Default reranking strategy ('none', 'mmr', 'cross_encoder').
+            mmr_lambda: Relevance-diversity tradeoff for MMR. Must be 0.0–1.0.
+            embeddings_fn: Callable returning the embedding model. Required for
+                MMR when pre-fetched vectors are unavailable.
+            reranker: Optional CrossEncoderReranker instance for cross_encoder
+                strategy. If None and cross_encoder is requested, falls back to MMR.
+            top_k: Number of chunks to return after reranking.
+
+        Raises:
+            ValueError: If mmr_lambda is outside the range 0.0–1.0.
+        """
         if not (0.0 <= mmr_lambda <= 1.0):
             raise ValueError(f"mmr_lambda must be 0.0-1.0, got {mmr_lambda}")
 
@@ -71,17 +89,15 @@ class ContextRanker:
             "enabled" if reranker else "disabled",
         )
 
-    # ------------------------------------------------------------------
     # Public API
-    # ------------------------------------------------------------------
 
     @property
     def retrieval_top_k(self) -> int:
         """How many chunks to fetch from the vector store before reranking.
 
         For cross_encoder: returns RERANKER_COARSE_TOP_K (e.g. 10) so the
-        reranker has enough candidates to work with.
-        For all other strategies: returns the final top_k directly.
+        reranker has enough candidates to score accurately.
+        For all other strategies: returns the configured final top_k.
         """
         if self._strategy == "cross_encoder" and self._reranker is not None:
             from config.settings import settings
@@ -94,16 +110,16 @@ class ContextRanker:
         query: str,
         strategy: str | None = None,
     ) -> List[RetrievedChunk]:
-        """
-        Rerank chunks using the configured strategy.
+        """Rerank chunks using the configured or overridden strategy.
 
         Args:
-            chunks:   Retrieved chunks ordered by Qdrant score.
-            query:    Original query string.
-            strategy: Override default strategy for this call.
+            chunks: Retrieved chunks ordered by Qdrant score.
+            query: Original query string used for relevance scoring.
+            strategy: Per-call strategy override. Falls back to the
+                instance default when None.
 
         Returns:
-            Reranked list — same chunks, different order / scores.
+            Reranked list — same chunks, potentially different order and scores.
         """
         if not chunks:
             return []
@@ -124,11 +140,10 @@ class ContextRanker:
         logger.warning("Unknown strategy '%s', falling back to none", active)
         return self._rank_none(chunks)
 
-    # ------------------------------------------------------------------
     # Strategies
-    # ------------------------------------------------------------------
 
     def _rank_none(self, chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
+        """Pass-through — return chunks in the original retrieval order."""
         logger.info("Rerank=none | chunks=%d | order preserved", len(chunks))
         return chunks
 
@@ -137,12 +152,20 @@ class ContextRanker:
         chunks: List[RetrievedChunk],
         query: str,
     ) -> List[RetrievedChunk]:
-        """
-        Cross-encoder rerank → MMR for diversity.
+        """Cross-encoder rerank followed by MMR for diversity.
 
         Step 1: Cross-encoder scores all (query, chunk) pairs and returns
-                top_k with updated relevance_score.
-        Step 2: MMR on top_k to remove near-duplicate chunks.
+                top_k chunks with updated relevance_score values.
+        Step 2: MMR on the top_k result to remove near-duplicate chunks.
+
+        Falls back to MMR-only when no reranker is injected.
+
+        Args:
+            chunks: Retrieved chunks to rerank.
+            query: Query string for the cross-encoder.
+
+        Returns:
+            Reranked and diversified chunk list.
         """
         if self._reranker is None:
             logger.warning(
@@ -151,12 +174,12 @@ class ContextRanker:
             )
             return await self._rank_mmr(chunks, query)
 
-        # Step 1 — cross-encoder: run in thread (CPU-bound)
+        # Run in a thread — cross-encoder inference is CPU-bound
         reranked = await asyncio.to_thread(
             self._reranker.rerank, query, chunks, self._top_k
         )
 
-        # Step 2 — MMR for diversity on the already-reranked small set
+        # Apply MMR for diversity on the already-reranked small set
         if len(reranked) > 1:
             reranked = await self._rank_mmr(reranked, query)
 
@@ -167,20 +190,24 @@ class ContextRanker:
         chunks: List[RetrievedChunk],
         query: str,
     ) -> List[RetrievedChunk]:
-        """
-        Maximal Marginal Relevance reranking.
+        """Maximal Marginal Relevance reranking.
 
-        MMR bug fix — what changed vs original:
-            BEFORE: embed_documents(chunks + [query]) → re-embeds everything
-                    from scratch on every query call (~3 seconds wasted).
-            AFTER:  chunk.relevance_score IS the cosine-sim to the query
-                    (already computed by Qdrant). Use it directly.
-                    Only embed chunk texts for inter-chunk similarity.
-                    This eliminates the query re-embedding entirely and
-                    uses pre-existing Qdrant scores for the relevance term.
+        Uses chunk.relevance_score as the query-chunk similarity term
+        (already computed by Qdrant as cosine similarity during retrieval).
+        Only inter-chunk similarity requires embeddings, which are sourced
+        from pre-fetched Qdrant vectors when available, eliminating the
+        costly re-embedding step that the original implementation performed.
 
-        Falls back to no reranking if neither pre-fetched vectors nor
-        an embeddings_fn is available.
+        Falls back to pass-through when neither pre-fetched vectors nor an
+        embeddings_fn is available.
+
+        Args:
+            chunks: Chunks to rerank via MMR.
+            query: Query string (unused directly — relevance comes from
+                chunk.relevance_score set during retrieval).
+
+        Returns:
+            MMR-reranked chunk list.
         """
         has_vectors = bool(chunks) and chunks[0].vector is not None
 
@@ -192,7 +219,7 @@ class ContextRanker:
             return self._rank_none(chunks)
 
         try:
-            # ── Relevance term: use Qdrant cosine-sim scores directly ───
+            # Relevance term: use Qdrant cosine-sim scores directly.
             # relevance_score is already the cosine similarity between the
             # query vector and each chunk vector, computed during retrieval.
             relevance_scores = np.array(
@@ -200,7 +227,7 @@ class ContextRanker:
             )
 
             if has_vectors:
-                # ── FAST PATH: use pre-fetched Qdrant vectors (0ms) ─────
+                # Fast path: use pre-fetched Qdrant vectors (0ms overhead).
                 # Vectors were returned by similarity_search_with_vectors()
                 # alongside the search results — no re-embedding needed.
                 chunk_embeddings = np.array(
@@ -212,8 +239,8 @@ class ContextRanker:
                     len(chunks),
                 )
             else:
-                # ── FALLBACK: embed chunk texts (slower path) ────────────
-                # Used when chunks come from a non-Qdrant source or from
+                # Fallback: embed chunk texts when pre-fetched vectors are absent.
+                # Triggered when chunks come from a non-Qdrant source or from
                 # code paths that don't carry pre-fetched vectors.
                 embeddings_model = self._embeddings_fn()
                 chunk_texts = [chunk.content for chunk in chunks]
@@ -222,7 +249,7 @@ class ContextRanker:
                 )
                 chunk_embeddings = np.array(chunk_embeddings_raw, dtype=np.float32)
 
-            # Run MMR selection
+            # Run greedy MMR selection
             selected_indices = self._mmr_select(
                 relevance_scores=relevance_scores,
                 chunk_embeddings=chunk_embeddings,
@@ -242,9 +269,7 @@ class ContextRanker:
             logger.warning("MMR failed, falling back to none | error=%s", exc)
             return self._rank_none(chunks)
 
-    # ------------------------------------------------------------------
     # MMR core algorithm
-    # ------------------------------------------------------------------
 
     def _mmr_select(
         self,
@@ -252,17 +277,28 @@ class ContextRanker:
         chunk_embeddings: np.ndarray,
         n_results: int,
     ) -> list[int]:
-        """
-        Greedy MMR selection.
+        """Greedy MMR selection returning chunk indices in ranked order.
 
-        score(d) = lambda * relevance(d, query)
-                 - (1-lambda) * max_sim(d, already_selected)
+        Selects chunks to maximise:
+            score(d) = lambda * relevance(d, query)
+                     - (1 - lambda) * max_sim(d, already_selected)
+
+        The first pick is the highest-relevance chunk. Each subsequent
+        pick trades off relevance against similarity to already-chosen chunks.
+
+        Args:
+            relevance_scores: Per-chunk cosine similarity to the query.
+            chunk_embeddings: Per-chunk embedding vectors for inter-chunk sim.
+            n_results: Maximum number of chunks to select.
+
+        Returns:
+            List of selected chunk indices in MMR rank order.
         """
         n_chunks = len(relevance_scores)
         selected: list[int] = []
         remaining = list(range(n_chunks))
 
-        # First pick: highest relevance
+        # First pick: highest relevance, no diversity penalty yet
         best_idx = int(np.argmax(relevance_scores))
         selected.append(best_idx)
         remaining.remove(best_idx)
@@ -277,7 +313,7 @@ class ContextRanker:
             for candidate in remaining:
                 relevance = float(relevance_scores[candidate])
 
-                # Diversity: penalise similarity to already-selected chunks
+                # Penalise similarity to already-selected chunks
                 max_sim = max(
                     self._cosine_similarity(
                         chunk_embeddings[candidate], chunk_embeddings[sel]
@@ -299,11 +335,18 @@ class ContextRanker:
 
         return selected
 
-    # ------------------------------------------------------------------
     # Similarity helpers
-    # ------------------------------------------------------------------
 
     def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Compute cosine similarity between two vectors.
+
+        Args:
+            a: First embedding vector.
+            b: Second embedding vector.
+
+        Returns:
+            Cosine similarity in range [-1.0, 1.0]. Returns 0.0 for zero vectors.
+        """
         norm_a = np.linalg.norm(a)
         norm_b = np.linalg.norm(b)
         if norm_a == 0 or norm_b == 0:

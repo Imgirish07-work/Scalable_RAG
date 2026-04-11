@@ -1,28 +1,36 @@
 """
-TTL classifier — assigns cache TTL based on query type.
+Keyword-based classifier that assigns cache TTL by query type.
 
-Different query types have vastly different staleness profiles:
-    Factual/time-sensitive  → short TTL (1-4 hours)
-    Conceptual/educational  → long TTL (24 hours)
-    Code generation         → medium TTL (12 hours)
-    Summarization           → longest TTL (7 days)
-    Default                 → settings.CACHE_TTL_SECONDS (1 hour)
+Design:
+    Different query types have vastly different staleness profiles, so
+    a single global TTL would either under-cache stable knowledge or
+    over-cache volatile facts. This module uses pre-compiled regex
+    patterns to classify each query into one of seven types, each with
+    its own TTL value.
 
-Classification is keyword-based — fast, deterministic, no LLM call.
-Covers 90%+ of real queries. Edge cases fall to the safe default TTL.
+    Classification is pure regex — fast (~0.01ms), deterministic, zero
+    LLM cost. Covers 90%+ of real queries. Edge cases fall to the safe
+    DEFAULT TTL (1 hour).
 
-Sync — pure CPU, zero I/O (Rule 2).
+    TTL map:
+        FACTUAL       → 1 hour   (volatile: prices, scores, versions)
+        CONCEPTUAL    → 24 hours (stable knowledge)
+        CODE          → 12 hours (library APIs change)
+        SUMMARIZATION → 7 days   (source document doesn't change)
+        TRANSLATION   → 7 days   (stable)
+        CREATIVE      → 3 days   (creative outputs are unique)
+        DEFAULT       → 1 hour   (safe fallback)
 
-Usage:
-    classifier = TTLClassifier(default_ttl=3600)
-    ttl = classifier.classify("What is the latest Python version?")
-    # → 3600 (factual, short TTL)
+    Pattern priority: more specific patterns (code, summarization) are
+    checked before broader ones (factual, conceptual) to prevent
+    misclassification.
 
-    ttl = classifier.classify("Explain how transformers work")
-    # → 86400 (conceptual, 24h TTL)
+Chain of Responsibility:
+    Instantiated by CacheManager. Called by CacheManager.set() to
+    determine the TTL for each new cache entry before writing to L1/L2.
 
-    ttl = classifier.classify("Summarize this document")
-    # → 604800 (summarization, 7 days)
+Dependencies:
+    re, enum (stdlib only)
 """
 
 import re
@@ -46,9 +54,7 @@ class QueryType(str, Enum):
     DEFAULT = "default"
 
 
-# ──────────────────────────────────────────────────
 # TTL values in seconds
-# ──────────────────────────────────────────────────
 
 TTL_MAP: dict[QueryType, int] = {
     QueryType.FACTUAL: 3_600,           # 1 hour — goes stale quickly
@@ -61,10 +67,7 @@ TTL_MAP: dict[QueryType, int] = {
 }
 
 
-# ──────────────────────────────────────────────────
-# Keyword patterns per query type
-# ──────────────────────────────────────────────────
-
+# Keyword patterns per query type.
 # Compiled once at module load — zero cost per classify() call.
 # Order matters: patterns are checked top-to-bottom, first match wins.
 
@@ -157,7 +160,8 @@ _CREATIVE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Ordered list — first match wins. More specific patterns first.
+# Ordered list — first match wins. More specific patterns checked first
+# to prevent broad conceptual patterns from masking code/summarization.
 _CLASSIFICATION_RULES: list[tuple[re.Pattern, QueryType]] = [
     (_CODE_PATTERN, QueryType.CODE),
     (_SUMMARIZATION_PATTERN, QueryType.SUMMARIZATION),
@@ -175,8 +179,8 @@ class TTLClassifier:
     Falls back to default TTL for unrecognized query patterns.
 
     Attributes:
-        _default_ttl: Fallback TTL in seconds.
-        _ttl_overrides: Optional custom TTL map (overrides defaults).
+        _default_ttl: Fallback TTL in seconds for unclassified queries.
+        _ttl_map: Active TTL map (TTL_MAP merged with any overrides).
     """
 
     def __init__(
@@ -197,6 +201,7 @@ class TTLClassifier:
         if ttl_overrides:
             self._ttl_map.update(ttl_overrides)
 
+        # Ensure the DEFAULT bucket always reflects the caller's default_ttl
         self._ttl_map[QueryType.DEFAULT] = default_ttl
 
         logger.info(
@@ -210,8 +215,6 @@ class TTLClassifier:
 
         Runs keyword patterns in priority order. First match wins.
         Returns QueryType.DEFAULT if no pattern matches.
-
-        Sync — pure regex, ~0.01ms per call.
 
         Args:
             query: Raw user query.

@@ -1,3 +1,19 @@
+"""
+gRPC vs HTTP probe and latency benchmark for Qdrant.
+
+Test scope:
+    Connectivity probe — attempts gRPC (port 6334) then falls back to HTTP.
+    If gRPC succeeds, benchmarks 10 get_collections() calls for each transport
+    and prints average latency. If gRPC fails, benchmarks HTTP only.
+
+Flow:
+    gRPC probe → HTTP probe → benchmark (10 calls each, after warmup) → summary.
+
+Dependencies:
+    Qdrant cluster URL and API key from settings (QDRANT_URL, QDRANT_API_KEY).
+    qdrant-client installed. Network access to the Qdrant cluster.
+"""
+
 import time
 from qdrant_client import QdrantClient
 from config.settings import settings
@@ -9,7 +25,7 @@ KEY  = settings.qdrant_api_key
 print(f"Cluster : {HOST}")
 print(f"gRPC port: 6334\n")
 
-# ── gRPC probe ────────────────────────────────────────────────────────────────
+# gRPC probe
 grpc_available = False
 grpc_client = None
 
@@ -29,13 +45,13 @@ except Exception as e:
     print(f"[gRPC] FAILED — {type(e).__name__}: {e}")
     print("[gRPC] Falling back to HTTP\n")
 
-# ── HTTP probe ────────────────────────────────────────────────────────────────
+# HTTP probe
 print("[HTTP] Connecting...")
 http_client = QdrantClient(url=URL, api_key=KEY)
 result = http_client.get_collections()
 print(f"[HTTP] Connected — collections: {[c.name for c in result.collections]}\n")
 
-# ── Benchmark (only if gRPC succeeded) ───────────────────────────────────────
+# Benchmark (only if gRPC succeeded)
 if grpc_available:
     print("Benchmarking 10 calls each (after warmup)...\n")
     for label, client in [("HTTP", http_client), ("gRPC", grpc_client)]:

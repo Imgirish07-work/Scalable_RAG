@@ -1,11 +1,23 @@
-"""Result verifier — quality checks on sub-query results.
+"""
+Result verifier — quality checks on sub-query results.
 
-Two verification modes:
-  - Heuristic (default): fast, zero LLM calls, checks basic quality signals.
-  - LLM-verified: one LLM call per sub-query result for deeper relevance check.
+Design:
+    Two verification modes:
+      - Heuristic (default): free, zero LLM calls, checks length,
+        confidence, and known non-answer phrases.
+      - LLM-verified: one LLM call per sub-query result for a deeper
+        relevance check. Enabled via use_llm=True.
+    Heuristic mode is the production default; LLM mode is for high-stakes
+    queries where the extra cost is justified.
+    Failures in either mode downgrade the result to success=False rather
+    than raising — partial failures are normal and handled by the synthesizer.
 
-Heuristic mode is the production default. LLM mode is available for
-high-stakes queries where the extra cost is justified.
+Chain of Responsibility:
+    AgentOrchestrator.execute() → ResultVerifier.verify()
+    → (optional) LLM call per result → List[SubQueryResult] returned.
+
+Dependencies:
+    agents.prompts.agent_prompt_templates, llm.contracts.base_llm
 """
 
 # stdlib
@@ -21,11 +33,11 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# heuristic thresholds
+# Heuristic thresholds
 _MIN_ANSWER_LENGTH = 20
 _MIN_CONFIDENCE = 0.3
 
-# phrases that indicate non-answers
+# Phrases that indicate the LLM could not answer — treat as non-answers.
 _NON_ANSWER_PATTERNS = [
     "i don't know",
     "i cannot",
@@ -83,7 +95,7 @@ class ResultVerifier:
         verified = []
         for result in results:
             if not result.success:
-                # already failed — pass through
+                # Already failed — pass through without re-checking.
                 verified.append(result)
                 continue
 
@@ -92,7 +104,7 @@ class ResultVerifier:
             if is_adequate:
                 verified.append(result)
             else:
-                # downgrade to failed
+                # Downgrade to failed so the synthesizer can note the gap.
                 logger.warning(
                     "Sub-query '%s' failed verification: answer too weak",
                     result.sub_query_id,
@@ -127,11 +139,11 @@ class ResultVerifier:
         Returns:
             True if the result is adequate.
         """
-        # heuristic checks (always run, zero cost)
+        # Heuristic checks are always run — zero cost.
         if not self._heuristic_check(result):
             return False
 
-        # LLM check (optional, costs one call)
+        # LLM check is optional — costs one call per result.
         if self._use_llm:
             return await self._llm_check(result)
 
@@ -146,7 +158,7 @@ class ResultVerifier:
         Returns:
             True if the result passes all heuristic checks.
         """
-        # check 1 — answer is not empty or too short
+        # Check 1 — answer must meet minimum length.
         if len(result.answer.strip()) < _MIN_ANSWER_LENGTH:
             logger.debug(
                 "Sub-query '%s' failed: answer too short (%d chars)",
@@ -154,7 +166,7 @@ class ResultVerifier:
             )
             return False
 
-        # check 2 — confidence above minimum
+        # Check 2 — confidence must be above minimum threshold.
         if result.confidence < _MIN_CONFIDENCE:
             logger.debug(
                 "Sub-query '%s' failed: confidence %.3f below threshold %.3f",
@@ -162,7 +174,7 @@ class ResultVerifier:
             )
             return False
 
-        # check 3 — answer is not a non-answer
+        # Check 3 — reject known non-answer phrases.
         answer_lower = result.answer.lower()
         for pattern in _NON_ANSWER_PATTERNS:
             if pattern in answer_lower:
@@ -205,6 +217,7 @@ class ResultVerifier:
             return _parse_verification_response(response.text)
 
         except Exception:
+            # Verification failure must not discard a potentially good result.
             logger.exception(
                 "LLM verification failed for sub-query '%s', defaulting to pass",
                 result.sub_query_id,
@@ -216,7 +229,7 @@ def _parse_verification_response(text: str) -> bool:
     """Parse the LLM verification response.
 
     Expects JSON with an "is_adequate" boolean field. Falls back
-    to True if parsing fails — conservative default.
+    to True if parsing fails — conservative default preserves results.
 
     Args:
         text: Raw LLM response text.
@@ -226,7 +239,7 @@ def _parse_verification_response(text: str) -> bool:
     """
     cleaned = text.strip()
 
-    # try direct parse
+    # Try direct parse first, then strip markdown fences.
     parsed = _try_json_parse(cleaned)
     if parsed is None:
         stripped = re.sub(r"^```(?:json)?\s*", "", cleaned)

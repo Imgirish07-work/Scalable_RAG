@@ -1,21 +1,28 @@
 """
-Quality gate — filters out bad LLM responses before caching.
+Quality gate that filters out poor LLM responses before caching.
 
-Prevents cache poisoning by rejecting responses that are:
-    - Empty or whitespace-only text
-    - Too few completion tokens (likely errors, refusals, or truncated)
-    - Suspiciously fast (likely API errors returning instantly)
+Design:
+    Prevents cache poisoning by rejecting responses that are likely
+    errors, refusals, or LLM non-answers. Three categories of rejection:
+        1. Empty or whitespace-only text
+        2. Too few completion tokens (truncated or error responses)
+        3. Suspiciously fast latency (instant API errors)
+        4. Negative response patterns (polite refusals, context misses)
 
-Runs on the write path ONLY — zero impact on read latency.
-All checks are sync CPU comparisons on fields already in LLMResponse.
+    Negative patterns block responses like "I don't have enough information"
+    from being cached. These are document-specific failures that would
+    poison every future cache hit for the matching query until TTL expires.
 
-Sync — pure CPU, zero I/O (Rule 2).
+    Runs on the write path only — zero impact on read latency.
+    All checks are sync CPU comparisons on fields already in LLMResponse.
 
-Usage:
-    gate = QualityGate(min_tokens=20, min_latency_ms=100.0)
-    passed, reason = gate.check(llm_response)
-    if not passed:
-        logger.info("Rejected: %s", reason)
+Chain of Responsibility:
+    Instantiated by CacheManager. Called by CacheManager.set() before
+    any write to L1, L2, or Qdrant. Rejection increments
+    CacheMetrics.quality_gate_rejections.
+
+Dependencies:
+    llm.models.llm_response (LLMResponse)
 """
 
 from typing import Optional
@@ -77,14 +84,13 @@ class QualityGate:
     def check(self, response: LLMResponse) -> tuple[bool, Optional[str]]:
         """Run all quality checks on an LLM response.
 
-        Returns (True, None) if the response passes all checks.
-        Returns (False, reason) if any check fails.
-
         Args:
             response: The LLMResponse to evaluate.
 
         Returns:
             Tuple of (passed: bool, reason: Optional[str]).
+            Returns (True, None) if all checks pass.
+            Returns (False, reason) if any check fails.
         """
         if not response.text or not response.text.strip():
             reason = "empty response text"

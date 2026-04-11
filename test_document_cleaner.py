@@ -1,7 +1,25 @@
+"""
+Unit tests for the DocumentCleaner component.
+
+Test scope:
+    Unit tests covering file-type detection, unsupported-type rejection,
+    file-not-found handling, text cleaning (unicode, hyphenation, boilerplate,
+    URL removal, whitespace), short-page filtering, real file loading (.txt
+    and .pdf), and metadata preservation.
+
+Flow:
+    Module-level execution — each Test N section runs sequentially; a failed
+    assert exits immediately via sys.exit(1).
+
+Dependencies:
+    DocumentCleaner, sample_docs directory (optional for file-load tests),
+    langchain_core Document.
+"""
+
 import os
 import sys
 
-# ── Corporate SSL fix ──────────────────────────────────────────────────────────
+# Corporate network SSL fix
 os.environ["HF_HUB_DISABLE_SSL_VERIFICATION"] = "1"
 os.environ["CURL_CA_BUNDLE"]                   = ""
 os.environ["REQUESTS_CA_BUNDLE"]               = ""
@@ -12,9 +30,7 @@ from chunking.document_cleaner import DocumentCleaner
 cleaner   = DocumentCleaner()
 SAMPLE_DIR = Path("data/sample_docs")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def section(title: str) -> None:
     print(f"\n{'='*60}")
@@ -28,9 +44,7 @@ def failed(msg: str) -> None:
     print(f"  ❌ {msg}")
     sys.exit(1)
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 1 — Supported file type detection
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 1 — File Type Detection")
 
@@ -41,9 +55,7 @@ for ext in supported:
     assert detected == ext, f"Expected {ext} got {detected}"
     passed(f"Detected: {ext}")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 2 — Unsupported file type raises ValueError
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 2 — Unsupported File Type")
 
@@ -53,9 +65,7 @@ try:
 except ValueError as e:
     passed(f"Raised ValueError correctly → {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 3 — File not found raises FileNotFoundError
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 3 — File Not Found")
 
@@ -65,9 +75,7 @@ try:
 except FileNotFoundError as e:
     passed(f"Raised FileNotFoundError correctly → {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 4 — clean_text() basic cleaning
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 4 — Text Cleaning")
 
@@ -107,9 +115,7 @@ result = cleaner._clean_text("   ")
 assert result == ""
 passed(f"Empty text     | whitespace only → returns empty string")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 5 — clean_documents() filters short pages
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 5 — Short Page Filtering")
 
@@ -125,9 +131,7 @@ result = cleaner._clean_documents([short_doc, normal_doc])
 assert len(result) == 1, f"Expected 1 doc, got {len(result)}"
 passed(f"Short page filtered | kept={len(result)}/2 pages")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 6 — Load real .txt file
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 6 — Load Real .txt File")
 
@@ -142,9 +146,7 @@ else:
     passed(f"Loaded {len(docs)} page(s) | file={txt_files[0].name}")
     print(f"     Preview → {docs[0].page_content[:100]}...")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 7 — Load real .pdf file
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 7 — Load Real .pdf File")
 
@@ -160,9 +162,7 @@ else:
     print(f"     Preview → {docs[0].page_content[:100]}...")
     print(f"     Metadata → {docs[0].metadata}")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 8 — Metadata preserved after cleaning
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 8 — Metadata Preserved")
 
@@ -176,9 +176,7 @@ assert result[0].metadata["page"]   == 1
 assert result[0].metadata["author"] == "test_user"
 passed("Metadata fully preserved after cleaning")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Summary
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("All Tests Passed ✅")
 print("  DocumentCleaner is working correctly\n")

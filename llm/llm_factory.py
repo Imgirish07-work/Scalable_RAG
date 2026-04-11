@@ -1,16 +1,21 @@
 """
-Factory for creating LLM provider instances.
+Factory for creating and configuring LLM provider instances.
 
 Design:
-    - Pipeline calls LLMFactory.create() — never imports providers directly.
-    - Registry dict maps provider name → provider class.
-    - Adding a new provider = 1 line in _registry, nothing else changes.
-    - register() allows runtime provider registration for plugins and tests.
+    Class-level registry pattern. The registry dict maps provider name strings
+    to their concrete BaseLLM subclasses. Adding a new provider requires only
+    one registry entry — no other code changes. All public methods are
+    classmethods so no factory instantiation is needed at the call site.
 
-Usage:
-    llm = LLMFactory.create("openai")
-    llm = LLMFactory.create("gemini", temperature=0.7)
-    llm = LLMFactory.create_from_settings()   # reads .env defaults
+Chain of Responsibility:
+    Pipeline calls LLMFactory.create() or create_from_settings() →
+    factory instantiates the concrete provider → wraps it in LLMRateLimiter
+    when enabled → returns BaseLLM to RAGPipeline.configure_llm().
+
+Dependencies:
+    llm.contracts.base_llm, llm.providers.*, llm.exceptions.llm_exceptions,
+    llm.rate_limiter (LLMRateLimiter, get_rate_limit_config),
+    config.settings, utils.logger.
 """
 
 from typing import Optional
@@ -28,16 +33,15 @@ logger = get_logger(__name__)
 
 
 class LLMFactory:
-    """Factory for creating LLM provider instances.
+    """Creates and configures LLM provider instances from a registry.
 
-    Class-level registry maps provider names to their implementation classes.
-    All public methods are classmethods — no instantiation needed.
+    All methods are classmethods — no instantiation of LLMFactory is needed.
 
     Attributes:
-        _registry: Dict mapping provider name → BaseLLM subclass.
+        _registry: Maps provider name strings to their BaseLLM subclasses.
     """
 
-    # Registry — single source of truth for all providers
+    # Single source of truth for all registered providers
     _registry: dict[str, type[BaseLLM]] = {
         "openai": OpenAIProvider,
         "gemini": GeminiProvider,
@@ -56,21 +60,21 @@ class LLMFactory:
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
     ) -> BaseLLM:
-        """Create and return an LLM provider instance.
+        """Create and return a raw (non-rate-limited) LLM provider instance.
 
-        Only passes explicitly-provided overrides to the provider constructor.
-        The provider's __init__ falls back to settings for anything not passed.
+        Only passes explicitly-provided overrides to the constructor.
+        The provider's __init__ falls back to settings for any unset parameter.
 
         Args:
-            provider_name: Provider to create e.g. 'openai' or 'gemini'.
-            api_key: Optional override for API key.
-            model: Optional override for model name.
-            temperature: Optional override for sampling temperature.
-            max_tokens: Optional override for max output tokens.
-            timeout: Optional override for request timeout.
+            provider_name: Provider to create e.g. 'openai', 'gemini', 'groq'.
+            api_key: Optional API key override.
+            model: Optional model name override.
+            temperature: Optional sampling temperature override.
+            max_tokens: Optional max output tokens override.
+            timeout: Optional request timeout override in seconds.
 
         Returns:
-            BaseLLM instance — always returns the contract, never a concrete class.
+            BaseLLM instance — always the contract type, never a concrete class.
 
         Raises:
             LLMProviderError: If provider_name is empty or not in the registry.
@@ -100,13 +104,12 @@ class LLMFactory:
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
     ) -> BaseLLM:
-        """Create provider and wrap with per-model rate limiter.
+        """Create a provider and wrap it with the per-model rate limiter.
 
-        Single call that handles both creation and rate limiting — prevents
+        Single call that handles both creation and rate limiting, preventing
         any code path from accidentally using an unthrottled raw provider.
-
-        Rate limiting is skipped when LLM_RATE_LIMITER_ENABLED=False (tests,
-        local dev) but active by default in all other contexts.
+        Rate limiting is skipped when LLM_RATE_LIMITER_ENABLED=False
+        (used in tests and local dev).
 
         Args:
             provider_name: Provider name e.g. 'groq', 'gemini', 'openai'.
@@ -117,7 +120,8 @@ class LLMFactory:
             timeout: Optional request timeout override.
 
         Returns:
-            LLMRateLimiter-wrapped BaseLLM when enabled, raw provider otherwise.
+            LLMRateLimiter-wrapped BaseLLM when rate limiting is enabled,
+            raw provider BaseLLM otherwise.
         """
         provider = cls.create(
             provider_name=provider_name,
@@ -142,10 +146,10 @@ class LLMFactory:
 
     @classmethod
     def create_from_settings(cls) -> BaseLLM:
-        """Create rate-limited provider from default_provider setting.
+        """Create a rate-limited provider from the default_provider setting.
 
         Always returns a rate-limited provider when LLM_RATE_LIMITER_ENABLED
-        is True — no manual wrapping needed at the call site.
+        is True — no manual wrapping is needed at the call site.
 
         Returns:
             Rate-limited BaseLLM configured from settings.
@@ -164,9 +168,9 @@ class LLMFactory:
 
     @classmethod
     def available_providers(cls) -> list[str]:
-        """Return list of all registered provider names.
+        """Return all registered provider names sorted alphabetically.
 
-        Useful for validation, logging, health checks, and CLI help text.
+        Useful for validation, health checks, and CLI help text.
 
         Returns:
             Sorted list of provider name strings.
@@ -178,11 +182,11 @@ class LLMFactory:
         """Register a new provider at runtime.
 
         Allows external plugins or test mocks to add providers without
-        modifying the factory source code.
+        modifying the factory source. Validates that the class implements BaseLLM.
 
         Args:
-            provider_name: Unique name string e.g. 'anthropic'.
-            provider_class: Class that implements BaseLLM.
+            provider_name: Unique identifier string e.g. 'anthropic'.
+            provider_class: Class that subclasses BaseLLM.
 
         Raises:
             LLMProviderError: If provider_class does not subclass BaseLLM.
@@ -200,16 +204,16 @@ class LLMFactory:
 
     @classmethod
     def _validate_provider(cls, provider_name: str) -> str:
-        """Validate that provider name exists in the registry.
+        """Validate the provider name and return its cleaned lowercase form.
 
         Args:
-            provider_name: Raw provider name string.
+            provider_name: Raw provider name string from the caller.
 
         Returns:
             Cleaned lowercase provider name.
 
         Raises:
-            LLMProviderError: If provider name is empty or not registered.
+            LLMProviderError: If provider_name is empty or not in the registry.
         """
         if not provider_name or not provider_name.strip():
             raise LLMProviderError(
@@ -236,9 +240,10 @@ class LLMFactory:
         max_tokens: Optional[int],
         timeout: Optional[float],
     ) -> dict:
-        """Build kwargs dict with only explicitly-provided overrides.
+        """Build a kwargs dict containing only explicitly-provided overrides.
 
-        Provider __init__ falls back to settings for anything not in this dict.
+        Excludes None values so the provider's __init__ falls back to settings
+        for any parameter not explicitly set by the caller.
 
         Args:
             api_key: Optional API key override.

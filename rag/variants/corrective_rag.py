@@ -1,47 +1,34 @@
 """
-CorrectiveRAG — retrieval quality evaluation with query rewrite retry.
+CorrectiveRAG — retrieval quality evaluation with query rewrite and retry.
 
 Design:
-    - Overrides retrieve() to add a post-retrieval relevance evaluation
-      branch. This is the ONLY variant that questions whether retrieval
-      actually worked before sending results to the LLM.
-    - After initial retrieval, each chunk is scored for relevance via
-      a lightweight LLM call. The average score determines the branch:
-        - score >= PASS threshold (0.7)  → accept chunks, proceed
-        - score >= RETRY threshold (0.4) → rewrite query, retry once
-        - score < RETRY threshold        → flag as low_confidence
-    - Maximum 1 retry to prevent infinite loops and unbounded cost.
-    - Overrides _compute_confidence() to use the relevance evaluation
-      scores instead of raw retrieval cosine similarity — more accurate
-      because the LLM evaluates semantic relevance, not just embedding
-      distance.
+    Overrides retrieve() to add a post-retrieval relevance evaluation branch.
+    This is the only variant that verifies retrieval quality before sending
+    results to the LLM. After initial retrieval, each of the top N chunks is
+    scored for relevance via a lightweight LLM call. The average score drives
+    three branches:
+        - score >= pass_threshold (0.7)  → accept, proceed to rank
+        - score >= retry_threshold (0.4) → rewrite query, retry once
+        - score < retry_threshold        → flag low_confidence, proceed anyway
 
-Cost analysis:
-    - Best case: 1 retrieval + N eval LLM calls + 1 generation = N+2 calls
-    - Worst case (retry): 2 retrievals + 2×N eval calls + 1 rewrite + 1 gen = 2N+4 calls
-    - Where N = number of chunks evaluated (default: top_k from config)
-    - Optimization: evaluate only top 3 chunks instead of all top_k to
-      reduce eval cost. If top 3 are irrelevant, the rest likely are too.
+    Maximum one retry prevents infinite loops and unbounded cost. Overrides
+    _compute_confidence() to use LLM-evaluated relevance scores instead of
+    raw cosine similarity, which is a more accurate signal.
 
-When to use:
-    - High-stakes queries (financial, medical, legal, compliance)
-    - Domains where retrieval often returns similar-but-wrong chunks
-    - When confidence in the answer matters more than latency
+    Cost (N = evaluated chunks, default N=3):
+        Best case:  1 retrieval + N eval LLM calls + 1 generation = N+2 calls
+        Worst case: 2 retrievals + 2N eval calls + 1 rewrite + 1 gen = 2N+4 calls
 
-Pipeline flow:
-    1. Cache check          → inherited from BaseRAG
-    2. pre_process()        → inherited from BaseRAG
-    3. retrieve()           → ★ OVERRIDDEN: retrieve + evaluate + maybe retry
-    4. rank()               → inherited (MMR)
-    5. assemble_context()   → inherited (token-bounded)
-    6. generate()           → inherited (grounded LLM call)
-    7. Cache write          → inherited from BaseRAG
+Chain of Responsibility:
+    Created by RAGFactory → BaseRAG.query() calls retrieve()
+    → CorrectiveRAG.retrieve() → _evaluate_relevance() → maybe _retry_with_rewrite()
+    → returns list[RetrievedChunk] to the rank step.
 
-Integration:
-    - RELEVANCE_EVAL prompts from rag/prompts/rag_prompt_templates.py
-    - QUERY_REWRITE prompts from rag/prompts/rag_prompt_templates.py
-    - Settings: CRAG_RELEVANCE_THRESHOLD_PASS, CRAG_RELEVANCE_THRESHOLD_RETRY,
-      CRAG_MAX_RETRIES from config/settings.py
+Dependencies:
+    rag.base_rag (BaseRAG)
+    rag.prompts.rag_prompt_templates (build_relevance_eval_prompt, build_query_rewrite_prompt)
+    rag.exceptions.rag_exceptions (RAGRetrievalError)
+    config.settings (settings)
 """
 
 import json
@@ -64,35 +51,33 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Default thresholds — overridden by settings if available
+# Default thresholds — overridden by settings when available
 _DEFAULT_PASS_THRESHOLD = 0.7
 _DEFAULT_RETRY_THRESHOLD = 0.4
 _DEFAULT_MAX_RETRIES = 1
 
-# Number of top chunks to evaluate for relevance
-# Evaluating all top_k is expensive. Top 3 is a good proxy —
-# if the top 3 are irrelevant, the rest almost certainly are too.
+# Evaluate only the top N chunks — if the top 3 are irrelevant, the rest are too.
+# This caps eval cost without meaningfully reducing detection accuracy.
 _EVAL_CHUNK_COUNT = 3
 
 
 class CorrectiveRAG(BaseRAG):
-    """Corrective RAG — retrieval evaluation with query rewrite retry.
+    """Corrective RAG — retrieval quality evaluation with query rewrite retry.
 
-    Adds a relevance evaluation branch after retrieval. Catches the
-    most dangerous RAG failure mode: retrieval returns confident-looking
-    but irrelevant chunks, and the LLM generates a fluent, well-structured,
-    completely wrong answer.
+    Adds a relevance evaluation branch after retrieval to catch the most
+    dangerous RAG failure mode: retrieval returns confident-looking but
+    irrelevant chunks, causing the LLM to generate a fluent but wrong answer.
 
     Attributes:
-        _pass_threshold: Minimum average relevance to accept chunks.
-        _retry_threshold: Minimum average relevance to attempt retry.
-            Below this, chunks are flagged as low_confidence.
-        _max_retries: Maximum query rewrite + retry attempts.
-        _eval_chunk_count: Number of top chunks to evaluate.
-        _last_avg_relevance: Stores the relevance score from the most
-            recent evaluation for confidence computation.
-        _is_low_confidence: Flag set when relevance is below retry
-            threshold after all attempts exhausted.
+        _pass_threshold: Minimum average relevance to accept chunks without retry.
+        _retry_threshold: Minimum average relevance to attempt a query rewrite.
+            Below this, chunks are accepted but flagged as low_confidence.
+        _max_retries: Maximum query rewrite and retry attempts.
+        _eval_chunk_count: Number of top chunks to evaluate per retrieval.
+        _last_avg_relevance: Relevance score from the most recent evaluation.
+            Used by _compute_confidence() to report evaluation-based confidence.
+        _is_low_confidence: Set to True when relevance falls below the retry
+            threshold after all attempts. Read by BaseRAG._get_low_confidence_flag().
     """
 
     def __init__(
@@ -111,18 +96,18 @@ class CorrectiveRAG(BaseRAG):
 
         Args:
             retriever: Vector store retriever (dense or hybrid).
-            llm: LLM provider for generation, evaluation, and rewriting.
+            llm: LLM provider for generation, evaluation, and query rewriting.
             cache: Optional CacheManager.
             ranker: Optional ContextRanker.
             assembler: Optional ContextAssembler.
-            pass_threshold: Minimum relevance to accept chunks without retry.
+            pass_threshold: Minimum relevance to accept without retry.
                 Falls back to settings.CRAG_RELEVANCE_THRESHOLD_PASS.
-            retry_threshold: Minimum relevance to attempt query rewrite.
-                Below this, result is flagged low_confidence.
+            retry_threshold: Minimum relevance to attempt a query rewrite.
+                Below this, chunks are accepted but flagged low_confidence.
                 Falls back to settings.CRAG_RELEVANCE_THRESHOLD_RETRY.
-            max_retries: Maximum retry attempts. Falls back to
-                settings.CRAG_MAX_RETRIES.
-            eval_chunk_count: Number of top chunks to evaluate.
+            max_retries: Maximum retry attempts.
+                Falls back to settings.CRAG_MAX_RETRIES.
+            eval_chunk_count: Number of top chunks to evaluate per retrieval.
                 Default 3.
         """
         super().__init__(
@@ -150,7 +135,7 @@ class CorrectiveRAG(BaseRAG):
         )
         self._eval_chunk_count = eval_chunk_count or _EVAL_CHUNK_COUNT
 
-        # Per-query state — reset on each retrieve() call
+        # Per-query state — reset at the start of each retrieve() call
         self._last_avg_relevance = 0.0
         self._is_low_confidence = False
 
@@ -172,9 +157,7 @@ class CorrectiveRAG(BaseRAG):
         """
         return "corrective"
 
-    # ================================================================
-    # Override: retrieve() — the core corrective logic
-    # ================================================================
+    # Override: retrieve() — core corrective logic
 
     async def retrieve(
         self,
@@ -182,18 +165,18 @@ class CorrectiveRAG(BaseRAG):
         top_k: int,
         filters: list[MetadataFilter] | None = None,
     ) -> list[RetrievedChunk]:
-        """Retrieve with relevance evaluation and optional retry.
+        """Retrieve with relevance evaluation and optional query rewrite retry.
 
         Flow:
             1. Initial retrieval via the injected retriever.
-            2. Evaluate relevance of top N chunks via LLM.
+            2. Evaluate relevance of the top N chunks via LLM.
             3. Branch on average relevance score:
-               - >= pass_threshold → accept chunks
+               - >= pass_threshold  → accept, return chunks
                - >= retry_threshold → rewrite query, retry once
-               - < retry_threshold → flag low_confidence, return what we have
+               - < retry_threshold  → flag low_confidence, return what we have
 
         Args:
-            query: Processed query string.
+            query: Processed query string (output of pre_process).
             top_k: Maximum chunks to retrieve.
             filters: Optional metadata filters.
 
@@ -203,7 +186,7 @@ class CorrectiveRAG(BaseRAG):
         Raises:
             RAGRetrievalError: If initial retrieval fails.
         """
-        # Reset per-query state
+        # Reset per-query state before each retrieve call
         self._last_avg_relevance = 0.0
         self._is_low_confidence = False
 
@@ -217,7 +200,7 @@ class CorrectiveRAG(BaseRAG):
             self._is_low_confidence = True
             return chunks
 
-        # Step 2: Evaluate relevance
+        # Step 2: Evaluate relevance of top N chunks
         avg_relevance = await self._evaluate_relevance(query, chunks)
         self._last_avg_relevance = avg_relevance
 
@@ -231,7 +214,7 @@ class CorrectiveRAG(BaseRAG):
             return chunks
 
         if avg_relevance >= self._retry_threshold:
-            # Attempt query rewrite + retry
+            # Score is marginal — attempt query rewrite and retry
             return await self._retry_with_rewrite(
                 original_query=query,
                 top_k=top_k,
@@ -239,7 +222,7 @@ class CorrectiveRAG(BaseRAG):
                 attempt=1,
             )
 
-        # Below retry threshold — flag as low confidence
+        # Below retry threshold — flag as low confidence and proceed
         logger.warning(
             "CorrectiveRAG: relevance below retry threshold | "
             "score=%.3f < %.2f | flagging low_confidence",
@@ -249,37 +232,33 @@ class CorrectiveRAG(BaseRAG):
         self._is_low_confidence = True
         return chunks
 
-    # ================================================================
-    # Override: confidence uses evaluation scores, not retrieval scores
-    # ================================================================
+    # Override: use evaluation scores for confidence, not retrieval cosine similarity
 
     def _compute_confidence(
         self,
         chunks: list[RetrievedChunk],
         method: str = "retrieval",
     ) -> ConfidenceScore:
-        """Compute confidence from relevance evaluation scores.
+        """Compute confidence from LLM-evaluated relevance scores.
 
-        Overrides BaseRAG._compute_confidence() to use the LLM-based
-        relevance evaluation score instead of raw cosine similarity.
-        This is more accurate because the LLM evaluates semantic
-        relevance, not just embedding distance.
+        Overrides BaseRAG._compute_confidence() to use the LLM-evaluated
+        relevance score instead of raw cosine similarity. LLM evaluation
+        is more accurate because it assesses semantic relevance directly,
+        not just embedding distance.
 
         Args:
             chunks: Updated chunks with used_in_context flags.
-            method: Ignored — CorrectiveRAG always uses 'corrective_eval'.
+            method: Ignored — CorrectiveRAG always reports 'corrective_eval'.
 
         Returns:
-            ConfidenceScore with evaluation-based value.
+            ConfidenceScore with the evaluation-based relevance value.
         """
         return ConfidenceScore(
             value=round(self._last_avg_relevance, 4),
             method="corrective_eval",
         )
 
-    # ================================================================
     # Private: core corrective methods
-    # ================================================================
 
     async def _do_retrieval(
         self,
@@ -287,20 +266,21 @@ class CorrectiveRAG(BaseRAG):
         top_k: int,
         filters: list[MetadataFilter] | None,
     ) -> list[RetrievedChunk]:
-        """Execute a single retrieval call.
+        """Execute a single retrieval call via the injected retriever.
 
-        Thin wrapper for logging and error context.
+        Thin wrapper around the retriever for logging and consistent error
+        context. Used for both the initial retrieval and retry retrievals.
 
         Args:
-            query: Query string.
-            top_k: Maximum chunks.
+            query: Query string for this retrieval attempt.
+            top_k: Maximum chunks to retrieve.
             filters: Optional metadata filters.
 
         Returns:
             List of RetrievedChunk.
 
         Raises:
-            RAGRetrievalError: If retriever fails.
+            RAGRetrievalError: If the retriever fails.
         """
         logger.info(
             "CorrectiveRAG retrieving | query_len=%d | top_k=%d",
@@ -318,21 +298,20 @@ class CorrectiveRAG(BaseRAG):
         query: str,
         chunks: list[RetrievedChunk],
     ) -> float:
-        """Evaluate relevance of top chunks via LLM.
+        """Evaluate relevance of the top N chunks via LLM scoring.
 
-        Sends each of the top N chunks to the LLM with a relevance
-        scoring prompt. Returns the average score.
-
-        Only evaluates the top _eval_chunk_count chunks. If the top 3
-        are irrelevant, evaluating the rest is wasted tokens.
+        Sends each of the top _eval_chunk_count chunks to the LLM with
+        the relevance evaluation prompt and averages the returned scores.
+        Evaluating only the top N chunks caps cost — if the top 3 are
+        irrelevant, the rest almost certainly are too.
 
         Args:
             query: The user's query.
-            chunks: Retrieved chunks (ordered by retrieval score).
+            chunks: Retrieved chunks ordered by retrieval score.
 
         Returns:
-            Average relevance score (0.0-1.0). Returns 0.0 if all
-            evaluations fail.
+            Average relevance score (0.0–1.0). Returns 0.0 if all
+            individual evaluations fail.
         """
         eval_chunks = chunks[:self._eval_chunk_count]
         scores = []
@@ -374,18 +353,18 @@ class CorrectiveRAG(BaseRAG):
         chunk: RetrievedChunk,
         index: int,
     ) -> float | None:
-        """Evaluate a single chunk's relevance via LLM.
+        """Evaluate a single chunk's relevance via LLM scoring.
 
-        Sends the query + chunk to the LLM with the relevance eval
-        prompt. Parses the JSON response for the score.
+        Sends the query and chunk content to the LLM with the relevance
+        evaluation prompt. Parses the JSON response for the relevance score.
 
         Args:
             query: The user's query.
             chunk: Single RetrievedChunk to evaluate.
-            index: Chunk position for logging.
+            index: 0-based chunk position for log messages.
 
         Returns:
-            Relevance score (0.0-1.0), or None if evaluation fails.
+            Relevance score in range 0.0–1.0, or None if evaluation fails.
         """
         system_prompt, user_prompt = build_relevance_eval_prompt(
             query=query,
@@ -425,27 +404,28 @@ class CorrectiveRAG(BaseRAG):
             return None
 
     def _parse_relevance_score(self, text: str) -> float | None:
-        """Parse relevance score from LLM evaluation response.
+        """Parse a relevance score from the LLM evaluation response.
 
-        Expects JSON: {"relevance": 0.85, "reason": "..."}
-        Falls back to extracting any float from the response.
+        Expects JSON of the form {"relevance": 0.85, "reason": "..."}.
+        Falls back to scanning tokens for any float in range [0, 1]
+        when JSON parsing fails (handles malformed or markdown-fenced output).
 
-        This is a sync CPU-only function (Rule 2).
+        This is a synchronous CPU-only function — no I/O, no await needed.
 
         Args:
             text: Raw LLM response text.
 
         Returns:
-            Relevance score (0.0-1.0), or None if parsing fails.
+            Relevance score in range 0.0–1.0, or None if parsing fails.
         """
         if not text or not text.strip():
             return None
 
         cleaned = text.strip()
 
-        # Try JSON parsing first
+        # Primary: JSON parsing
         try:
-            # Handle markdown code fences
+            # Strip markdown code fences before parsing
             if cleaned.startswith("```"):
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
@@ -461,7 +441,7 @@ class CorrectiveRAG(BaseRAG):
         except (json.JSONDecodeError, ValueError, TypeError, KeyError):
             pass
 
-        # Fallback: extract any float from the text
+        # Fallback: scan tokens for any float in [0.0, 1.0]
         try:
             for token in cleaned.replace(",", " ").split():
                 token = token.strip("()[]{}\"'")
@@ -487,21 +467,21 @@ class CorrectiveRAG(BaseRAG):
         filters: list[MetadataFilter] | None,
         attempt: int,
     ) -> list[RetrievedChunk]:
-        """Rewrite the query and retry retrieval.
+        """Rewrite the query and retry retrieval once.
 
-        Uses the LLM to rewrite the original query for better
-        retrieval, then re-retrieves and re-evaluates. Maximum
-        one retry to bound cost and prevent infinite loops.
+        Uses the LLM to produce an improved query, re-retrieves, and
+        re-evaluates. Bounded by _max_retries to prevent infinite loops
+        and unbounded LLM cost.
 
         Args:
-            original_query: The query that produced low-relevance results.
-            top_k: Maximum chunks to retrieve.
+            original_query: The query that produced marginal-relevance results.
+            top_k: Maximum chunks to retrieve on retry.
             filters: Optional metadata filters.
             attempt: Current retry attempt number (1-based).
 
         Returns:
-            List of RetrievedChunk from retry, or original chunks
-            if retry doesn't improve results.
+            List of RetrievedChunk from the retry, or from a fresh retrieval
+            of the original query if retries are exhausted or rewrite fails.
         """
         if attempt > self._max_retries:
             logger.warning(
@@ -510,7 +490,7 @@ class CorrectiveRAG(BaseRAG):
                 attempt,
             )
             self._is_low_confidence = True
-            # Return whatever we had from the last attempt
+            # Return a fresh retrieval — the original chunks are not held in scope
             return await self._do_retrieval(original_query, top_k, filters)
 
         # Step 1: Rewrite the query
@@ -532,7 +512,7 @@ class CorrectiveRAG(BaseRAG):
             rewritten_query[:80],
         )
 
-        # Step 2: Retry retrieval with rewritten query
+        # Step 2: Retry retrieval with the rewritten query
         retry_chunks = await self._do_retrieval(rewritten_query, top_k, filters)
 
         if not retry_chunks:
@@ -542,7 +522,7 @@ class CorrectiveRAG(BaseRAG):
             self._is_low_confidence = True
             return retry_chunks
 
-        # Step 3: Re-evaluate relevance
+        # Step 3: Re-evaluate relevance against the original query
         retry_relevance = await self._evaluate_relevance(
             original_query, retry_chunks
         )
@@ -556,8 +536,8 @@ class CorrectiveRAG(BaseRAG):
             )
             return retry_chunks
 
-        # Retry didn't reach pass threshold
         if retry_relevance >= self._retry_threshold:
+            # Retry improved but didn't fully pass — accept with moderate confidence
             logger.info(
                 "CorrectiveRAG: retry improved but below pass | "
                 "score=%.3f | accepting with moderate confidence",
@@ -565,7 +545,7 @@ class CorrectiveRAG(BaseRAG):
             )
             return retry_chunks
 
-        # Retry still below retry threshold
+        # Retry still below retry threshold — flag low confidence
         logger.warning(
             "CorrectiveRAG: retry still below threshold | "
             "score=%.3f < %.2f | flagging low_confidence",
@@ -576,16 +556,18 @@ class CorrectiveRAG(BaseRAG):
         return retry_chunks
 
     async def _rewrite_query(self, query: str) -> str | None:
-        """Rewrite a query to improve retrieval.
+        """Rewrite a query to improve retrieval using the LLM.
 
-        Uses the LLM with the query rewrite prompt template.
-        Returns the rewritten query, or None if rewriting fails.
+        Uses the query rewrite prompt template to generate an alternative
+        query formulation. Rejects rewrites that are unchanged or suspiciously
+        longer than the original — both indicate the LLM failed to rewrite.
 
         Args:
-            query: Original query that produced low-relevance results.
+            query: Original query that produced low-relevance retrieval results.
 
         Returns:
-            Rewritten query string, or None on failure.
+            Rewritten query string, or None if rewriting fails or produces
+            no usable change.
         """
         system_prompt, user_prompt = build_query_rewrite_prompt(query)
 
@@ -606,7 +588,8 @@ class CorrectiveRAG(BaseRAG):
                 logger.warning("Query rewrite returned empty response")
                 return None
 
-            # Sanity check: rewritten query shouldn't be absurdly long
+            # Guard against runaway rewrites — 5x length ratio is a strong signal
+            # that the LLM generated an explanation rather than a rewritten query.
             if len(rewritten) > len(query) * 5:
                 logger.warning(
                     "Query rewrite suspiciously long | original_len=%d | "

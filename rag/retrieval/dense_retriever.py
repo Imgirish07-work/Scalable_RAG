@@ -1,20 +1,27 @@
 """
-Dense retriever — wraps QdrantStore for dense-only vector search.
+Dense vector retrieval from Qdrant using embedding similarity.
 
 Design:
-    - Thin wrapper around the existing QdrantStore.similarity_search().
-    - No new embedding code — QdrantStore uses get_embeddings() internally.
-    - Converts LangChain Documents → RetrievedChunks at the boundary.
-    - MetadataFilters converted to Qdrant payload filters via base class.
+    Thin wrapper around QdrantStore.similarity_search_with_vectors(). No
+    new embedding code — QdrantStore uses get_embeddings() internally.
+    Converts LangChain Documents to RetrievedChunks at the retriever
+    boundary. MetadataFilters are converted to Qdrant payload filters via
+    the shared BaseRetriever.build_qdrant_filter() method.
 
-When to use dense vs hybrid:
-    - Dense: Good default. Works well when user queries and document
-      language overlap semantically. Faster than hybrid.
-    - Hybrid: Better when exact keywords matter (product codes, legal
-      terms, medical terminology). Adds SPLADE sparse matching.
+    Use dense over hybrid when queries and documents share semantic
+    vocabulary and exact keyword matching is not critical. Dense is faster
+    (~1.5–2x) because it performs only one index lookup.
 
-The retrieval_mode field in RAGConfig controls which retriever
-RAGFactory injects into BaseRAG.
+Chain of Responsibility:
+    Instantiated by RAGFactory.create_retriever(mode="dense")
+    → called by SimpleRAG.retrieve() / CorrectiveRAG._do_retrieval()
+    → QdrantStore.similarity_search_with_vectors()
+    → returns list[RetrievedChunk].
+
+Dependencies:
+    rag.retrieval.base_retriever (BaseRetriever)
+    rag.exceptions.rag_exceptions (RAGRetrievalError)
+    vectorstore.qdrant_store (QdrantStore, via duck typing)
 """
 
 import time
@@ -27,21 +34,25 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-class DenseRetriever(BaseRetriever):
-    """Dense-only retrieval via existing QdrantStore.
 
-    Wraps QdrantStore.similarity_search() with MetadataFilter
-    conversion and LangChain → RetrievedChunk transformation.
+class DenseRetriever(BaseRetriever):
+    """Dense-only retrieval using QdrantStore vector similarity.
+
+    Wraps QdrantStore.similarity_search_with_vectors() with MetadataFilter
+    conversion and LangChain Document → RetrievedChunk transformation.
+    Falls back to similarity_search() when the with-vectors variant is
+    unavailable (e.g., non-Qdrant store injected in tests).
 
     Attributes:
         _store: QdrantStore instance injected via constructor.
     """
+
     def __init__(self, store: object):
-        """Initialize dense retriever.
+        """Initialize the dense retriever.
 
         Args:
             store: QdrantStore instance from vectorstore/qdrant_store.py.
-                Must implement async similarity_search(query, k, filter).
+                Must implement async similarity_search_with_vectors(query, k).
         """
         super().__init__(store)
         logger.info("DenseRetriever initialized")
@@ -63,19 +74,23 @@ class DenseRetriever(BaseRetriever):
     ) -> list[RetrievedChunk]:
         """Retrieve relevant chunks using dense vector similarity.
 
-        Calls QdrantStore.similarity_search() which:
-            1. Embeds the query using get_embeddings() (shared BGE instance)
-            2. Searches the Qdrant collection for nearest vectors
-            3. Returns LangChain Documents with relevance_score in metadata
+        Calls QdrantStore.similarity_search_with_vectors() which:
+            1. Embeds the query using the shared BGE get_embeddings() instance.
+            2. Searches the Qdrant collection for nearest vectors.
+            3. Returns LangChain Documents with relevance_score and vector
+               in metadata.
+
+        Falls back to similarity_search() when the with-vectors variant
+        is not available on the injected store.
 
         Args:
             query: Search query string.
-            top_k: Maximum number of chunks to return (1-50).
+            top_k: Maximum number of chunks to return (1–50).
             filters: Optional metadata filters for scoped retrieval.
 
         Returns:
             List of RetrievedChunk ordered by relevance (highest first).
-            Empty list if no results found.
+            Empty list if no results are found.
 
         Raises:
             RAGRetrievalError: If the vector store query fails.
@@ -87,11 +102,10 @@ class DenseRetriever(BaseRetriever):
         qdrant_filter = self.build_qdrant_filter(filters)
 
         start = time.perf_counter()
-        
+
         try:
-            # Use with-vectors variant so MMR can skip re-embedding entirely.
-            # Falls back gracefully to similarity_search if the method is
-            # not available (e.g. non-Qdrant store injected in tests).
+            # Prefer the with-vectors variant so MMR can skip re-embedding.
+            # Falls back gracefully when the store doesn't expose this method.
             if hasattr(self._store, "similarity_search_with_vectors"):
                 docs = await self._store.similarity_search_with_vectors(
                     query=query,
@@ -117,6 +131,7 @@ class DenseRetriever(BaseRetriever):
             )
 
             return chunks
+
         except Exception as e:
             elapsed_ms = (time.perf_counter() - start) * 1000
             logger.error(
@@ -136,4 +151,3 @@ class DenseRetriever(BaseRetriever):
                     "has_filters": filters is not None,
                 },
             ) from e
-

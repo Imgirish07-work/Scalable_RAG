@@ -1,9 +1,19 @@
-"""Agent request and sub-query models.
+"""
+Agent request and sub-query models.
 
-SubQuery is the unit of work produced by the planner. Each SubQuery
-maps to a single RAG pipeline call. The planner decides how many
-sub-queries are needed, which collection each targets, and which
-RAG variant to use.
+Design:
+    SubQuery is the atomic unit of work produced by the planner. Each
+    SubQuery maps to exactly one RAG pipeline call. DecompositionPlan
+    groups the sub-queries with routing metadata (parallel-safe flag,
+    planner reasoning).
+
+Chain of Responsibility:
+    QueryPlanner produces DecompositionPlan → ParallelRetriever iterates
+    SubQuery items → SubQuery.to_rag_request() converts each to RAGRequest
+    → pipeline.query_raw() executes.
+
+Dependencies:
+    pydantic, rag.models.rag_request
 """
 
 # stdlib

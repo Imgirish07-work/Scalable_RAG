@@ -1,16 +1,19 @@
 """
-Real end-to-end agent test — The Constitution of India.
+Integration tests for the agent layer against a real LLM and vectorstore.
 
-Uses:
-    - THE_CONSTITUTION_OF_INDIA.pdf  (real document, no mocks)
-    - Full ingestion pipeline (DocumentCleaner → Chunker → QdrantStore in-memory)
-    - GeminiProvider (real LLM)
-    - RAGPipeline with configure_agents()
-    - 3 agent queries that require decomposition
-    - 2 simple queries that bypass the agent (direct RAG)
+Test scope:
+    End-to-end integration using The Constitution of India PDF. No mocks —
+    exercises DocumentCleaner, Chunker, QdrantStore (in-memory), GeminiProvider,
+    RAGPipeline with configure_agents(), routing via should_decompose(), and
+    full agent query execution.
 
-Run:
-    python test_agents_real.py
+Flow:
+    Ingest PDF → configure agents → routing check → agent queries (decomposed)
+    → simple queries (direct RAG) → teardown.
+
+Dependencies:
+    THE_CONSTITUTION_OF_INDIA.pdf in data/sample_docs/, GeminiProvider API key,
+    BGE embedding model, in-memory QdrantStore.
 """
 
 import asyncio
@@ -29,7 +32,7 @@ logger = get_logger(__name__)
 PDF_PATH   = "./data/sample_docs/THE_CONSTITUTION_OF_INDIA.pdf"
 COLLECTION = "constitution_india"
 
-# ── Collections metadata for the planner ──────────────────────────────────────
+# Collections metadata for the planner
 COLLECTIONS = {
     "constitution_india": (
         "The Constitution of India — Preamble, Parts, Articles, Schedules. "
@@ -37,8 +40,6 @@ COLLECTIONS = {
         "judicial powers, amendment procedures, and emergency provisions."
     ),
 }
-
-# ── Queries ───────────────────────────────────────────────────────────────────
 
 # These should trigger agent decomposition (complex, multi-part)
 AGENT_QUERIES = [
@@ -74,9 +75,7 @@ SIMPLE_QUERIES = [
 ]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Print helpers
-# ──────────────────────────────────────────────────────────────────────────────
 
 def _banner(title: str) -> None:
     print(f"\n{'=' * 70}")
@@ -106,14 +105,12 @@ def _print_response(label: str, response, query: str, routed_to_agent: bool) -> 
     print()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Main
-# ──────────────────────────────────────────────────────────────────────────────
 
 async def run() -> None:
     _banner("REAL AGENT TEST — The Constitution of India")
 
-    # ── Step 1: Ingest document ───────────────────────────────────────────────
+    # Step 1: Ingest document
     _section("Step 1: Ingesting document")
 
     pipeline = RAGPipeline()
@@ -132,7 +129,7 @@ async def run() -> None:
     print(f"  Duplicates : {result.duplicates_skipped} skipped")
     print(f"  Time       : {ingest_ms:.0f} ms")
 
-    # ── Step 2: Configure agents ──────────────────────────────────────────────
+    # Step 2: Configure agents
     _section("Step 2: Configuring agent layer")
 
     pipeline.configure_agents(
@@ -142,7 +139,7 @@ async def run() -> None:
     )
     print("  Agent layer configured — planner + parallel retriever + verifier + synthesizer")
 
-    # ── Step 3: Routing check — confirm queries route correctly ───────────────
+    # Step 3: Routing check — confirm queries route correctly
     _section("Step 3: Routing check (complexity detector)")
 
     print("  AGENT queries (should decompose = True):")
@@ -157,7 +154,7 @@ async def run() -> None:
         status = "[OK]" if not result_flag else "[WARN] expected False"
         print(f"    {status} {desc[:60]}")
 
-    # ── Step 4: Run agent queries ─────────────────────────────────────────────
+    # Step 4: Run agent queries
     _section("Step 4: Agent queries (decomposed)")
 
     for i, (query, desc) in enumerate(AGENT_QUERIES, 1):
@@ -179,7 +176,7 @@ async def run() -> None:
         )
         print(f"  Wall-clock latency: {q_ms:.0f} ms")
 
-    # ── Step 5: Run simple queries (direct RAG, no decomposition) ─────────────
+    # Step 5: Run simple queries (direct RAG, no decomposition)
     _section("Step 5: Simple queries (direct RAG)")
 
     for i, (query, desc) in enumerate(SIMPLE_QUERIES, 1):
@@ -200,7 +197,7 @@ async def run() -> None:
         )
         print(f"  Wall-clock latency: {q_ms:.0f} ms")
 
-    # ── Step 6: Teardown ──────────────────────────────────────────────────────
+    # Step 6: Teardown
     await pipeline.shutdown()
     _banner("TEST COMPLETE")
 

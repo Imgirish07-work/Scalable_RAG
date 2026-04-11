@@ -1,33 +1,31 @@
 """
-Exact-match cache key strategy.
+Exact-match cache key strategy using SHA-256 hashing.
 
-Generates a deterministic SHA-256 hash from the normalized query
-and model parameters. Two queries produce the same key if and only
-if they are identical after normalization.
+Design:
+    Generates a deterministic 64-character SHA-256 hex digest from the
+    normalized query and model parameters. Two queries produce the same
+    key if and only if they are identical after normalization.
 
-Flow:
-    raw query
-      → QueryNormalizerChain.build_cache_fingerprint()
-          → whitespace → case → punctuation → unicode → params
-      → hash_text(fingerprint)  (from utils/helpers.py)
-      → SHA-256 hex digest (64 chars)
+    Normalization pipeline (via QueryNormalizerChain):
+        raw query → whitespace → case → punctuation → unicode → params
+        → build_cache_fingerprint() → hash_text() → SHA-256 hex digest
 
-This strategy is fast (sub-millisecond), deterministic, and has
-zero false positives. The tradeoff is zero semantic understanding:
-    "What is RAG?" → HIT
-    "what is rag"  → HIT (normalization handles this)
-    "Explain RAG"  → MISS (different words, same meaning)
+    Zero false positives — identical keys always mean identical content.
+    Zero semantic understanding — "Explain RAG" misses even if
+    "What is RAG?" is cached. SemanticCacheStrategy handles that case.
 
-For semantic matching, see SemanticCacheStrategy (Phase 6).
+    make_key() is sync (CPU only).
+    find_similar() is async (checks backend existence — may involve I/O).
+    index_entry() is a no-op (the backend key IS the index).
 
-make_key() is sync (CPU only — Rule 2).
-find_similar() is async (checks backend — Rule 1).
-index_entry() is a no-op (exact keys don't need a separate index).
+Chain of Responsibility:
+    Instantiated by CacheManager with a normalizer and an ordered list
+    of backends (L1 first, L2 second). CacheManager calls make_key()
+    on both the read and write paths, and find_similar() as a secondary
+    lookup step when direct get() returns None.
 
 Dependencies:
-    - QueryNormalizerChain (cache/normalizers/)
-    - hash_text() (utils/helpers.py)
-    - BaseCacheBackend (injected for key existence checks)
+    utils.helpers.hash_text, cache.normalizers, cache.backend
 """
 
 from typing import Optional
@@ -74,6 +72,7 @@ class ExactCacheStrategy(BaseCacheStrategy):
 
     @property
     def name(self) -> str:
+        """Strategy identifier."""
         return "exact"
 
     def make_key(
@@ -85,10 +84,8 @@ class ExactCacheStrategy(BaseCacheStrategy):
     ) -> str:
         """Generate SHA-256 cache key from normalized inputs.
 
-        Sync — CPU only (Rule 2).
-
         The key is deterministic: identical normalized inputs always
-        produce the same 64-character hex digest.
+        produce the same 64-character hex digest. Sync — CPU only.
 
         Args:
             query: Raw user query.
@@ -139,13 +136,11 @@ class ExactCacheStrategy(BaseCacheStrategy):
     ) -> Optional[SimilarityMatch]:
         """Check if the exact key exists in any backend.
 
-        Async — checks backends which may involve I/O (Rule 1).
-
         Searches backends in priority order (L1 → L2). Returns on
         first match. If no backends are configured, returns None.
 
         For exact strategy, similarity_score is always 1.0 on hit
-        and tier is always "direct" — there's no ambiguity in
+        and tier is always 'direct' — there is no ambiguity in
         exact matching.
 
         Args:

@@ -1,30 +1,24 @@
 """
-RAG request models.
+Pydantic request models for RAG queries.
 
-Design decisions:
-    - RAGRequest carries core fields (query, collection). Simple callers
-      send just these two and get sane defaults for everything else.
-    - RAGConfig carries advanced overrides (retrieval mode, reranking,
-      filters, temperature, variant selection). Nested on RAGRequest as
-      an optional field with a default constructor — power users override
-      per-request, simple callers never touch it.
-    - ConversationTurn is a lightweight role+content pair for multi-turn
-      context. Maps directly to BaseLLM.chat() message format via
-      model_dump(). Kept minimal — no message IDs, no timestamps.
-    - MetadataFilter maps to Qdrant payload filters. Supports eq, neq,
-      gt, gte, lt, lte, in operators for structured retrieval filtering.
+Design:
+    Dataclass-style Pydantic v2 models with ConfigDict. RAGRequest carries
+    the required fields (query, collection_name) and delegates all advanced
+    options to the nested RAGConfig. Simple callers send only query and
+    collection_name and get sensible production defaults. Power users or
+    agent layers override specific RAGConfig fields per-request.
+    ConversationTurn maps directly to BaseLLM.chat() message format via
+    model_dump(). MetadataFilter maps to Qdrant payload filter conditions
+    with AND logic across multiple filters.
 
-All models use Pydantic v2 with ConfigDict. Frozen where immutability
-is desired (ConversationTurn), mutable where per-request modification
-is needed (RAGConfig).
+Chain of Responsibility:
+    Created by the API layer or agent → passed to RAGPipeline.query()
+    → forwarded to BaseRAG.query() → config fields read by the pipeline
+    to select variant, retriever, and generation parameters.
 
-Integration points:
-    - RAGConfig.temperature → passed as kwarg to BaseLLM.generate()
-    - RAGConfig.rag_variant → used by RAGFactory to select variant class
-    - RAGConfig.retrieval_mode → used by RAGFactory to select retriever
-    - ConversationTurn → maps to BaseLLM.chat() message format
-    - MetadataFilter → maps to Qdrant payload filter conditions
-    - request_id → flows through to RAGResponse for end-to-end tracing
+Dependencies:
+    pydantic (BaseModel, Field, ConfigDict, field_validator)
+    config.settings (settings)
 """
 
 import uuid
@@ -34,25 +28,26 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 from config.settings import settings
 
 
-# Supported values for validated Literal fields
+# Allowed values for Literal-validated fields
 SUPPORTED_RETRIEVAL_MODES = {"dense", "hybrid"}
 SUPPORTED_RERANK_STRATEGIES = {"none", "mmr", "cross_encoder"}
 SUPPORTED_CONFIDENCE_METHODS = {"retrieval", "llm", "hybrid"}
 SUPPORTED_RAG_VARIANTS = {"simple", "corrective", "chain"}
 SUPPORTED_FILTER_OPERATORS = {"eq", "neq", "gt", "gte", "lt", "lte", "in"}
 
+
 class ConversationTurn(BaseModel):
     """A single turn in a multi-turn conversation.
 
-    Designed to map directly to BaseLLM.chat() message format:
-        turn.model_dump() → {"role": "user", "content": "..."}
+    Maps directly to the BaseLLM.chat() message format via model_dump():
+        turn.model_dump() -> {"role": "user", "content": "..."}
 
     Both Gemini and OpenAI providers accept this format. GeminiProvider
-    converts internally (assistant → model, system → user).
+    converts role names internally (assistant -> model, system -> user).
 
     Attributes:
         role: Message role. Must be 'user', 'assistant', or 'system'.
-        content: Message text content. Cannot be empty.
+        content: Message text content. Cannot be empty or whitespace-only.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -66,6 +61,7 @@ class ConversationTurn(BaseModel):
         min_length=1,
         description="Message text content"
     )
+
     @field_validator("content")
     @classmethod
     def validate_content_not_blank(cls, value: str) -> str:
@@ -85,11 +81,12 @@ class ConversationTurn(BaseModel):
             raise ValueError("Content cannot be blank or whitespace only.")
         return stripped
 
-class MetadataFilter(BaseModel):
-    """A single metadata filter condition for retrieval.
 
-    Maps to Qdrant payload filter conditions. Multiple MetadataFilters
-    are combined with AND logic at the retriever level.
+class MetadataFilter(BaseModel):
+    """A single metadata filter condition for retrieval scoping.
+
+    Maps to Qdrant payload filter conditions. Multiple MetadataFilters on
+    a request are combined with AND logic at the retriever level.
 
     Examples:
         MetadataFilter(field="source_file", value="report.pdf")
@@ -98,7 +95,7 @@ class MetadataFilter(BaseModel):
 
     Attributes:
         field: Metadata field name to filter on.
-        value: Value to compare against. Type depends on operator.
+        value: Value to compare against. Type depends on the operator.
         operator: Comparison operator. Default is 'eq' (exact match).
     """
 
@@ -148,7 +145,7 @@ class MetadataFilter(BaseModel):
             Lowercase operator string.
 
         Raises:
-            ValueError: If operator is not supported.
+            ValueError: If operator is not in SUPPORTED_FILTER_OPERATORS.
         """
         cleaned = value.strip().lower()
         if cleaned not in SUPPORTED_FILTER_OPERATORS:
@@ -160,36 +157,34 @@ class MetadataFilter(BaseModel):
 
 
 class RAGConfig(BaseModel):
-    """Advanced configuration overrides for a RAG request.
+    """Advanced per-request configuration overrides for the RAG pipeline.
 
-    Every field has a sensible default. Simple callers use RAGConfig()
-    and get production-ready settings. Power users (and Layer 8 agents)
-    override specific fields per-request.
-
-    This is nested on RAGRequest as config: RAGConfig = RAGConfig().
-    One object in, one object out — clean for FastAPI serialization.
+    Every field has a sensible default. Simple callers use RAGConfig() and
+    get production-ready settings. Power users and agent layers override
+    specific fields. Nested on RAGRequest as config: RAGConfig = RAGConfig().
 
     Attributes:
         rag_variant: Which RAG variant to use. None means use
             settings.RAG_DEFAULT_VARIANT (the smart default pattern).
         retrieval_mode: Dense-only or hybrid (dense + SPLADE).
-        top_k: Number of chunks to retrieve.
-        rerank_strategy: Post-retrieval reranking. 'mmr' for diversity,
-            'cross_encoder' for relevance, 'none' to skip.
+        top_k: Number of chunks to retrieve per query.
+        rerank_strategy: Post-retrieval reranking strategy.
+            'mmr' for diversity, 'cross_encoder' for relevance, 'none' to skip.
         max_context_tokens: Token budget for assembled context. Prevents
             exceeding the LLM's context window.
-        temperature: LLM sampling temperature. Passed as kwarg to
-            BaseLLM.generate(). Lower = more deterministic.
-        system_prompt: Optional system prompt override. If None, the
-            variant uses its default prompt template.
-        metadata_filters: Optional list of filters applied to retrieval.
+        temperature: LLM sampling temperature passed to BaseLLM.generate().
+            Lower values produce more deterministic output.
+        system_prompt: Optional system prompt override. If None, the variant
+            uses its default prompt template.
+        metadata_filters: Optional filters applied at retrieval.
             Combined with AND logic at the Qdrant level.
-        include_sources: Whether to include retrieved chunks in the
-            response. True for debugging/citation, False for speed.
-        confidence_method: How confidence score is computed.
+        include_sources: Whether to include retrieved chunks in the response.
+        confidence_method: How confidence is computed.
             'retrieval' = average retrieval similarity (free).
             'llm' = LLM self-assessment (1 extra call).
             'hybrid' = weighted combination of both.
+        max_hops: Maximum retrieval hops for ChainRAG. None uses the
+            settings default.
     """
 
     model_config = ConfigDict(frozen=False)
@@ -240,7 +235,7 @@ class RAGConfig(BaseModel):
         default="retrieval",
         description="Confidence scoring method: retrieval, llm, hybrid",
     )
-    # CORAG Config
+    # ChainRAG config
     max_hops: Optional[int] = Field(
         default=None,
         ge=1,
@@ -253,9 +248,9 @@ class RAGConfig(BaseModel):
     @field_validator("rag_variant")
     @classmethod
     def validate_rag_variant(cls, value: str | None) -> str | None:
-        """Validate RAG variant if provided.
+        """Validate the RAG variant name if provided.
 
-        None is valid — means use settings default.
+        None is valid — it means use the settings default.
 
         Args:
             value: Raw variant string or None.
@@ -279,16 +274,16 @@ class RAGConfig(BaseModel):
     @field_validator("retrieval_mode")
     @classmethod
     def validate_retrieval_mode(cls, value: str) -> str:
-        """Validate retrieval mode.
+        """Validate the retrieval mode.
 
         Args:
             value: Raw retrieval mode string.
 
         Returns:
-            Lowercase retrieval mode.
+            Lowercase retrieval mode string.
 
         Raises:
-            ValueError: If mode is not supported.
+            ValueError: If mode is not in SUPPORTED_RETRIEVAL_MODES.
         """
         cleaned = value.strip().lower()
         if cleaned not in SUPPORTED_RETRIEVAL_MODES:
@@ -301,7 +296,7 @@ class RAGConfig(BaseModel):
     @field_validator("rerank_strategy")
     @classmethod
     def validate_rerank_strategy(cls, value: str) -> str:
-        """Validate rerank strategy.
+        """Validate the reranking strategy.
 
         Args:
             value: Raw strategy string.
@@ -310,7 +305,7 @@ class RAGConfig(BaseModel):
             Lowercase strategy string.
 
         Raises:
-            ValueError: If strategy is not supported.
+            ValueError: If strategy is not in SUPPORTED_RERANK_STRATEGIES.
         """
         cleaned = value.strip().lower()
         if cleaned not in SUPPORTED_RERANK_STRATEGIES:
@@ -323,7 +318,7 @@ class RAGConfig(BaseModel):
     @field_validator("confidence_method")
     @classmethod
     def validate_confidence_method(cls, value: str) -> str:
-        """Validate confidence scoring method.
+        """Validate the confidence scoring method.
 
         Args:
             value: Raw method string.
@@ -332,7 +327,7 @@ class RAGConfig(BaseModel):
             Lowercase method string.
 
         Raises:
-            ValueError: If method is not supported.
+            ValueError: If method is not in SUPPORTED_CONFIDENCE_METHODS.
         """
         cleaned = value.strip().lower()
         if cleaned not in SUPPORTED_CONFIDENCE_METHODS:
@@ -343,11 +338,11 @@ class RAGConfig(BaseModel):
         return cleaned
 
     def resolve_variant(self) -> str:
-        """Resolve the effective RAG variant.
+        """Resolve the effective RAG variant name.
 
-        If rag_variant is set, use it. Otherwise fall back to
-        settings.RAG_DEFAULT_VARIANT. This is the smart default
-        pattern — explicit overrides win, settings provide the fallback.
+        Explicit per-request override wins over the settings default.
+        This is the smart default pattern: callers that care specify it,
+        callers that don't get the global default.
 
         Returns:
             Resolved variant name string (e.g. 'simple', 'corrective').
@@ -357,10 +352,10 @@ class RAGConfig(BaseModel):
         return getattr(settings, "RAG_DEFAULT_VARIANT", "simple").strip().lower()
 
     def resolve_max_hops(self) -> int:
-        """Resolve max_hops with smart default pattern.
+        """Resolve the effective max_hops value for ChainRAG.
 
         Returns:
-            Explicit override if set, else settings default.
+            Explicit per-request override if set, else the settings default.
         """
         if self.max_hops is not None:
             return self.max_hops
@@ -371,7 +366,7 @@ class RAGRequest(BaseModel):
     """Input model for all RAG queries.
 
     Core fields (query, collection_name) are required. Everything else
-    has sensible defaults via RAGConfig.
+    has sensible defaults via the nested RAGConfig.
 
     Simple usage:
         request = RAGRequest(query="What is RAG?", collection_name="docs")
@@ -396,11 +391,11 @@ class RAGRequest(BaseModel):
         )
 
     Attributes:
-        query: The user's question. Cannot be empty.
+        query: The user's question. Cannot be empty or whitespace-only.
         collection_name: Qdrant collection to search. Cannot be empty.
         config: Advanced overrides. Defaults to RAGConfig() (all defaults).
         conversation_history: Optional previous turns for multi-turn RAG.
-            Used by pre_process() to resolve pronouns and context.
+            Used by pre_process() to resolve pronouns and trailing references.
         request_id: UUID for end-to-end request tracing. Auto-generated
             if not provided. Flows through to RAGResponse.
     """
@@ -456,7 +451,7 @@ class RAGRequest(BaseModel):
         """Reject blank collection names.
 
         Args:
-            value: Raw collection name.
+            value: Raw collection name string.
 
         Returns:
             Stripped collection name.
@@ -469,10 +464,10 @@ class RAGRequest(BaseModel):
         return value.strip()
 
     def get_chat_messages(self) -> list[dict] | None:
-        """Convert conversation_history to BaseLLM.chat() format.
+        """Convert conversation_history to the BaseLLM.chat() message format.
 
-        Returns None if no conversation history exists. Otherwise returns
-        a list of dicts compatible with both OpenAI and Gemini providers.
+        Returns None when no history exists. Returns a list of dicts
+        compatible with both OpenAI and Gemini provider implementations.
 
         Returns:
             List of {"role": str, "content": str} dicts, or None.

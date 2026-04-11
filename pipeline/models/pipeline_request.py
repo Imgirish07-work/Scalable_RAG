@@ -1,9 +1,18 @@
-"""Simplified external-facing request model for the pipeline.
+"""
+Simplified external-facing request and response models for the pipeline.
 
-PipelineQuery is the public API surface. Internal layers use RAGRequest
-and RAGConfig — but external callers (FastAPI endpoints, CLI, scripts)
-should not need to know about those internals. PipelineQuery translates
-to RAGRequest + RAGConfig via to_rag_request().
+Design:
+    PipelineQuery is the public API surface. Internal layers use RAGRequest
+    and RAGConfig — but external callers (FastAPI endpoints, CLI, scripts)
+    should not need to know about those internals. PipelineQuery translates
+    to RAGRequest + RAGConfig via to_rag_request().
+
+Chain of Responsibility:
+    External caller constructs PipelineQuery → RAGPipeline.query() converts
+    it to RAGRequest via to_rag_request() → BaseRAG.query() receives it.
+
+Dependencies:
+    pydantic, rag.models.rag_request
 """
 
 # stdlib

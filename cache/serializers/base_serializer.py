@@ -1,21 +1,36 @@
 """
-Abstract base class for cache serializers.
+Abstract base class for cache value serializers.
 
-Responsible for converting CacheEntry <-> string for storage in backends.
-Backends store raw strings — they never see Pydantic models directly.
+Design:
+    Defines the two-method interface that converts CacheEntry objects
+    to/from strings for storage in cache backends. Backends store raw
+    strings — they never interact with Pydantic models directly.
+    Separating serialization from storage allows backends and serializers
+    to evolve independently.
 
-Sync — serialization is CPU only (Rule 2). No I/O involved.
+    Implementations:
+        JSONSerializer    — human-readable, uses Pydantic v2 native JSON
+        (Future) MsgpackSerializer — compact binary, ~30-40% smaller, faster parse
 
-Implementations:
-    JSONSerializer — human-readable, debuggable, uses Pydantic v2 native JSON
-    (Future) MsgpackSerializer — compact binary, 30-40% smaller, faster parse
+Chain of Responsibility:
+    Instantiated by CacheManager (currently always JSONSerializer).
+    Called by CacheManager on every read (deserialize) and write
+    (serialize) operation before data reaches the backend.
+
+Dependencies:
+    abc, cache.models.cache_entry (stdlib + internal)
 """
 
 from abc import ABC, abstractmethod
 from cache.models.cache_entry import CacheEntry
 
+
 class BaseCacheSerializer(ABC):
-    """Interface for serializing/deserializing cache entries."""
+    """Interface for serializing/deserializing cache entries.
+
+    Attributes:
+        name: Serializer identifier for logging (e.g. 'json', 'msgpack').
+    """
 
     @property
     @abstractmethod

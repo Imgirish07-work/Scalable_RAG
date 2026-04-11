@@ -1,32 +1,34 @@
 """
-Hybrid retriever — wraps QdrantStore for dense + SPLADE sparse search.
+Hybrid retrieval combining dense vectors and SPLADE sparse vectors.
 
 Design:
-    - Combines dense vector similarity (BGE embeddings) with SPLADE sparse
-      matching for keyword-aware retrieval.
-    - Uses QdrantStore's existing hybrid search capability — no new
-      embedding or sparse encoding logic.
-    - Falls back to dense-only search if sparse component fails, logging
-      a warning instead of raising. This makes hybrid retrieval resilient
-      to SPLADE initialization failures.
+    Wraps QdrantStore.hybrid_search_with_vectors() to combine dense
+    embedding similarity (BGE) with SPLADE sparse keyword matching via
+    Reciprocal Rank Fusion (RRF). Falls back to dense-only if the sparse
+    component is unavailable or raises — this makes hybrid retrieval
+    resilient to SPLADE initialization failures without surfacing them
+    to the caller.
 
-When to use:
-    - Queries containing exact terms that must match (product IDs, legal
-      clause numbers, medical codes like ICD-10, chemical formulas).
-    - Queries where semantic similarity alone misses keyword-critical
-      documents (e.g., "HIPAA section 164.502" vs "privacy rules").
-    - Documents with specialized vocabulary where dense embeddings
-      may not capture domain-specific term importance.
+    Use hybrid over dense when queries contain exact terms that must match
+    (product codes, legal clause numbers, medical codes like ICD-10,
+    chemical formulas) or when domain-specific vocabulary reduces the
+    quality of dense embeddings alone.
 
-Cost:
-    - ~1.5-2x latency vs dense-only (two index lookups + fusion).
-    - No extra embedding model — SPLADE uses FastEmbedSparse already
-      initialized in QdrantStore.
+    Cost: ~1.5–2x latency vs dense-only due to two index lookups + fusion.
+    No extra embedding model — SPLADE uses FastEmbedSparse already initialized
+    in QdrantStore.
 
-Integration:
-    - QdrantStore must have been initialized with hybrid=True and sparse
-      embeddings configured. If not, hybrid search falls back to dense.
-    - RAGConfig.retrieval_mode="hybrid" selects this retriever via RAGFactory.
+Chain of Responsibility:
+    Instantiated by RAGFactory.create_retriever(mode="hybrid")
+    → called by BaseRAG variants via retrieve()
+    → QdrantStore.hybrid_search_with_vectors() (primary)
+    → QdrantStore.similarity_search_with_vectors() (fallback)
+    → returns list[RetrievedChunk].
+
+Dependencies:
+    rag.retrieval.base_retriever (BaseRetriever)
+    rag.exceptions.rag_exceptions (RAGRetrievalError)
+    vectorstore.qdrant_store (QdrantStore, via duck typing)
 """
 
 import time
@@ -39,35 +41,38 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-class HybridRetriever(BaseRetriever):
-    """Hybrid dense + SPLADE retrieval via existing QdrantStore.
 
-    Wraps QdrantStore.hybrid_search() with fallback to dense-only
-    if the sparse component is unavailable or fails.
+class HybridRetriever(BaseRetriever):
+    """Hybrid dense + SPLADE retrieval via QdrantStore.
+
+    Wraps QdrantStore.hybrid_search_with_vectors() with automatic fallback
+    to dense-only search if the sparse component is unavailable or fails.
 
     Attributes:
         _store: QdrantStore instance injected via constructor.
-        _dense_weight: Weight for dense scores in fusion (0.0-1.0).
-        _sparse_weight: Weight for sparse scores in fusion (0.0-1.0).
+        _dense_weight: Weight applied to dense scores during fusion (0.0–1.0).
+        _sparse_weight: Weight applied to sparse scores during fusion (0.0–1.0).
     """
+
     def __init__(
         self,
         store: object,
         dense_weight: float = 0.7,
         sparse_weight: float = 0.3,
     ):
-        """Initialize hybrid retriever.
+        """Initialize the hybrid retriever.
 
         Args:
             store: QdrantStore instance from vectorstore/qdrant_store.py.
-                Must implement async hybrid_search() and similarity_search().
-            dense_weight: Weight for dense vector scores in fusion.
-                Higher = more semantic matching. Default 0.7.
-            sparse_weight: Weight for sparse SPLADE scores in fusion.
-                Higher = more keyword matching. Default 0.3.
+                Must implement async hybrid_search_with_vectors() and
+                similarity_search_with_vectors() for the dense fallback.
+            dense_weight: Fusion weight for dense vector scores.
+                Higher values favour semantic matching. Default 0.7.
+            sparse_weight: Fusion weight for sparse SPLADE scores.
+                Higher values favour exact keyword matching. Default 0.3.
 
         Raises:
-            ValueError: If weights are negative or don't sum to ~1.0.
+            ValueError: If any weight is negative, or if they do not sum to ~1.0.
         """
         super().__init__(store)
         if dense_weight < 0 or sparse_weight < 0:
@@ -105,21 +110,21 @@ class HybridRetriever(BaseRetriever):
         top_k: int,
         filters: list[MetadataFilter] | None = None,
     ) -> list[RetrievedChunk]:
-        """Retrieve relevant chunks using dense + SPLADE hybrid search.
+        """Retrieve chunks using dense + SPLADE hybrid search.
 
-        Attempts hybrid search first. Falls back to dense-only if:
-            - QdrantStore doesn't have hybrid_search() method
-            - Sparse embeddings are not initialized
-            - Hybrid search raises an exception
+        Attempts hybrid search first. Falls back to dense-only when:
+            - QdrantStore does not have hybrid_search_with_vectors().
+            - Sparse embeddings are not initialized.
+            - Hybrid search raises any exception.
 
         Args:
             query: Search query string.
-            top_k: Maximum number of chunks to return (1-50).
+            top_k: Maximum number of chunks to return (1–50).
             filters: Optional metadata filters for scoped retrieval.
 
         Returns:
             List of RetrievedChunk ordered by relevance (highest first).
-            Empty list if no results found.
+            Empty list if no results are found.
 
         Raises:
             RAGRetrievalError: If both hybrid and dense fallback fail.
@@ -135,12 +140,12 @@ class HybridRetriever(BaseRetriever):
         docs = await self._try_hybrid_search(query, top_k, qdrant_filter)
 
         if docs is None:
-            # Hybrid unavailable or failed — fall back to dense
+            # Hybrid unavailable or failed — fall back to dense-only
             docs = await self._fallback_dense_search(query, top_k, qdrant_filter)
 
-        elapsed_ms = (time.perf_counter() - start)*1000
+        elapsed_ms = (time.perf_counter() - start) * 1000
 
-        chunks  = self._convert_documents(docs)
+        chunks = self._convert_documents(docs)
 
         logger.info(
             "Hybrid retrieval complete | query_len=%d | top_k=%d | "
@@ -154,7 +159,7 @@ class HybridRetriever(BaseRetriever):
         return chunks
 
     async def _try_hybrid_search(
-        self, 
+        self,
         query: str,
         top_k: int,
         qdrant_filter: dict | None,
@@ -163,13 +168,13 @@ class HybridRetriever(BaseRetriever):
 
         Args:
             query: Search query string.
-            top_k: Maximum results.
+            top_k: Maximum results to return.
             qdrant_filter: Qdrant payload filter dict or None.
 
         Returns:
-            List of LangChain Documents, or None if hybrid is unavailable.
+            List of LangChain Documents, or None if hybrid is unavailable
+            or raises.
         """
-
         if not hasattr(self._store, "hybrid_search_with_vectors"):
             logger.warning(
                 "QdrantStore does not have hybrid_search_with_vectors method, "
@@ -196,20 +201,19 @@ class HybridRetriever(BaseRetriever):
         top_k: int,
         qdrant_filter: dict | None,
     ) -> list:
-        """Fallback to dense-only search when hybrid is unavailable.
+        """Fall back to dense-only search when hybrid is unavailable.
 
         Args:
             query: Search query string.
-            top_k: Maximum results.
+            top_k: Maximum results to return.
             qdrant_filter: Qdrant payload filter dict or None.
 
         Returns:
-            List of LangChain Documents.
+            List of LangChain Documents from dense search.
 
         Raises:
             RAGRetrievalError: If dense search also fails.
         """
-
         try:
             docs = await self._store.similarity_search_with_vectors(
                 query=query,

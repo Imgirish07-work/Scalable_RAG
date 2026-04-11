@@ -1,41 +1,31 @@
 """
-BaseRAG — Template Method pattern for the RAG pipeline.
+Abstract base class for all RAG variants using the Template Method pattern.
 
 Design:
-    - query() is the SEALED algorithm skeleton. No variant can reorder,
-      skip, or add steps. They can only override individual hooks.
-    - Cache integration lives HERE, not in variants. Every variant
-      inherits caching for free. Variants own retrieval logic, not
-      orchestration concerns.
-    - All dependencies are injected via constructor: retriever, LLM,
-      cache, ranker, assembler. Fully testable with mocks.
-    - Timing instrumentation is built into query() — every step is
-      timed individually for RAGTimings diagnostics.
+    Template Method pattern: query() is a sealed algorithm skeleton.
+    No variant can reorder, skip, or add pipeline steps — they can only
+    override individual hooks. Cache integration, timing instrumentation,
+    and confidence computation all live here and are inherited for free.
+    All dependencies (retriever, LLM, cache, ranker, assembler) are
+    constructor-injected for full testability with mocks.
 
-Sealed pipeline (query):
-    1. Cache check (get_or_wait)
-    2. pre_process()     — hook: normalize query, resolve pronouns
-    3. retrieve()        — hook: ABSTRACT, every variant implements
-    4. rank()            — hook: MMR diversification (default)
-    5. assemble_context() — hook: token-bounded assembly (default)
-    6. generate()        — hook: LLM call with context (default)
-    7. build_response()  — sealed: construct RAGResponse
-    8. Cache write (set + resolve_in_flight)
+Chain of Responsibility:
+    RAGFactory creates and injects dependencies → BaseRAG.query() orchestrates
+    the sealed pipeline → retrieve() calls BaseRetriever → rank() calls
+    ContextRanker → assemble_context() calls ContextAssembler →
+    generate() calls BaseLLM.chat().
 
-Overridable hooks:
-    - pre_process():     QueryExpansionRAG overrides (HyDE, future)
-    - retrieve():        ALL variants override (abstract)
-    - rank():            CorrectiveRAG may override (adds eval step)
-    - generate():        MultiAgentRAG would override (future)
-    - assemble_context(): Rarely overridden
-
-Integration:
-    - CacheManager from cache/cache_manager.py (optional)
-    - BaseLLM from llm/contracts/base_llm.py
-    - BaseRetriever from rag/retrieval/base_retriever.py
-    - ContextRanker from rag/context/context_ranker.py
-    - ContextAssembler from rag/context/context_assembler.py
-    - Prompt templates from rag/prompts/rag_prompt_templates.py
+Dependencies:
+    llm.contracts.base_llm (BaseLLM)
+    llm.models.llm_response (LLMResponse)
+    llm.provider_health (provider_health)
+    rag.models.rag_request (RAGRequest)
+    rag.models.rag_response (RAGResponse, RetrievedChunk, ConfidenceScore, RAGTimings)
+    rag.retrieval.base_retriever (BaseRetriever)
+    rag.context.context_assembler (ContextAssembler)
+    rag.context.context_ranker (ContextRanker)
+    rag.prompts.rag_prompt_templates
+    rag.exceptions.rag_exceptions
 """
 
 import time
@@ -78,14 +68,14 @@ class BaseRAG(ABC):
     behavior without changing the pipeline flow.
 
     Subclasses MUST implement:
-        - retrieve(query, top_k, filters) → list[RetrievedChunk]
-        - variant_name (property) → str
+        - retrieve(query, top_k, filters) -> list[RetrievedChunk]
+        - variant_name (property) -> str
 
     Subclasses MAY override:
-        - pre_process(request) → str
-        - rank(chunks, query) → list[RetrievedChunk]
-        - assemble_context(chunks) → tuple[str, list[RetrievedChunk], int]
-        - generate(context, query, request) → LLMResponse
+        - pre_process(request) -> str
+        - rank(chunks, query) -> list[RetrievedChunk]
+        - assemble_context(chunks) -> tuple[str, list[RetrievedChunk], int]
+        - generate(context, query, request) -> LLMResponse
 
     Attributes:
         _retriever: BaseRetriever for vector store access.
@@ -116,12 +106,15 @@ class BaseRAG(ABC):
             assembler: Optional ContextAssembler. If None, a default
                 assembler is created using the provided LLM for
                 token counting.
+            fallback_llm: Optional secondary LLM used when the primary
+                provider enters cooldown or fails with a provider error.
         """
         self._retriever = retriever
         self._llm = llm
         self._fallback_llm = fallback_llm
         self._cache = cache
-        # Default ranker: inject reranker if available so per-request cross_encoder works
+        # Inject reranker at construction so per-request cross_encoder works
+        # without re-instantiating the ranker on every query.
         self._ranker = ranker or ContextRanker(
             strategy="mmr",
             embeddings_fn=get_embeddings,
@@ -140,9 +133,7 @@ class BaseRAG(ABC):
             "enabled" if self._cache else "disabled",
         )
 
-    # ================================================================
     # Abstract — subclasses MUST implement
-    # ================================================================
 
     @property
     @abstractmethod
@@ -162,9 +153,9 @@ class BaseRAG(ABC):
     ) -> list[RetrievedChunk]:
         """Retrieve relevant chunks from the vector store.
 
-        This is the primary hook that every variant implements.
-        SimpleRAG calls the retriever directly. CorrectiveRAG adds
-        relevance evaluation and retry logic.
+        This is the primary hook every variant implements. SimpleRAG
+        calls the retriever directly. CorrectiveRAG adds relevance
+        evaluation and retry logic.
 
         Args:
             query: Processed query string (output of pre_process).
@@ -178,9 +169,7 @@ class BaseRAG(ABC):
             RAGRetrievalError: If retrieval fails.
         """
 
-    # ================================================================
     # Sealed pipeline — query() orchestrates everything
-    # ================================================================
 
     async def query(self, request: RAGRequest) -> RAGResponse:
         """Execute the full RAG pipeline.
@@ -216,16 +205,16 @@ class BaseRAG(ABC):
             request.collection_name,
         )
 
-        # ---- Step 1: Cache check ----
+        # Step 1: Cache check
         if self._cache:
             cache_result = await self._try_cache_read(request)
             if cache_result is not None:
                 return cache_result
 
-        # ---- Step 2: Pre-process ----
+        # Step 2: Pre-process
         processed_query = await self.pre_process(request)
 
-        # ---- Step 3: Retrieve ----
+        # Step 3: Retrieve
         # For cross_encoder: fetch RERANKER_COARSE_TOP_K candidates (e.g. 10) so
         # the reranker has enough to score; otherwise fetch config.top_k directly.
         active_strategy = config.rerank_strategy
@@ -243,12 +232,12 @@ class BaseRAG(ABC):
         )
         retrieval_ms = (time.perf_counter() - retrieval_start) * 1000
 
-        # ---- Step 4: Rank ----
+        # Step 4: Rank
         ranking_start = time.perf_counter()
         ranked_chunks = await self.rank(chunks, processed_query, strategy=active_strategy)
         ranking_ms = (time.perf_counter() - ranking_start) * 1000
 
-        # ---- Step 4b: Reranker threshold guard ----
+        # Step 4b: Reranker threshold guard
         # If all cross-encoder scores are near-zero, the reranker found nothing
         # relevant. Assembling context from irrelevant chunks causes hallucination.
         # Return a transparent "no context" response instead.
@@ -315,17 +304,17 @@ class BaseRAG(ABC):
                         low_confidence=True,
                     )
 
-        # ---- Step 5: Assemble context ----
+        # Step 5: Assemble context
         context_str, updated_chunks, context_tokens = await self.assemble_context(
             ranked_chunks
         )
 
-        # ---- Step 6: Generate ----
+        # Step 6: Generate
         generation_start = time.perf_counter()
         llm_response = await self.generate(context_str, processed_query, request)
         generation_ms = (time.perf_counter() - generation_start) * 1000
 
-        # ---- Step 7: Build response ----
+        # Step 7: Build response
         total_ms = (time.perf_counter() - total_start) * 1000
 
         timings = RAGTimings(
@@ -340,7 +329,7 @@ class BaseRAG(ABC):
             method=config.confidence_method,
         )
 
-        # Filter sources if include_sources is False
+        # Omit source chunks when the caller has disabled source inclusion
         sources = updated_chunks if config.include_sources else []
 
         rag_response = RAGResponse.from_generation(
@@ -355,7 +344,7 @@ class BaseRAG(ABC):
             low_confidence=self._get_low_confidence_flag(),
         )
 
-        # ---- Step 8: Cache write ----
+        # Step 8: Cache write
         if self._cache:
             await self._try_cache_write(request, llm_response, sources, confidence)
 
@@ -372,21 +361,17 @@ class BaseRAG(ABC):
 
         return rag_response
 
-    # ================================================================
     # Overridable hooks — sensible defaults, variants customize
-    # ================================================================
 
     async def pre_process(self, request: RAGRequest) -> str:
         """Pre-process the query before retrieval.
 
-        Default behavior:
-            - If conversation_history exists, use LLM to resolve pronouns
-              and make the query self-contained.
-            - Otherwise, return the query as-is (already stripped by
-              RAGRequest validator).
+        Default behavior: if conversation_history exists, use the LLM to
+        resolve pronouns and make the query self-contained. Otherwise,
+        return the query as-is (already stripped by RAGRequest validator).
 
-        QueryExpansionRAG (future) would override this to generate
-        a hypothetical answer for HyDE embedding.
+        QueryExpansionRAG (future) would override this to generate a
+        hypothetical answer for HyDE embedding.
 
         Args:
             request: Full RAGRequest with query and optional history.
@@ -394,12 +379,12 @@ class BaseRAG(ABC):
         Returns:
             Processed query string ready for retrieval.
         """
-        # If no conversation history, return query directly
+        # Without history there is nothing to resolve — return directly
         chat_messages = request.get_chat_messages()
         if not chat_messages:
             return request.query
 
-        # Conversation-aware query refinement
+        # Build a conversation-aware refinement prompt
         history_str = format_conversation_history(chat_messages)
         system_prompt, user_prompt = build_conversation_refinement_prompt(
             query=request.query,
@@ -441,18 +426,17 @@ class BaseRAG(ABC):
         query: str,
         strategy: str | None = None,
     ) -> list[RetrievedChunk]:
-        """Rerank retrieved chunks.
+        """Rerank retrieved chunks using the configured strategy.
 
         Default behavior: delegate to the injected ContextRanker.
-
         CorrectiveRAG may override this to add relevance evaluation
         before or after reranking.
 
         Args:
-            chunks:   Retrieved chunks from retrieve().
-            query:    Processed query string.
+            chunks: Retrieved chunks from retrieve().
+            query: Processed query string.
             strategy: Per-request strategy override (e.g. 'cross_encoder').
-                      Passed through to ContextRanker.rank().
+                Passed through to ContextRanker.rank().
 
         Returns:
             Reranked list of RetrievedChunk.
@@ -466,7 +450,6 @@ class BaseRAG(ABC):
         """Assemble ranked chunks into a token-bounded context string.
 
         Default behavior: delegate to the injected ContextAssembler.
-
         Rarely overridden — the assembler handles token budgeting,
         source labeling, and used_in_context flagging.
 
@@ -493,10 +476,14 @@ class BaseRAG(ABC):
             - Build system + user prompts from templates.
             - If custom system_prompt is set in RAGConfig, use that instead.
             - If conversation_history exists, include it in the prompt.
-            - Call LLM via chat() with system + user messages.
+            - Call the LLM via chat() with system + user messages.
+            - If the primary LLM is in cooldown, route directly to the
+              fallback LLM without paying the timeout penalty.
+            - On provider-level failure, mark primary unhealthy and retry
+              generation with fallback (saves re-running full retrieval).
 
-        MultiAgentRAG (future) would override this to synthesize
-        across sub-query answers.
+        MultiAgentRAG (future) would override this to synthesize answers
+        across multiple sub-query results.
 
         Args:
             context: Assembled context string from assemble_context().
@@ -517,14 +504,14 @@ class BaseRAG(ABC):
             else None
         )
 
-        # Build prompt pair
+        # Build prompt pair from templates
         system_prompt, user_prompt = build_rag_prompt(
             query=query,
             context=context,
             conversation_history=history_str,
         )
 
-        # Allow system prompt override from config
+        # Allow per-request system prompt override
         if request.config.system_prompt:
             system_prompt = request.config.system_prompt
 
@@ -609,7 +596,7 @@ class BaseRAG(ABC):
                         details={"request_id": request.request_id},
                     ) from fallback_exc
 
-            # Non-provider errors or no fallback — propagate as-is
+            # Non-provider errors or no fallback configured — propagate as-is
             if isinstance(exc, LLMError):
                 raise
 
@@ -621,18 +608,16 @@ class BaseRAG(ABC):
                 },
             ) from exc
 
-    # ================================================================
     # Private helpers
-    # ================================================================
 
     async def _try_cache_read(self, request: RAGRequest) -> RAGResponse | None:
-        """Attempt to read from cache. Returns None on miss or error.
+        """Attempt to read a cached response. Returns None on miss or error.
 
-        Cache errors are caught and logged — they never propagate to
-        the caller. A cache failure means we just run the full pipeline.
+        Cache errors are caught and logged — they never propagate to the
+        caller. A cache failure means the full pipeline runs instead.
 
         Args:
-            request: RAGRequest for cache key generation.
+            request: RAGRequest used to compute the cache key.
 
         Returns:
             RAGResponse if cache hit, None otherwise.
@@ -683,16 +668,16 @@ class BaseRAG(ABC):
         sources: list[RetrievedChunk] = [],
         confidence: ConfidenceScore | None = None,
     ) -> None:
-        """Attempt to write to cache. Errors are caught and logged.
+        """Attempt to write a response to cache. Errors are caught and logged.
 
-        Cache write happens AFTER the response is built and returned
-        conceptually — in practice it's the last step before return
-        but failures don't affect the response.
+        Cache write is the last step before return. Failures do not affect
+        the response already built — they are surfaced only via a warning log.
 
         Args:
-            request: RAGRequest for cache key generation.
-            llm_response: LLMResponse to cache.
+            request: RAGRequest used to compute the cache key.
+            llm_response: LLMResponse to store.
             sources: Retrieved chunks to store alongside the response.
+            confidence: Confidence score to persist for cache hit responses.
         """
         try:
             await self._cache.set(
@@ -718,13 +703,13 @@ class BaseRAG(ABC):
             )
 
     def _get_low_confidence_flag(self) -> bool:
-        """Return whether the current query has low confidence.
+        """Return whether the current query result has low confidence.
 
-        Default: always False. CorrectiveRAG overrides this via
-        its _is_low_confidence instance variable.
+        Default: always False. CorrectiveRAG overrides this via its
+        _is_low_confidence instance variable set during retrieve().
 
         Returns:
-            True if the variant flagged low confidence.
+            True if the variant flagged low confidence for this query.
         """
         return getattr(self, "_is_low_confidence", False)
 
@@ -733,18 +718,18 @@ class BaseRAG(ABC):
         chunks: list[RetrievedChunk],
         method: str = "retrieval",
     ) -> ConfidenceScore:
-        """Compute confidence score from retrieval results.
+        """Compute a confidence score from retrieval results.
 
-        Default implementation: average relevance score of chunks
-        that were included in the context (used_in_context=True).
+        Averages relevance scores of chunks that were included in the
+        context (used_in_context=True). Prefers reranker scores when
+        available — cross-encoder attends jointly to (query, chunk) and
+        is a stronger relevance signal than cosine distance alone.
 
-        This is the 'retrieval' method — free, no extra LLM calls.
-        CorrectiveRAG may compute its own confidence based on the
-        relevance evaluation step.
+        CorrectiveRAG overrides this to use LLM-evaluated relevance scores.
 
         Args:
-            chunks: Updated chunks with used_in_context flags.
-            method: Confidence scoring method from RAGConfig.
+            chunks: Updated chunks with used_in_context flags set.
+            method: Confidence scoring method string from RAGConfig.
 
         Returns:
             ConfidenceScore with value and method.

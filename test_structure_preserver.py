@@ -1,3 +1,22 @@
+"""
+Unit tests for the StructurePreserver component.
+
+Test scope:
+    Unit tests (no pytest) covering structure-type priority resolution, single
+    document tagging, section-label carry-over across pages, section-label
+    updates on new headings, original metadata preservation, and a full
+    multi-page pipeline with mixed structure types.
+    Tests 1-5 (heading/table/list/code detectors) are commented out — they
+    tested internal helpers that have since been consolidated.
+
+Flow:
+    Module-level execution — each test section runs sequentially; a failed
+    assert exits immediately via sys.exit(1).
+
+Dependencies:
+    StructurePreserver; langchain_core Document; no external services.
+"""
+
 import os
 os.environ["HF_HUB_DISABLE_SSL_VERIFICATION"] = "1"
 os.environ["CURL_CA_BUNDLE"]                   = ""
@@ -9,9 +28,6 @@ from chunking.structure_preserver import StructurePreserver
 
 preserver = StructurePreserver()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def section(title: str) -> None:
     print(f"\n{'='*60}\n  {title}\n{'='*60}")
@@ -20,11 +36,9 @@ def ok(msg: str)   : print(f"  ✅ {msg}")
 def fail(msg: str) : print(f"  ❌ {msg}"); sys.exit(1)
 
 def make_doc(text: str, page: int = 1) -> Document:
+    """Build a minimal Document for use in structure preservation tests."""
     return Document(page_content=text, metadata={"source": "test.pdf", "page": page})
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Test Data
-# ─────────────────────────────────────────────────────────────────────────────
 
 MARKDOWN_HEADING_TEXT  = "# Introduction\nThis section covers RAG basics."
 PLAIN_HEADING_TEXT     = "Introduction\nThis section covers RAG basics."
@@ -43,9 +57,8 @@ PARAGRAPH_TEXT         = "RAG combines retrieval with generation for grounded re
 
 EMPTY_TEXT             = ""
 
-# # ─────────────────────────────────────────────────────────────────────────────
+
 # # Test 1 — Empty document list
-# # ─────────────────────────────────────────────────────────────────────────────
 
 # section("Test 1 — Empty Document List")
 
@@ -53,9 +66,7 @@ EMPTY_TEXT             = ""
 # assert result == []
 # ok("Empty list returned as-is")
 
-# # ─────────────────────────────────────────────────────────────────────────────
 # # Test 2 — Heading Detection
-# # ─────────────────────────────────────────────────────────────────────────────
 
 # section("Test 2 — Heading Detection")
 
@@ -84,9 +95,7 @@ EMPTY_TEXT             = ""
 # assert heading == "" and level == 0
 # ok(f"No heading | heading='' | level=0")
 
-# # ─────────────────────────────────────────────────────────────────────────────
 # # Test 3 — Table Detection
-# # ─────────────────────────────────────────────────────────────────────────────
 
 # section("Test 3 — Table Detection")
 
@@ -99,9 +108,7 @@ EMPTY_TEXT             = ""
 # assert preserver._detect_table(PARAGRAPH_TEXT) == False
 # ok("No false positive on paragraph text")
 
-# # ─────────────────────────────────────────────────────────────────────────────
 # # Test 4 — List Detection
-# # ─────────────────────────────────────────────────────────────────────────────
 
 # section("Test 4 — List Detection")
 
@@ -114,9 +121,7 @@ EMPTY_TEXT             = ""
 # assert preserver._detect_list(PARAGRAPH_TEXT) == False
 # ok("No false positive on paragraph text")
 
-# # ─────────────────────────────────────────────────────────────────────────────
 # # Test 5 — Code Detection
-# # ─────────────────────────────────────────────────────────────────────────────
 
 # section("Test 5 — Code Detection")
 
@@ -129,9 +134,7 @@ EMPTY_TEXT             = ""
 # assert preserver._detect_code(PARAGRAPH_TEXT) == False
 # ok("No false positive on paragraph text")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 6 — Structure Type Priority
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 6 — Structure Type Priority (table > code > list > heading > paragraph)")
 
@@ -150,9 +153,7 @@ ok("heading wins over paragraph")
 assert preserver._resolve_structure_type("",      False, False, False) == "paragraph"
 ok("paragraph is default")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 7 — Single Document Tagging
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 7 — Single Document Tagging")
 
@@ -167,9 +168,7 @@ assert tagged.metadata["has_list"]       == False
 assert tagged.metadata["has_code"]       == False
 ok(f"Tagged correctly | section='{tagged.metadata['section']}' | type={tagged.metadata['structure_type']}")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 8 — Section Carries Over Across Pages
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 8 — Section Carries Over Across Pages")
 
@@ -186,9 +185,7 @@ assert result[1].metadata["section"] == "Introduction"  # carried over
 assert result[2].metadata["section"] == "Introduction"  # carried over
 ok("Section 'Introduction' carried over across pages 1, 2, 3")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 9 — Section Updates On New Heading
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 9 — Section Updates On New Heading")
 
@@ -207,9 +204,7 @@ assert result[2].metadata["section"] == "Methods"
 assert result[3].metadata["section"] == "Methods"
 ok("Section updated to 'Methods' at page 3, carried to page 4")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 10 — Metadata Fully Preserved
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 10 — Original Metadata Preserved")
 
@@ -225,9 +220,7 @@ assert result[0].metadata["author"]  == "test_user"
 assert result[0].metadata["doc_id"]  == "abc123"
 ok("All original metadata preserved after tagging")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 11 — Full Pipeline (multiple structure types)
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 11 — Full Pipeline (mixed structure types)")
 
@@ -261,10 +254,6 @@ for doc in result:
 
 ok("All 5 pages tagged with correct structure types")
 ok("All required metadata keys present in every page")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Summary
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("All Tests Passed ✅")
 print("  StructurePreserver is working correctly\n")

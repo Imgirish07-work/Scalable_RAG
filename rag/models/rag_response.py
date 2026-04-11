@@ -1,28 +1,25 @@
 """
-RAG response models.
+Pydantic response models for RAG queries.
 
-Design decisions:
-    - RetrievedChunk is a clean Pydantic model decoupled from LangChain's
-      Document class. This prevents LangChain types from leaking into the
-      API contract when FastAPI serves these responses in Layer 10.
-    - RAGTimings splits latency into retrieval, ranking, and generation
-      components. This tells you whether retrieval or LLM is the bottleneck
-      without additional profiling.
-    - ConfidenceScore carries both the value AND the method used to compute
-      it. CorrectiveRAG can switch scoring strategies without changing the
-      response contract.
-    - RAGResponse wraps LLMResponse data (not the object itself — it's frozen
-      and we need to add RAG-specific fields). Factory classmethods handle
-      construction from cache hits vs fresh generation.
-    - metadata dict on RetrievedChunk is a catch-all for anything the chunker
-      tagged that doesn't have a dedicated field. Future-proofs for agents
-      that might need arbitrary metadata signals.
+Design:
+    Dataclass-style Pydantic v2 models, frozen where immutability is
+    required. RetrievedChunk is decoupled from LangChain's Document class
+    so LangChain types never leak into the API contract. RAGTimings splits
+    latency into retrieval, ranking, and generation components so operators
+    can identify pipeline bottlenecks without extra profiling. ConfidenceScore
+    carries both value and method so callers always know how confidence was
+    computed. RAGResponse wraps LLMResponse data (not the object itself) and
+    adds RAG-specific fields. Factory classmethods handle construction from
+    cache hits vs fresh generation.
 
-Integration points:
-    - RetrievedChunk.from_document() converts LangChain Document → chunk
-    - RAGResponse.from_cache() builds response from CacheResult
-    - RAGResponse.from_generation() builds response from fresh LLMResponse
-    - request_id flows from RAGRequest → RAGResponse for tracing
+Chain of Responsibility:
+    Constructed by BaseRAG.query() → returned to RAGPipeline → serialized
+    by the FastAPI API layer. from_cache() is called on cache hits;
+    from_generation() is called after the full pipeline completes.
+
+Dependencies:
+    pydantic (BaseModel, ConfigDict, Field, field_validator, model_validator)
+    llm.models.llm_response (LLMResponse)
 """
 
 from __future__ import annotations
@@ -38,21 +35,26 @@ class RetrievedChunk(BaseModel):
     """A single chunk retrieved from the vector store.
 
     Decoupled from LangChain's Document class. The from_document()
-    classmethod handles conversion. This model is what callers see —
-    never raw LangChain objects.
+    classmethod handles conversion at the retriever boundary. This is
+    what all downstream layers see — never raw LangChain objects.
 
     Attributes:
         content: Clean text content (post _restore_original_content).
         source_file: Original document filename.
         chunk_id: SHA-256 hash of chunk content (from hash_text()).
-        relevance_score: Cosine similarity score from retrieval (0.0-1.0).
+        relevance_score: Cosine similarity score from retrieval (0.0–1.0).
         section_heading: Section heading from structure_preserver, if any.
         page_number: Page number from document_loader, if any.
         content_type: Content type tag (text, code, table, list), if any.
-        used_in_context: Whether this chunk was included in the final
-            context sent to the LLM. May be False if truncated by
-            token budget or filtered by ranker.
-        metadata: Catch-all dict for any additional chunker metadata.
+        used_in_context: True if this chunk was included in the final context
+            sent to the LLM. False if excluded by token budget or ranker.
+        metadata: Catch-all dict for additional chunker metadata not covered
+            by dedicated fields. Future-proofs for arbitrary agent signals.
+        vector: Pre-fetched embedding vector from Qdrant for zero-cost MMR
+            inter-chunk similarity. Excluded from API and cache output.
+        reranker_score: Cross-encoder score (sigmoid 0.0–1.0) from the
+            reranker. None when the reranker was not used. Excluded from
+            API and cache output.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -143,16 +145,16 @@ class RetrievedChunk(BaseModel):
         """Convert a LangChain Document to a RetrievedChunk.
 
         Extracts known metadata fields into dedicated attributes.
-        Remaining metadata goes into the catch-all dict.
+        Any remaining metadata keys go into the catch-all dict.
 
         Args:
-            doc: LangChain Document with page_content and metadata.
-            relevance_score: Similarity score from retrieval.
+            doc: LangChain Document with page_content and metadata dict.
+            relevance_score: Cosine similarity score from retrieval.
             vector: Pre-fetched embedding vector from Qdrant (optional).
-                    Passed through to enable zero-cost MMR diversity scoring.
+                Forwarded to enable zero-cost MMR diversity scoring.
 
         Returns:
-            RetrievedChunk instance.
+            RetrievedChunk instance with all available fields populated.
         """
         meta = getattr(doc, "metadata", {}) or {}
 
@@ -183,15 +185,16 @@ class RetrievedChunk(BaseModel):
 
 
 class ConfidenceScore(BaseModel):
-    """Confidence score with the method used to compute it.
+    """Confidence score paired with the computation method.
 
-    The method field future-proofs the model — CorrectiveRAG can switch
-    from retrieval-based to LLM-based scoring without changing the
-    response contract. Callers always know HOW the score was computed.
+    Carrying the method alongside the value lets callers understand the
+    signal quality. CorrectiveRAG can switch from retrieval-based to
+    LLM-evaluated scoring without changing the response contract.
 
     Attributes:
-        value: Confidence score between 0.0 and 1.0.
-        method: How the score was computed: retrieval, llm, hybrid.
+        value: Confidence score in range 0.0–1.0.
+        method: How the score was computed: retrieval, llm, hybrid,
+            reranker, corrective_eval, chain_eval, or cache.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -212,16 +215,16 @@ class ConfidenceScore(BaseModel):
 class RAGTimings(BaseModel):
     """Split latency measurements for the RAG pipeline.
 
-    Knowing whether retrieval or generation is the bottleneck is
-    critical for optimization. One flat latency_ms number hides this.
+    One flat latency_ms number hides whether retrieval or LLM generation
+    is the bottleneck. This model exposes each step separately.
 
     Attributes:
-        retrieval_ms: Time spent in retrieve() step.
-        ranking_ms: Time spent in rank() step (MMR, cross-encoder, etc.).
-        generation_ms: Time spent in generate() step (LLM call).
+        retrieval_ms: Time spent in the retrieve() step.
+        ranking_ms: Time spent in the rank() step (MMR, cross-encoder, etc.).
+        generation_ms: Time spent in the generate() step (LLM call).
         total_ms: Wall-clock time for the entire query() pipeline.
-            May be slightly greater than sum of parts due to overhead
-            (cache checks, context assembly, serialization).
+            May exceed the sum of individual steps due to overhead in
+            cache checks, context assembly, and serialization.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -252,30 +255,27 @@ class RAGResponse(BaseModel):
     """Output model for all RAG queries.
 
     Wraps the LLM-generated answer with retrieval context, timing
-    diagnostics, confidence scoring, and cache metadata.
-
-    Every RAG variant returns this exact model. Pipeline and agent
-    layers import ONLY RAGResponse — never raw LLMResponse for
-    RAG queries.
+    diagnostics, confidence scoring, and cache metadata. Every RAG
+    variant returns this exact model. Pipeline and agent layers import
+    only RAGResponse — never raw LLMResponse for RAG queries.
 
     Attributes:
         answer: The generated answer text.
         sources: Retrieved chunks with relevance scores and metadata.
-            Empty list if include_sources=False in RAGConfig.
-        timings: Split latency measurements (retrieval, ranking, gen).
+            Empty list when include_sources=False in RAGConfig.
+        timings: Split latency measurements (retrieval, ranking, generation).
         confidence: Confidence score with computation method.
-        cache_hit: Whether the answer was served from cache.
-        cache_layer: Which cache layer served the hit (L1, L2, semantic).
-            None if cache_hit is False.
+        cache_hit: True if the answer was served from cache.
+        cache_layer: Cache layer that served the hit (L1, L2, semantic).
+            None when cache_hit is False.
         rag_variant: Which variant produced this response.
-        context_tokens_used: How many tokens the assembled context consumed.
-            Critical for token budget optimization in Layer 5.
-        model_name: Which LLM model generated the answer.
+        context_tokens_used: Tokens consumed by the assembled context.
+        model_name: LLM model that generated the answer.
         request_id: Traces back to the originating RAGRequest.
         prompt_tokens: Input tokens consumed by the LLM call.
         completion_tokens: Output tokens generated by the LLM call.
-        low_confidence: Flag set by CorrectiveRAG when relevance is below
-            threshold after all retries. Caller decides how to handle.
+        low_confidence: Flag set by CorrectiveRAG or ChainRAG when relevance
+            is below threshold. Caller decides how to surface this.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -341,10 +341,10 @@ class RAGResponse(BaseModel):
 
     @model_validator(mode="after")
     def validate_cache_layer_consistency(self) -> RAGResponse:
-        """Cache layer should only be set when cache_hit is True.
+        """Ensure cache_layer is only set when cache_hit is True.
 
         Returns:
-            Self if valid.
+            Self if the combination is valid.
 
         Raises:
             ValueError: If cache_layer is set but cache_hit is False.
@@ -387,18 +387,19 @@ class RAGResponse(BaseModel):
         sources: list = [],
         confidence_value: float = 0.0,
     ) -> RAGResponse:
-        """Build RAGResponse from a cached LLMResponse.
+        """Build a RAGResponse from a cached LLMResponse.
 
-        Used by BaseRAG.query() when cache returns a hit. No retrieval
-        or generation timings — only the cache lookup latency.
+        Used by BaseRAG.query() when the cache returns a hit. Retrieval
+        and generation timings are omitted — only cache lookup latency is set.
 
         Args:
-            cached_response: The LLMResponse from cache.
+            cached_response: The LLMResponse retrieved from cache.
             request_id: Request ID from the originating RAGRequest.
-            rag_variant: Which variant was configured (even though cache served).
-            cache_layer: Which cache layer served the hit (L1, L2, semantic).
-            lookup_latency_ms: Time spent on cache lookup.
+            rag_variant: Variant configured for this request (informational).
+            cache_layer: Cache layer that served the hit (L1, L2, semantic).
+            lookup_latency_ms: Time spent on the cache lookup.
             sources: Retrieved chunks restored from the cache entry.
+            confidence_value: Confidence score stored with the cache entry.
 
         Returns:
             RAGResponse with cache_hit=True and minimal timings.
@@ -431,21 +432,21 @@ class RAGResponse(BaseModel):
         context_tokens_used: int = 0,
         low_confidence: bool = False,
     ) -> RAGResponse:
-        """Build RAGResponse from a fresh LLM generation.
+        """Build a RAGResponse from a fresh LLM generation.
 
         Used by BaseRAG.query() after the full pipeline completes
         (retrieve → rank → assemble → generate).
 
         Args:
             answer: The generated answer text.
-            llm_response: The raw LLMResponse from the LLM provider.
+            llm_response: Raw LLMResponse from the LLM provider.
             sources: Retrieved chunks with relevance scores.
-            timings: Split latency measurements.
+            timings: Split latency measurements for the pipeline.
             confidence: Confidence score with computation method.
             request_id: Request ID from the originating RAGRequest.
             rag_variant: Which variant produced this response.
-            context_tokens_used: Tokens consumed by assembled context.
-            low_confidence: CorrectiveRAG flag for below-threshold relevance.
+            context_tokens_used: Tokens consumed by the assembled context.
+            low_confidence: True if the variant flagged below-threshold relevance.
 
         Returns:
             RAGResponse with cache_hit=False and full diagnostics.

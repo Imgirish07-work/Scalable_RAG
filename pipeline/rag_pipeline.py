@@ -1,14 +1,21 @@
-"""RAGPipeline — single entry point for the entire RAG system.
+"""
+RAGPipeline — single entry point for the entire RAG system.
 
-Owns lifecycle (init/shutdown), query routing, document ingestion,
-health checks, and fallback logic. Delegates all processing to
-existing layers — the pipeline is glue and lifecycle, not logic.
+Design:
+    Facade pattern over all subsystems (LLM, vector store, cache, RAG
+    variants, agent layer). Owns lifecycle (init/shutdown), query routing,
+    document ingestion, health checks, and fallback logic. Delegates all
+    processing to existing layers — the pipeline is glue and lifecycle,
+    not business logic.
 
-Usage:
-    pipeline = RAGPipeline()
-    await pipeline.initialize()
-    response = await pipeline.query(PipelineQuery(query="...", collection="docs"))
-    await pipeline.shutdown()
+Chain of Responsibility:
+    External callers (FastAPI, CLI, tests) → RAGPipeline.query()
+    → if complex: AgentOrchestrator.execute() else: BaseRAG.query()
+    RAGPipeline.query_raw() is called by ParallelRetriever for sub-queries.
+
+Dependencies:
+    agents.agent_orchestrator, cache.cache_manager, chunking.*,
+    llm.llm_factory, rag.rag_factory, vectorstore.qdrant_store
 """
 
 # stdlib
@@ -57,7 +64,7 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# fallback variant when the requested variant fails
+# Fallback variant used when the requested variant fails.
 _FALLBACK_VARIANT = "simple"
 
 
@@ -105,9 +112,7 @@ class RAGPipeline:
         # All share self._store._client so they query the same Qdrant database.
         self._collection_stores: dict[str, QdrantStore] = {}
 
-    # ──────────────────────────────────────────────
     # Lifecycle
-    # ──────────────────────────────────────────────
 
     async def initialize(self) -> None:
         """Boot all subsystems in dependency order.
@@ -127,10 +132,8 @@ class RAGPipeline:
         init_start = time.perf_counter()
 
         try:
-            # step 1 — LLM providers.
-            # create_from_settings() returns a rate-limited provider automatically
-            # (LLMRateLimiter wrapping is inside LLMFactory — no manual wrapping
-            # needed here, and no risk of bypassing limits in other call sites).
+            # LLM providers — LLMFactory.create_from_settings() wraps the
+            # provider in LLMRateLimiter automatically; no manual wrapping needed.
             if self._llm is None:
                 self._llm = LLMFactory.create_from_settings()
                 logger.info(
@@ -141,13 +144,13 @@ class RAGPipeline:
             if self._fallback_llm is None:
                 self._fallback_llm = self._try_create_fallback_llm()
 
-            # step 2 — vector store
+            # Vector store
             if self._store is None:
                 self._store = QdrantStore(in_memory=settings.debug)
             await self._store.initialize()
             logger.info("Vector store initialized")
 
-            # step 3 — cache (non-critical — failure degrades, not crashes)
+            # Cache is non-critical — failure degrades gracefully, not crashes.
             if self._cache is None and settings.cache_enabled:
                 self._cache = CacheManager(settings)
             if self._cache:
@@ -162,8 +165,8 @@ class RAGPipeline:
                 details={"error_type": type(exc).__name__, "error": str(exc)},
             ) from exc
 
-        # step 4 — warm-up: force all heavy models to load now so the
-        # first real user query pays zero cold-start penalty.
+        # Warm-up forces all heavy models to load now so the first real
+        # user query pays zero cold-start penalty.
         await self._run_warmup()
 
         elapsed = (time.perf_counter() - init_start) * 1000
@@ -266,8 +269,8 @@ class RAGPipeline:
         store_status = await self._check_store_health()
         cache_status = await self._check_cache_health()
 
-        # ready only if LLM and vector store are both healthy
-        # cache is non-critical — degraded is acceptable
+        # Ready only if LLM and vector store are both healthy.
+        # Cache is non-critical — degraded state is acceptable.
         ready = llm_status == "ok" and store_status == "ok"
 
         return PipelineHealthStatus(
@@ -318,9 +321,7 @@ class RAGPipeline:
             "Agent layer configured with %d collections", len(collections),
         )
 
-    # ──────────────────────────────────────────────
     # Query — the main entry point
-    # ──────────────────────────────────────────────
 
     async def query(
         self,
@@ -361,8 +362,8 @@ class RAGPipeline:
             return response
 
         except (LLMAuthError, LLMRateLimitError):
-            # auth and rate limit errors are not retryable via fallback
-            # caller needs to handle these (fix credentials, wait, etc.)
+            # Auth and rate-limit errors are not retryable via fallback;
+            # the caller must handle these (fix credentials, back off, etc.).
             raise
 
         except (RAGError, LLMTimeoutError) as exc:
@@ -402,9 +403,9 @@ class RAGPipeline:
         query_start = time.perf_counter()
 
         try:
-            # Bypass agent routing — query_raw() is called by the agent's
-            # ParallelRetriever to execute sub-queries and must NEVER
-            # re-enter the agent layer (would cause infinite recursion).
+            # Bypass agent routing — query_raw() is called by ParallelRetriever
+            # to execute sub-queries and must NEVER re-enter the agent layer
+            # (would cause infinite recursion).
             rag = await self._build_rag_for_request(request, self._llm)
             response = await rag.query(request)
             self._log_query_metrics(request, response, query_start)
@@ -420,9 +421,7 @@ class RAGPipeline:
             )
             return await self._handle_fallback(request, exc, query_start)
 
-    # ──────────────────────────────────────────────
     # Document ingestion
-    # ──────────────────────────────────────────────
 
     async def ingest(
         self,
@@ -454,26 +453,25 @@ class RAGPipeline:
         ingest_start = time.perf_counter()
 
         try:
-            # step 1 — load + clean (DocumentCleaner.load_and_clean handles both)
+            # Load and clean — DocumentCleaner.load_and_clean handles both steps.
             cleaner = DocumentCleaner()
             raw_docs = await asyncio.to_thread(cleaner.load_and_clean, file_path)
             logger.info("Loaded %d pages from '%s'", len(raw_docs), file_path)
 
-            # step 2 — preserve structure (tag headings, tables, etc.)
+            # Tag headings, tables, and other structural elements.
             preserver = StructurePreserver()
             structured_docs = await asyncio.to_thread(preserver.preserve, raw_docs)
 
-            # step 3 — chunk
+            # Chunk into retrieval-sized pieces.
             chunker = Chunker()
             chunks = await asyncio.to_thread(chunker.split_documents, structured_docs)
             total_chunks = len(chunks)
             logger.info("Produced %d chunks", total_chunks)
 
-            # step 4 — store in vector db
             # Reuse the pipeline's existing Qdrant client so the ingested
             # collection is visible to all subsequent queries. Creating a new
             # QdrantStore without sharing the client would produce an isolated
-            # in-memory database that queries can never reach.
+            # in-memory database unreachable by queries.
             ingest_store = QdrantStore(
                 collection_name=collection,
                 client=self._store._client,
@@ -525,9 +523,7 @@ class RAGPipeline:
                 },
             ) from exc
 
-    # ──────────────────────────────────────────────
     # Internal — query execution and routing
-    # ──────────────────────────────────────────────
 
     async def _execute_query(
         self,
@@ -547,7 +543,7 @@ class RAGPipeline:
         Returns:
             RAGResponse from the selected execution path.
         """
-        # agent path — decompose complex queries
+        # Route complex queries through the agent decomposition layer.
         if self._agent_orchestrator and should_decompose(request.query):
             logger.info(
                 "Routing request_id=%s to agent decomposition",
@@ -556,7 +552,7 @@ class RAGPipeline:
             agent_response = await self._agent_orchestrator.execute(request)
             return agent_response.to_rag_response()
 
-        # direct RAG path (unchanged)
+        # Direct RAG path for simple queries.
         rag = await self._build_rag_for_request(request, llm)
         return await rag.query(request)
 
@@ -613,9 +609,7 @@ class RAGPipeline:
             embeddings_fn=get_embeddings,
         )
 
-    # ──────────────────────────────────────────────
     # Internal — fallback logic
-    # ──────────────────────────────────────────────
 
     async def _handle_fallback(
         self,
@@ -641,7 +635,7 @@ class RAGPipeline:
         Raises:
             PipelineFallbackExhaustedError: If no fallback succeeds.
         """
-        # strategy 1 — try simpler variant with same LLM
+        # Strategy 1 — retry with simpler variant using the same LLM.
         variant = self._get_request_variant(request)
         if variant != _FALLBACK_VARIANT:
             logger.info(
@@ -660,7 +654,7 @@ class RAGPipeline:
                     request.request_id, exc,
                 )
 
-        # strategy 2 — try fallback LLM with simpler variant
+        # Strategy 2 — retry with fallback LLM using the simpler variant.
         if self._fallback_llm:
             logger.info(
                 "Fallback: retrying request_id=%s with fallback LLM",
@@ -680,7 +674,7 @@ class RAGPipeline:
                     request.request_id, exc,
                 )
 
-        # all fallbacks exhausted
+        # All fallbacks exhausted — surface to caller.
         raise PipelineFallbackExhaustedError(
             message="All fallback strategies exhausted",
             details={
@@ -744,9 +738,7 @@ class RAGPipeline:
             )
         return attempted
 
-    # ──────────────────────────────────────────────
     # Internal — validation
-    # ──────────────────────────────────────────────
 
     def _ensure_initialized(self) -> None:
         """Guard against using the pipeline before initialization.
@@ -800,9 +792,7 @@ class RAGPipeline:
             return request.config.rag_variant
         return settings.RAG_DEFAULT_VARIANT
 
-    # ──────────────────────────────────────────────
     # Internal — health checks
-    # ──────────────────────────────────────────────
 
     async def _check_llm_health(self) -> str:
         """Check LLM provider availability.
@@ -827,7 +817,7 @@ class RAGPipeline:
         if not self._store:
             return "not configured"
         try:
-            # get_collection_stats is a lightweight operation
+            # get_collection_stats is a lightweight read-only operation.
             await self._store.get_collection_stats()
             return "ok"
         except Exception as exc:
@@ -851,9 +841,7 @@ class RAGPipeline:
         except Exception as exc:
             return f"degraded: {exc}"
 
-    # ──────────────────────────────────────────────
     # Internal — LLM factory helpers
-    # ──────────────────────────────────────────────
 
     def _try_create_fallback_llm(self) -> Optional[BaseLLM]:
         """Attempt to create a fallback LLM provider.
@@ -882,9 +870,7 @@ class RAGPipeline:
             )
             return None
 
-    # ──────────────────────────────────────────────
     # Internal — metrics and logging
-    # ──────────────────────────────────────────────
 
     def _log_query_metrics(
         self,

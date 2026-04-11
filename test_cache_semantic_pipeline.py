@@ -1,28 +1,21 @@
 """
-Semantic Cache Pipeline Test — Phase 6 validation.
+End-to-end tests for the semantic (hybrid exact+semantic) cache layer.
 
-Run from project root:
-    python test_cache_semantic_pipeline.py
+Test scope:
+    End-to-end tests (no pytest) covering BGE embedding model loading, embedding
+    quality (cosine similarity), SemanticCacheStrategy initialization and
+    index/find_similar, tiered threshold classification, cross-model and
+    system-prompt isolation, hybrid CacheManager exact and semantic hit paths,
+    false-match prevention, metrics tracking, and graceful degradation when the
+    embedding model is unavailable or strategy is set to exact.
 
-Prerequisites:
-    - BGE-small-en-v1.5 model configured in .env (EMBEDDING_MODEL_LOCAL_PATH)
-    - sentence-transformers and langchain-huggingface installed
-    - qdrant-client installed
-    - No Redis or Qdrant server needed (uses in-memory Qdrant)
-    - Embedding model loaded via vectorstore/embeddings.py (shared with RAG)
+Flow:
+    Section 1 loads the BGE model; if unavailable, sections 2-10 are skipped.
+    Section 11 runs regardless (tests exact-only mode and config-driven degradation).
 
-Sections:
-    1.  Embedding model loading (via get_embeddings())
-    2.  Query embedding quality
-    3.  Semantic strategy — initialization + collection
-    4.  Semantic strategy — index and find_similar
-    5.  Tiered threshold matching
-    6.  Cross-model isolation
-    7.  Hybrid CacheManager — exact hit (fast path)
-    8.  Hybrid CacheManager — semantic hit (fallback path)
-    9.  Hybrid CacheManager — different queries don't match
-    10. Metrics — semantic hits tracked
-    11. Graceful degradation — semantic failure falls back to exact
+Dependencies:
+    BGE-small-en-v1.5 via EMBEDDING_MODEL_LOCAL_PATH in .env; in-memory Qdrant
+    (no server); colorama; MagicMock for settings.
 """
 
 import asyncio
@@ -127,12 +120,15 @@ def make_settings(**overrides) -> MagicMock:
     return mock
 
 
-# ══════════════════════════════════════════════════
-# SECTION 1 — Embedding model loading
-# ══════════════════════════════════════════════════
-
-
 def test_embedding_model() -> None:
+    """Verifies the BGE model loads, returns the correct dimension, and is cached.
+
+    Tests:
+        - get_embeddings() succeeds and sets MODEL_AVAILABLE for later sections.
+        - Embedding dimension is 384.
+        - Second call returns the same instance via lru_cache (near-instant).
+        - embed_query() returns a non-zero list of the expected length.
+    """
     global MODEL_AVAILABLE
     header("Embedding Model Loading", 1)
 
@@ -172,12 +168,15 @@ def test_embedding_model() -> None:
         info("Ensure BGE model is at the path configured in .env")
 
 
-# ══════════════════════════════════════════════════
-# SECTION 2 — Query embedding quality
-# ══════════════════════════════════════════════════
-
-
 def test_embedding_quality() -> None:
+    """Verifies that BGE embeddings reflect semantic similarity correctly.
+
+    Tests:
+        - Paraphrases of the same question score above 0.85 cosine similarity.
+        - An unrelated query scores below 0.5 against the reference.
+        - A structurally similar but topically different query scores lower than paraphrases.
+        - Vectors are L2-normalized (norm ≈ 1.0).
+    """
     header("Query Embedding Quality", 2)
 
     if not MODEL_AVAILABLE:
@@ -235,12 +234,13 @@ def test_embedding_quality() -> None:
     check("Vector is L2-normalized", abs(norm - 1.0) < 0.01, f"norm={norm:.4f}")
 
 
-# ══════════════════════════════════════════════════
-# SECTION 3 — Semantic strategy initialization
-# ══════════════════════════════════════════════════
-
-
 async def test_strategy_init() -> None:
+    """Verifies SemanticCacheStrategy creates a Qdrant collection and is idempotent.
+
+    Tests:
+        - initialize() creates a collection with zero points.
+        - A second call to initialize() does not raise an error.
+    """
     header("Semantic Strategy — Initialization", 3)
 
     if not MODEL_AVAILABLE:
@@ -269,12 +269,15 @@ async def test_strategy_init() -> None:
     await strategy.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 4 — Index and find_similar
-# ══════════════════════════════════════════════════
-
-
 async def test_index_and_find() -> None:
+    """Verifies index_entry() and find_similar() correctly store and retrieve entries.
+
+    Tests:
+        - Indexed query can be found with the same text (exact match).
+        - A paraphrase finds the same cache_key above the high threshold.
+        - An unrelated query returns None.
+        - With multiple indexed entries, find_similar returns the closest match.
+    """
     header("Semantic Strategy — Index and Find", 4)
 
     if not MODEL_AVAILABLE:
@@ -362,12 +365,14 @@ async def test_index_and_find() -> None:
     await strategy.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 5 — Tiered threshold matching
-# ══════════════════════════════════════════════════
-
-
 async def test_tiered_thresholds() -> None:
+    """Verifies the direct/high/miss tier classification logic and live threshold matching.
+
+    Tests:
+        - An identical query scores in the 'direct' tier.
+        - A moderate paraphrase scores in the 'high' or 'direct' tier.
+        - _classify_tier() maps score ranges to the correct tier labels.
+    """
     header("Tiered Threshold Matching", 5)
 
     if not MODEL_AVAILABLE:
@@ -429,12 +434,14 @@ async def test_tiered_thresholds() -> None:
     await strategy.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 6 — Cross-model isolation
-# ══════════════════════════════════════════════════
-
-
 async def test_cross_model_isolation() -> None:
+    """Verifies that model name and system prompt are included in the semantic key space.
+
+    Tests:
+        - A query indexed for 'gemini' is found by the same model but not 'openai'.
+        - A query indexed with a specific system prompt hash is only found with the same hash.
+        - A different system prompt hash produces a miss.
+    """
     header("Cross-Model Isolation", 6)
 
     if not MODEL_AVAILABLE:
@@ -488,12 +495,14 @@ async def test_cross_model_isolation() -> None:
     await strategy.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 7 — Hybrid CacheManager: exact hit
-# ══════════════════════════════════════════════════
-
-
 async def test_hybrid_exact_hit() -> None:
+    """Verifies the exact fast-path still works when the semantic strategy is active.
+
+    Tests:
+        - The CacheManager initializes with a non-None semantic strategy.
+        - An exact query lookup returns EXACT strategy and L1 layer.
+        - A normalized variant of the original query also returns an EXACT hit.
+    """
     header("Hybrid CacheManager — Exact Hit (Fast Path)", 7)
 
     if not MODEL_AVAILABLE:
@@ -526,12 +535,14 @@ async def test_hybrid_exact_hit() -> None:
     await cache.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 8 — Hybrid CacheManager: semantic hit
-# ══════════════════════════════════════════════════
-
-
 async def test_hybrid_semantic_hit() -> None:
+    """Verifies that a paraphrased query triggers a semantic hit in hybrid mode.
+
+    Tests:
+        - A paraphrase that misses the exact key returns a SEMANTIC strategy hit.
+        - The hit carries a positive similarity score and a direct/high tier.
+        - The original exact query still prefers the EXACT strategy over semantic.
+    """
     header("Hybrid CacheManager — Semantic Hit (Fallback Path)", 8)
 
     if not MODEL_AVAILABLE:
@@ -582,12 +593,13 @@ async def test_hybrid_semantic_hit() -> None:
     await cache.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 9 — Different queries don't match
-# ══════════════════════════════════════════════════
-
-
 async def test_no_false_matches() -> None:
+    """Verifies the semantic cache does not produce false positives for unrelated queries.
+
+    Tests:
+        - Four semantically unrelated queries all return misses.
+        - A query with a similar syntactic structure but a different topic also misses.
+    """
     header("Different Queries Don't Match", 9)
 
     if not MODEL_AVAILABLE:
@@ -621,12 +633,14 @@ async def test_no_false_matches() -> None:
     await cache.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 10 — Metrics track semantic hits
-# ══════════════════════════════════════════════════
-
-
 async def test_semantic_metrics() -> None:
+    """Verifies that semantic hits and misses are reflected in the metrics counters.
+
+    Tests:
+        - Total lookups equals the number of get() calls made.
+        - exact_hits and total_misses are at least 1 each.
+        - get_full_stats() reports strategy as 'hybrid' and includes a 'semantic' key.
+    """
     header("Metrics — Semantic Hits Tracked", 10)
 
     if not MODEL_AVAILABLE:
@@ -668,12 +682,14 @@ async def test_semantic_metrics() -> None:
     await cache.close()
 
 
-# ══════════════════════════════════════════════════
-# SECTION 11 — Graceful degradation
-# ══════════════════════════════════════════════════
-
-
 async def test_graceful_degradation() -> None:
+    """Verifies the cache operates correctly when the semantic strategy is disabled or unavailable.
+
+    Tests:
+        - CACHE_STRATEGY=exact results in no semantic strategy and only EXACT hits.
+        - get_full_stats() shows 'exact' strategy with no 'semantic' key.
+        - When the model is available, the exact path still works in hybrid mode.
+    """
     header("Graceful Degradation — Semantic Failure", 11)
 
     sub_header("CACHE_STRATEGY=exact disables semantic")
@@ -710,18 +726,13 @@ async def test_graceful_degradation() -> None:
         response2 = make_response(text="Exact path answer")
         await cache2.set("fallback query", "gemini", 0.0, response2)
 
-        # Exact hit should always work even if semantic breaks
+        # Exact is always the fast path; semantic is only the fallback
         r2 = await cache2.get("fallback query", "gemini", 0.0)
         check("Exact hit works in hybrid mode", r2.hit is True)
         check("Strategy is EXACT (not semantic)", r2.strategy == CacheStrategy.EXACT)
         info("Exact path is always the fast path — semantic is fallback only")
 
         await cache2.close()
-
-
-# ══════════════════════════════════════════════════
-# Main runner
-# ══════════════════════════════════════════════════
 
 
 async def run_all() -> None:

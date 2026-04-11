@@ -1,3 +1,21 @@
+"""
+Unit tests for the Chunker component.
+
+Test scope:
+    Unit tests covering token counting, structure-aware splitting (paragraph,
+    table, code, list), routing, chunk filtering, deduplication, metadata
+    enrichment, context prepending, total-chunk counting, the full pipeline,
+    chunk statistics, and character/RLM splitting utilities.
+
+Flow:
+    Module-level execution — each Test N section runs sequentially; a failed
+    assert exits immediately via sys.exit(1).
+
+Dependencies:
+    Chunker (structure-aware splitter), langchain_core Document.
+    No external services required.
+"""
+
 import os
 os.environ["HF_HUB_DISABLE_SSL_VERIFICATION"] = "1"
 os.environ["CURL_CA_BUNDLE"]                   = ""
@@ -9,9 +27,7 @@ from chunking.chunker import Chunker
 
 chunker = Chunker()
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def section(title: str) : print(f"\n{'='*60}\n  {title}\n{'='*60}")
 def ok(msg: str)        : print(f"  ✅ {msg}")
@@ -32,9 +48,7 @@ def make_doc(text: str, structure_type: str = "paragraph", page: int = 1) -> Doc
         }
     )
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test Data
-# ─────────────────────────────────────────────────────────────────────────────
 
 PARAGRAPH   = "RAG combines retrieval with generation for grounded responses. " * 20
 SMALL_PARA  = "RAG combines retrieval with generation."
@@ -46,9 +60,7 @@ CODE_LARGE  = "\n".join([f"def function_{i}(x):\n    return x * {i}\n" for i in 
 LIST_SMALL  = "- Install dependencies\n- Configure settings\n- Run pipeline"
 LIST_LARGE  = "\n".join([f"- Item number {i} with some description text here" for i in range(200)])
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 1 — Empty Input
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 1 — Empty Input")
 
@@ -56,9 +68,7 @@ result = chunker.split_documents([])
 assert result == []
 ok("Empty list returned as-is")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 2 — Token Counter
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 2 — Token Counter")
 
@@ -70,9 +80,7 @@ count = chunker._count_tokens("")
 assert count == 0
 ok("Empty string = 0 tokens")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 3 — Standard Paragraph Split
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 3 — Standard Paragraph Split")
 
@@ -84,9 +92,7 @@ assert all(isinstance(c, Document) for c in chunks)
 assert all(chunker._count_tokens(c.page_content) <= 512 for c in chunks)
 ok(f"Paragraph split | chunks={len(chunks)} | all ≤ 512 tokens")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 4 — Table Splitting
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 4 — Table Splitting")
 
@@ -105,9 +111,7 @@ assert all(header in c.page_content for c in chunks)
 assert all(chunker._count_tokens(c.page_content) <= 512 for c in chunks)
 ok(f"Large table → {len(chunks)} chunks | header repeated | all ≤ 512 tokens")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 5 — Code Splitting
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 5 — Code Splitting")
 
@@ -124,9 +128,7 @@ assert len(chunks) > 1
 assert all(chunker._count_tokens(c.page_content) <= 512 for c in chunks)
 ok(f"Large code → {len(chunks)} chunks | all ≤ 512 tokens")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 6 — List Splitting
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 6 — List Splitting")
 
@@ -143,9 +145,7 @@ assert len(chunks) > 1
 assert all(chunker._count_tokens(c.page_content) <= 512 for c in chunks)
 ok(f"Large list → {len(chunks)} chunks | all ≤ 512 tokens")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 7 — Structure Routing
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 7 — Structure-Aware Routing")
 
@@ -156,9 +156,7 @@ for structure_type in ["paragraph", "heading", "table", "list", "code"]:
     assert len(chunks) > 0
     ok(f"Routed correctly | structure_type={structure_type} | chunks={len(chunks)}")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 8 — Chunk Filtering
-# ─────────────────────────────────────────────────────────────────────────────
 
 # section("Test 8 — Chunk Filtering")
 
@@ -187,7 +185,7 @@ bplate_chunk = Document(page_content="1",         metadata=make_doc("1",        
 chunks   = [empty_chunk, short_chunk, bplate_chunk, valid_chunk]
 filtered = chunker._filter_chunks(chunks)
 
-# ── Debug — print what survived and why ──
+# Print what survived and why
 for c in filtered:
     token_count = chunker._count_tokens(c.page_content.strip())
     print(f"  SURVIVED | tokens={token_count} | content='{c.page_content[:50]}'")
@@ -198,9 +196,7 @@ ok(f"Filtered correctly | kept=1/{len(chunks)}")
 
 # ...existing code...
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 9 — Deduplication
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 9 — Deduplication")
 
@@ -219,9 +215,7 @@ deduped = chunker._deduplicate(chunks, seen)
 assert len(deduped) == 3
 ok("3 unique chunks → all 3 kept")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 10 — Metadata Enrichment
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 10 — Metadata Enrichment")
 
@@ -239,9 +233,7 @@ assert enriched[0].metadata["word_count"]  > 0
 assert enriched[0].metadata["token_count"] > 0
 ok(f"Metadata enriched | doc_type=pdf | chunk_index=0 | word_count={enriched[0].metadata['word_count']}")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 11 — Context Prepending
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 11 — Context Prepending")
 
@@ -254,9 +246,7 @@ assert "Section:"               in prepped[0].metadata["embed_content"]
 assert prepped[0].page_content  == SMALL_PARA   # original never modified
 ok(f"Context prepended | embed_content present | page_content unchanged")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 12 — Total Chunks Count
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 12 — Total Chunks Count")
 
@@ -266,9 +256,7 @@ result = chunker._add_total_chunks(chunks)
 assert all(c.metadata["total_chunks"] == 5 for c in result)
 ok("total_chunks=5 added to all chunks correctly")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 13 — Full Pipeline
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 13 — Full Pipeline (split_documents)")
 
@@ -290,9 +278,7 @@ assert all("chunk_index"    in c.metadata                      for c in chunks)
 assert all("total_chunks"   in c.metadata                      for c in chunks)
 ok(f"Full pipeline | chunks={len(chunks)} | all metadata present | all ≤ 512 tokens")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 14 — Chunk Stats
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 14 — Chunk Stats")
 
@@ -306,9 +292,7 @@ assert "structure_types" in stats
 assert stats["total_chunks"] == len(chunks)
 ok(f"Stats | total={stats['total_chunks']} | avg={stats['avg_tokens']} tokens | min={stats['min_tokens']} | max={stats['max_tokens']}")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Test 15 — split_by_character and split_for_rlm
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("Test 15 — split_by_character and split_for_rlm")
 
@@ -330,9 +314,7 @@ chunks = chunker.split_for_rlm("")
 assert chunks == []
 ok("split_for_rlm | empty input → []")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Summary
-# ─────────────────────────────────────────────────────────────────────────────
 
 section("All Tests Passed ✅")
 print("  Chunker is working correctly\n")

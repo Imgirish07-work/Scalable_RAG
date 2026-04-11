@@ -1,31 +1,36 @@
 """
 Circuit breaker for async backend operations.
 
-Prevents cascading failures when an external dependency (Redis, Qdrant)
-becomes unhealthy. Instead of letting every request hang for the full
-timeout duration, the circuit breaker short-circuits after N consecutive
-failures and skips the backend entirely for a configurable reset period.
+Design:
+    Wraps individual backend calls to prevent cascading failures when an
+    external dependency (Redis, Qdrant) becomes unhealthy. Instead of
+    letting every request hang for the full timeout duration, the circuit
+    breaker short-circuits after N consecutive failures and skips the
+    backend entirely for a configurable reset period.
 
-Three states:
-    CLOSED  — normal operation, all requests pass through
-    OPEN    — backend is unhealthy, all requests are immediately rejected
-    HALF_OPEN — reset period elapsed, next request is a probe:
-                if it succeeds → CLOSED
-                if it fails    → OPEN again
+    Three states:
+        CLOSED    — normal operation, all requests pass through
+        OPEN      — backend is unhealthy, all requests are immediately rejected
+        HALF_OPEN — reset period elapsed, next request is a probe:
+                    if it succeeds → CLOSED
+                    if it fails    → OPEN again
 
-State transitions:
-    CLOSED → OPEN:
-        Triggered when consecutive_failures >= failure_threshold.
+    State transitions:
+        CLOSED → OPEN:      consecutive_failures >= failure_threshold
+        OPEN → HALF_OPEN:   current_time >= last_failure_time + reset_seconds
+        HALF_OPEN → CLOSED: probe call succeeded
+        HALF_OPEN → OPEN:   probe call failed, reset the timer
 
-    OPEN → HALF_OPEN:
-        Triggered when current_time >= last_failure_time + reset_seconds.
-        The next call becomes a probe.
+    Sync — state checks are CPU-only. No locks needed — single event loop
+    with atomic attribute assignments.
 
-    HALF_OPEN → CLOSED:
-        Probe call succeeded.
+Chain of Responsibility:
+    Instantiated by RedisCacheBackend. Every public method in
+    RedisCacheBackend calls allow_request() before touching the network
+    and record_success() or record_failure() after.
 
-    HALF_OPEN → OPEN:
-        Probe call failed, reset the timer.
+Dependencies:
+    time (stdlib only)
 
 Usage:
     breaker = CircuitBreaker(name="redis", failure_threshold=5, reset_seconds=60.0)
@@ -40,9 +45,6 @@ Usage:
     except Exception:
         breaker.record_failure()
         raise
-
-Sync — state checks are CPU-only (Rule 2).
-No locks needed — single event loop + atomic attribute assignments.
 """
 
 import time
@@ -51,10 +53,14 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+
 class CircuitState:
+    """String constants for circuit breaker states."""
+
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half_open"
+
 
 class CircuitBreaker:
     """Async-safe circuit breaker for external dependencies.
@@ -63,9 +69,9 @@ class CircuitBreaker:
         _name: Human-readable name for logging (e.g. 'redis', 'qdrant').
         _failure_threshold: Consecutive failures before opening the circuit.
         _reset_seconds: Seconds to wait before probing a tripped circuit.
-        _state: Current circuit state.
+        _state: Current circuit state (CLOSED / OPEN / HALF_OPEN).
         _consecutive_failures: Running failure counter (resets on success).
-        _last_failure_time: Timestamp of most recent failure.
+        _last_failure_time: Monotonic timestamp of most recent failure.
         _total_trips: Lifetime count of CLOSED → OPEN transitions.
         _total_rejected: Lifetime count of requests rejected by open circuit.
     """
@@ -76,6 +82,13 @@ class CircuitBreaker:
         failure_threshold: int = 5,
         reset_seconds: float = 60.0,
     ) -> None:
+        """Initialize the circuit breaker in CLOSED state.
+
+        Args:
+            name: Human-readable label for logs (e.g. 'redis_l2').
+            failure_threshold: Consecutive failures before tripping to OPEN.
+            reset_seconds: Seconds before an OPEN circuit transitions to HALF_OPEN.
+        """
         self._name = name
         self._failure_threshold = failure_threshold
         self._reset_seconds = reset_seconds
@@ -93,8 +106,9 @@ class CircuitBreaker:
             self._reset_seconds,
         )
 
-    @property   
+    @property
     def name(self) -> str:
+        """Human-readable breaker name."""
         return self._name
 
     @property
@@ -111,10 +125,12 @@ class CircuitBreaker:
 
     @property
     def is_closed(self) -> bool:
+        """True when the circuit is CLOSED (normal operation)."""
         return self.state == CircuitState.CLOSED
 
     @property
     def is_open(self) -> bool:
+        """True when the circuit is OPEN (all requests rejected)."""
         return self.state == CircuitState.OPEN
 
     def allow_request(self) -> bool:
@@ -128,7 +144,7 @@ class CircuitBreaker:
 
         if current == CircuitState.CLOSED:
             return True
-        
+
         if current == CircuitState.HALF_OPEN:
             logger.debug(
                 "CircuitBreaker '%s': allowing probe request (HALF_OPEN)",
@@ -136,7 +152,7 @@ class CircuitBreaker:
             )
             return True
 
-        # OPEN state
+        # Log every 50th rejection to avoid flooding logs while OPEN
         self._total_rejected += 1
         if self._total_rejected % 50 == 0:
             logger.warning(
@@ -201,7 +217,11 @@ class CircuitBreaker:
         logger.info("CircuitBreaker '%s': manually reset to CLOSED", self._name)
 
     def stats(self) -> dict:
-        """Return circuit breaker statistics for observability."""
+        """Return circuit breaker statistics for observability.
+
+        Returns:
+            Dict with current state, failure counts, and trip history.
+        """
         return {
             "name": self._name,
             "state": self.state,
