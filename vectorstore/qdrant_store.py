@@ -102,6 +102,16 @@ class QdrantStore(BaseVectorStore):
     _SPARSE_VECTOR_NAME = "sparse"
     _DENSE_VECTOR_NAME = "dense"
 
+    # gRPC stability — per-request timeout (int per SDK), channel keepalive,
+    # max connection age (force-recycle stale channels), and background ping interval.
+    _GRPC_REQUEST_TIMEOUT: int = 10
+    _GRPC_KEEPALIVE_TIME_MS: int = 30_000
+    _GRPC_KEEPALIVE_TIMEOUT_MS: int = 5_000
+    _GRPC_MAX_CONN_AGE_MS: int = 300_000
+    _GRPC_MAX_CONN_AGE_GRACE_MS: int = 5_000
+    _GRPC_MAX_CONN_IDLE_MS: int = 60_000
+    _GRPC_PING_INTERVAL_S: int = 30
+
     def __init__(
         self,
         collection_name: Optional[str] = None,
@@ -135,6 +145,10 @@ class QdrantStore(BaseVectorStore):
         self._client: Optional[QdrantClient] = None
         self._store: Optional[QdrantVectorStore] = None
         self._sparse_embeddings_instance: Optional[FastEmbedSparse] = None
+        # Set by _build_client(); True only when gRPC is actually in use.
+        self._grpc_active: bool = False
+        # Background ping task — started in initialize(), cancelled in close().
+        self._keepalive_task: Optional[asyncio.Task] = None
 
     async def initialize(self) -> None:
         """Create the client, ensure the collection exists, and build the store.
@@ -152,6 +166,18 @@ class QdrantStore(BaseVectorStore):
             await asyncio.to_thread(self._create_collection_if_missing)
 
             self._store = self._build_vector_store()
+
+            # Start keepalive only for gRPC server connections — not in-memory
+            # or injected clients (caller manages their lifecycle).
+            if self._grpc_active and self._injected_client is None:
+                self._keepalive_task = asyncio.create_task(
+                    self._keepalive_loop(),
+                    name=f"qdrant-keepalive-{self.collection_name}",
+                )
+                logger.debug(
+                    "gRPC keepalive loop started | collection=%s | ping_interval=%ds",
+                    self.collection_name, self._GRPC_PING_INTERVAL_S,
+                )
 
             logger.info(
                 "QdrantStore ready: collection=%s, mode=%s, search=%s",
@@ -190,29 +216,112 @@ class QdrantStore(BaseVectorStore):
         url = self._qdrant_url or settings.qdrant_url
         api_key = self._qdrant_api_key or settings.qdrant_api_key
 
-        kwargs: dict = {"url": url}
+        # timeout is int per qdrant-client 1.17 SDK signature.
+        kwargs: dict = {"url": url, "timeout": self._GRPC_REQUEST_TIMEOUT}
         if api_key:
             kwargs["api_key"] = api_key
 
         if settings.QDRANT_PREFER_GRPC:
+            # grpc_options dict is converted to list[tuple] by
+            # qdrant_client.connection.parse_channel_options() before being
+            # passed to grpc.insecure_channel / secure_channel.
+            grpc_options: dict = {
+                "grpc.keepalive_time_ms":              self._GRPC_KEEPALIVE_TIME_MS,
+                "grpc.keepalive_timeout_ms":           self._GRPC_KEEPALIVE_TIMEOUT_MS,
+                "grpc.keepalive_permit_without_calls": 1,  # ping even with no active RPC
+                "grpc.http2.max_pings_without_data":   0,  # no limit on data-less pings
+                "grpc.max_connection_age_ms":          self._GRPC_MAX_CONN_AGE_MS,
+                "grpc.max_connection_age_grace_ms":    self._GRPC_MAX_CONN_AGE_GRACE_MS,
+                "grpc.max_connection_idle_ms":         self._GRPC_MAX_CONN_IDLE_MS,
+            }
             try:
-                client = QdrantClient(**kwargs, prefer_grpc=True)
-                # get_collections() forces the gRPC handshake immediately —
-                # cheap no-data call that confirms the port is reachable.
+                client = QdrantClient(**kwargs, prefer_grpc=True, grpc_options=grpc_options)
+                # Probe the channel immediately — confirms the port is reachable.
                 client.get_collections()
+                self._grpc_active = True
                 logger.info(
-                    "QdrantStore: mode=server, transport=gRPC, url=%s", url
+                    "QdrantStore: mode=server, transport=gRPC | url=%s | "
+                    "timeout=%ds | keepalive=%dms | max_conn_age=%dms",
+                    url,
+                    self._GRPC_REQUEST_TIMEOUT,
+                    self._GRPC_KEEPALIVE_TIME_MS,
+                    self._GRPC_MAX_CONN_AGE_MS,
                 )
                 return client
             except Exception as exc:
+                self._grpc_active = False
                 logger.warning(
                     "gRPC connection failed (%s) — falling back to HTTP. "
                     "Set QDRANT_PREFER_GRPC=false to suppress this warning.",
                     exc,
                 )
 
-        logger.info("QdrantStore: mode=server, transport=HTTP, url=%s", url)
+        self._grpc_active = False
+        logger.info(
+            "QdrantStore: mode=server, transport=HTTP | url=%s | timeout=%ds",
+            url, self._GRPC_REQUEST_TIMEOUT,
+        )
         return QdrantClient(**kwargs)
+
+    # gRPC keepalive and reconnect
+
+    async def _keepalive_loop(self) -> None:
+        """Ping Qdrant every _GRPC_PING_INTERVAL_S seconds; reconnect on failure.
+
+        Background task — started by initialize(), cancelled by close().
+        Complements gRPC-level keepalive pings: catches cases where the channel
+        is up at TCP level but Qdrant is not actually serving requests.
+        CancelledError (BaseException, not Exception) propagates naturally —
+        no explicit handling needed.
+        """
+        while True:
+            await asyncio.sleep(self._GRPC_PING_INTERVAL_S)
+            if self._client is None:
+                return
+            try:
+                await asyncio.to_thread(self._client.get_collections)
+                logger.debug("Qdrant gRPC ping OK | collection=%s", self.collection_name)
+            except Exception as exc:
+                logger.warning(
+                    "Qdrant gRPC ping failed | collection=%s | error=%s: %s — reconnecting",
+                    self.collection_name, type(exc).__name__, str(exc)[:120],
+                )
+                await self._reconnect()
+
+    async def _reconnect(self) -> None:
+        """Rebuild the gRPC channel and LangChain store wrapper after a drop.
+
+        self._client is swapped only after the new channel is confirmed reachable,
+        so readers always see a valid (old or new) client, never None.
+        On failure, logs and returns — keepalive loop retries after next interval.
+        """
+        try:
+            # _build_client() is sync and probes with get_collections() internally.
+            new_client = await asyncio.to_thread(self._build_client)
+            old_client = self._client
+
+            # GIL-atomic swap — readers see old or new, never None.
+            self._client = new_client
+            self._store = self._build_vector_store()  # pure object construction, no I/O
+
+            logger.info(
+                "Qdrant gRPC reconnect successful | collection=%s",
+                self.collection_name,
+            )
+
+            if old_client is not None:
+                try:
+                    await asyncio.to_thread(old_client.close)
+                except Exception:
+                    pass  # already broken — best-effort cleanup
+
+        except Exception as exc:
+            logger.error(
+                "Qdrant gRPC reconnect failed | collection=%s | error=%s: %s "
+                "— will retry in %ds",
+                self.collection_name, type(exc).__name__, str(exc)[:120],
+                self._GRPC_PING_INTERVAL_S,
+            )
 
     # Collection management
 
@@ -1187,6 +1296,15 @@ class QdrantStore(BaseVectorStore):
             async def shutdown():
                 await store.close()
         """
+        # Cancel keepalive first — prevents a ping from racing with client.close().
+        if self._keepalive_task is not None and not self._keepalive_task.done():
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except asyncio.CancelledError:
+                pass  # expected — we just cancelled it
+            self._keepalive_task = None
+
         if self._client:
             try:
                 await asyncio.to_thread(self._client.close)
