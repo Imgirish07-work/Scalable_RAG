@@ -190,9 +190,10 @@ async def run() -> None:
             else:
                 logger.warning("LLM pre-warm failed (%s): %s", name, err[:200])
 
-    # Only warm Gemini; Groq is Zscaler-blocked on corp network
-    if fallback_llm:
-        await _pre_warm_llm(fallback_llm, fallback_llm.model_name)
+    # Pre-warm whichever LLM is Gemini — Groq is Zscaler-blocked on corp network.
+    # Normal path: Gemini is fallback_llm. Groq-unavailable path: Gemini is llm.
+    _gemini_llm = fallback_llm if fallback_llm is not None else llm
+    await _pre_warm_llm(_gemini_llm, _gemini_llm.model_name)
 
     # ChainRAG config: tighter top_k per hop — it accumulates across hops
     rag_config = RAGConfig(
