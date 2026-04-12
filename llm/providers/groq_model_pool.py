@@ -600,10 +600,24 @@ class GroqModelPool(BaseLLM):
         max_tokens  = kwargs.get("max_tokens",  provider._max_tokens)
 
         # Disable thinking/reasoning mode for models that produce <think> tags.
-        # Thinking tokens waste quota and break all JSON parsers in the pipeline.
+        # Two complementary methods for maximum reliability:
+        #   1. reasoning_format="hidden" — Groq's official parameter, passed via
+        #      extra_body since we use the OpenAI SDK (not the Groq SDK directly).
+        #      Hides reasoning from the response; only the final answer is returned.
+        #   2. /no_think injected into the system prompt — model-level token that
+        #      fully skips the thinking process (Qwen3 and compatible models).
+        # Using both ensures thinking is suppressed even if one method is ignored.
         extra_body: dict = {}
         if provider._model in _THINKING_MODELS:
-            extra_body = {"thinking": {"type": "disabled"}}
+            extra_body = {"reasoning_format": "hidden"}
+            # Inject /no_think into system message for model-level disable
+            if messages and messages[0].get("role") == "system":
+                messages = [
+                    {**messages[0], "content": f"/no_think\n{messages[0]['content']}"},
+                    *messages[1:],
+                ]
+            else:
+                messages = [{"role": "system", "content": "/no_think"}, *messages]
 
         try:
             # with_raw_response returns an object whose .parse() gives the
