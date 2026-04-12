@@ -1,203 +1,221 @@
 """
-Integration tests for the agent layer against a real LLM and vectorstore.
-
-Test scope:
-    End-to-end integration using The Constitution of India PDF. No mocks —
-    exercises DocumentCleaner, Chunker, QdrantStore (in-memory), GeminiProvider,
-    RAGPipeline with configure_agents(), routing via should_decompose(), and
-    full agent query execution.
+Integration test for the agent layer using real infrastructure — no mocks.
 
 Flow:
-    Ingest PDF → configure agents → routing check → agent queries (decomposed)
-    → simple queries (direct RAG) → teardown.
+    Inject GroqModelPool + Gemini fallback + real Qdrant (hybrid) + cache
+    → initialize → health check → ingest DDAI PDF → configure agents
+    → routing check → agent queries → cache hit test → teardown.
+
+LLM stack:
+    Primary  : GroqModelPool (6 models — llama-3.1-8b, gpt-oss-20b, kimi-k2,
+               llama-3.3-70b, qwen3-32b, llama-4-scout; auto FAST/STRONG routing)
+    Fallback : Gemini 2.5 Flash (activated when all Groq exhausted or hard-blocked)
 
 Dependencies:
-    THE_CONSTITUTION_OF_INDIA.pdf in data/sample_docs/, GeminiProvider API key,
-    BGE embedding model, in-memory QdrantStore.
+    GROQ_API_KEY + GEMINI_API_KEY in .env; BGE + SPLADE models;
+    Qdrant on localhost:6333; Designing Data Intensive Applications.pdf in data/sample_docs/.
 """
 
 import asyncio
 import time
 
-from chunking.chunker import Chunker
-from chunking.document_cleaner import DocumentCleaner
-from chunking.structure_preserver import StructurePreserver
-from pipeline.rag_pipeline import RAGPipeline
+from cache.cache_manager import CacheManager
+from config.settings import settings
+from llm.llm_factory import LLMFactory
 from pipeline.models.pipeline_request import PipelineQuery
+from pipeline.rag_pipeline import RAGPipeline
 from agents.planner.complexity_detector import should_decompose
+from vectorstore.qdrant_store import QdrantStore
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-PDF_PATH   = "./data/sample_docs/THE_CONSTITUTION_OF_INDIA.pdf"
-COLLECTION = "constitution_india"
+PDF_PATH   = "./data/sample_docs/Designing Data Intensive Applications.pdf"
+COLLECTION = "DDAI"
 
-# Collections metadata for the planner
 COLLECTIONS = {
-    "constitution_india": (
-        "The Constitution of India — Preamble, Parts, Articles, Schedules. "
-        "Covers fundamental rights, directive principles, executive, legislative, "
-        "judicial powers, amendment procedures, and emergency provisions."
+    "DDAI": (
+        "Designing Data-Intensive Applications (DDIA) by Martin Kleppmann. "
+        "Covers storage engines (B-Trees, LSM-Trees), replication (leader-based, "
+        "leaderless, multi-leader), partitioning, transactions (ACID, isolation "
+        "levels, 2PC), distributed consistency (CAP, linearizability, eventual "
+        "consistency), batch and stream processing."
     ),
 }
 
-# These should trigger agent decomposition (complex, multi-part)
+# Complex multi-part queries — all should trigger agent decomposition
 AGENT_QUERIES = [
     (
-        "Compare the powers and composition of the Lok Sabha versus the Rajya Sabha, "
-        "and explain how both houses differ in terms of election, tenure, and legislative role.",
-        "Comparing two houses of Parliament — multi-entity comparison query"
+        "Compare B-Tree and LSM-Tree storage engines: how does each handle writes "
+        "and reads, what is write amplification, and under what workload should "
+        "you prefer one over the other?",
+        "B-Tree vs LSM-Tree — multi-entity comparison"
     ),
     (
-        "What are the Fundamental Rights guaranteed under Part III, and how do the "
-        "Directive Principles of State Policy in Part IV differ from them in terms of "
-        "enforceability and purpose?",
-        "Comparing Fundamental Rights vs Directive Principles — multi-part query"
+        "How does leader-based replication differ from leaderless replication "
+        "in distributed databases? Compare their consistency guarantees, "
+        "failover handling, and trade-offs under network partitions.",
+        "Leader vs leaderless replication — multi-aspect comparison"
     ),
     (
-        "Explain the emergency provisions under Articles 352, 356, and 360 — "
-        "what triggers each type of emergency, who proclaims it, and what are the "
-        "constitutional safeguards against misuse?",
-        "Three emergency types with multiple sub-questions"
+        "Explain how distributed transactions work: what are the ACID properties, "
+        "how does two-phase commit achieve atomicity across nodes, and what "
+        "isolation levels exist to control concurrency anomalies?",
+        "ACID + 2PC + isolation levels — multi-concept"
     ),
 ]
 
-# These should go directly to RAG (simple, single-focus)
-SIMPLE_QUERIES = [
-    (
-        "What does the Preamble of the Indian Constitution say?",
-        "Simple factual — single focus"
-    ),
-    (
-        "How many schedules are there in the Constitution of India?",
-        "Simple factual — single focus"
-    ),
-]
-
-
-# Print helpers
 
 def _banner(title: str) -> None:
-    print(f"\n{'=' * 70}")
-    print(f"  {title}")
-    print(f"{'=' * 70}")
+    print(f"\n{'=' * 72}\n  {title}\n{'=' * 72}")
 
 
 def _section(title: str) -> None:
-    print(f"\n{'-' * 70}")
-    print(f"  {title}")
-    print(f"{'-' * 70}")
+    print(f"\n{'-' * 72}\n  {title}\n{'-' * 72}")
 
 
-def _print_response(label: str, response, query: str, routed_to_agent: bool) -> None:
+def _print_response(label: str, response, query: str, wall_ms: float) -> None:
     print(f"\n[ {label} ]")
     print(f"QUERY      : {query[:120]}{'...' if len(query) > 120 else ''}")
-    print(f"ROUTE      : {'AGENT (decomposed)' if routed_to_agent else 'DIRECT RAG'}")
+    print(f"ROUTE      : {'AGENT (decomposed)' if response.rag_variant == 'agent' else 'DIRECT RAG'}")
     print(f"VARIANT    : {response.rag_variant}")
+    print(f"MODEL      : {response.model_name}")
+    print(f"CACHE HIT  : {response.cache_hit}"
+          + (f" (layer={response.cache_layer})" if response.cache_hit else ""))
     print(f"CONFIDENCE : {response.confidence.value:.3f} ({response.confidence.method})")
-    print(f"LATENCY    : {response.timings.total_ms:.0f} ms")
-    print(f"CACHE HIT  : {response.cache_hit}")
+    print(f"LATENCY    : {wall_ms:.0f} ms  "
+          f"[retrieval={response.timings.retrieval_ms:.0f}ms | "
+          f"ranking={response.timings.ranking_ms:.0f}ms | "
+          f"generation={response.timings.generation_ms:.0f}ms]")
     if response.sources:
-        print(f"SOURCES    : {len(response.sources)} chunks retrieved")
-        for i, chunk in enumerate(response.sources[:2], 1):
+        print(f"SOURCES    : {len(response.sources)} chunks")
+        for i, chunk in enumerate(response.sources[:3], 1):
             print(f"  [{i}] score={chunk.relevance_score:.3f} | {chunk.content[:100]}...")
-    print(f"\nANSWER:\n{response.answer}")
-    print()
+    if response.low_confidence:
+        print("  [!] LOW CONFIDENCE — retrieval threshold not met")
+    print(f"\nANSWER:\n{response.answer}\n")
 
-
-# Main
 
 async def run() -> None:
-    _banner("REAL AGENT TEST — The Constitution of India")
+    _banner("REAL AGENT TEST — Designing Data-Intensive Applications")
 
-    # Step 1: Ingest document
-    _section("Step 1: Ingesting document")
+    # Step 1: Build LLM providers and inject real infrastructure
+    _section("Step 1: Building infrastructure")
 
-    pipeline = RAGPipeline()
-    await pipeline.initialize()
+    try:
+        llm = LLMFactory.create_groq_pool()
+        print(f"  Primary LLM  : {llm.model_name} (GroqModelPool — 6 models)")
+    except Exception as exc:
+        logger.warning("Groq pool unavailable (%s) — using Gemini as primary", exc)
+        llm = LLMFactory.create_rate_limited("gemini")
+        print(f"  Primary LLM  : {llm.model_name} (Gemini — Groq unavailable)")
 
-    ingest_start = time.perf_counter()
-    result = await pipeline.ingest(
-        file_path=PDF_PATH,
-        collection=COLLECTION,
+    try:
+        fallback_llm = LLMFactory.create_rate_limited("gemini")
+        print(f"  Fallback LLM : {fallback_llm.model_name}")
+    except Exception as exc:
+        logger.warning("Gemini fallback unavailable: %s", exc)
+        fallback_llm = None
+        print("  Fallback LLM : unavailable")
+
+    store = QdrantStore(collection_name=COLLECTION, in_memory=False, search_mode="hybrid")
+    print(f"  Vector store : QdrantStore collection='{COLLECTION}' mode=hybrid")
+
+    pipeline = RAGPipeline(
+        llm=llm,
+        fallback_llm=fallback_llm,
+        store=store,
+        cache=CacheManager(settings),
     )
-    ingest_ms = (time.perf_counter() - ingest_start) * 1000
 
-    print(f"  File       : {result.file_path}")
-    print(f"  Collection : {result.collection}")
-    print(f"  Chunks     : {result.chunks_stored} stored / {result.total_chunks} total")
-    print(f"  Duplicates : {result.duplicates_skipped} skipped")
-    print(f"  Time       : {ingest_ms:.0f} ms")
+    # Step 2: Initialize — boots all subsystems and pre-warms models
+    _section("Step 2: Initializing pipeline")
+    init_start = time.perf_counter()
+    await pipeline.initialize()
+    print(f"  Initialized in {(time.perf_counter() - init_start) * 1000:.0f} ms")
 
-    # Step 2: Configure agents
-    _section("Step 2: Configuring agent layer")
+    # Step 3: Health check — abort early if LLM or store is down
+    _section("Step 3: Health check")
+    health = await pipeline.health_check()
+    print(f"  {'[OK]' if health.ready else '[WARN]'} ready={health.ready}")
+    print(f"  LLM          : {health.llm}")
+    print(f"  Vector store : {health.vector_store}")
+    print(f"  Cache        : {health.cache}")
+    print(f"  Primary LLM  : {health.details.get('primary_llm', '?')}")
+    print(f"  Fallback LLM : {health.details.get('fallback_llm', '?')}")
 
+    if not health.ready:
+        print("\n  [!] Pipeline not ready — aborting")
+        await pipeline.shutdown()
+        return
+
+    # Step 4: Ingest DDAI PDF into real Qdrant
+    _section("Step 4: Ingesting DDAI PDF")
+    ingest_start = time.perf_counter()
+    result = await pipeline.ingest(file_path=PDF_PATH, collection=COLLECTION)
+    print(f"  Chunks : {result.chunks_stored} stored / {result.total_chunks} total "
+          f"({result.duplicates_skipped} duplicates skipped)")
+    print(f"  Time   : {(time.perf_counter() - ingest_start) * 1000:.0f} ms")
+
+    # Step 5: Configure agent layer
+    _section("Step 5: Configuring agent layer")
     pipeline.configure_agents(
         collections=COLLECTIONS,
         max_concurrent=3,
         use_llm_verification=False,
     )
-    print("  Agent layer configured — planner + parallel retriever + verifier + synthesizer")
+    print("  Agent layer configured — planner + parallel retriever + synthesizer")
 
-    # Step 3: Routing check — confirm queries route correctly
-    _section("Step 3: Routing check (complexity detector)")
-
-    print("  AGENT queries (should decompose = True):")
+    # Step 6: Routing check — confirm all queries are flagged for decomposition
+    _section("Step 6: Routing check (complexity detector)")
     for query, desc in AGENT_QUERIES:
-        result_flag = should_decompose(query)
-        status = "[OK]" if result_flag else "[WARN] expected True"
-        print(f"    {status} {desc[:60]}")
+        flag = should_decompose(query)
+        print(f"  {'[OK]' if flag else '[WARN] expected True'}  {desc}")
 
-    print("\n  SIMPLE queries (should decompose = False):")
-    for query, desc in SIMPLE_QUERIES:
-        result_flag = should_decompose(query)
-        status = "[OK]" if not result_flag else "[WARN] expected False"
-        print(f"    {status} {desc[:60]}")
-
-    # Step 4: Run agent queries
-    _section("Step 4: Agent queries (decomposed)")
-
+    # Step 7: Agent queries — full decomposition path via AgentOrchestrator
+    _section("Step 7: Agent queries")
     for i, (query, desc) in enumerate(AGENT_QUERIES, 1):
-        print(f"\n  Running agent query {i}/3: {desc}")
-        print(f"  {'.' * 60}")
-
+        print(f"\n  Query {i}/{len(AGENT_QUERIES)}: {desc}")
         q_start = time.perf_counter()
         response = await pipeline.query(
-            PipelineQuery(query=query, collection=COLLECTION)
+            PipelineQuery(
+                query=query,
+                collection=COLLECTION,
+                variant="chain",
+                top_k=5,
+                max_hops=3,
+            )
         )
-        q_ms = (time.perf_counter() - q_start) * 1000
-
-        routed_to_agent = (response.rag_variant == "agent")
         _print_response(
             label=f"AGENT QUERY {i} — {desc}",
             response=response,
             query=query,
-            routed_to_agent=routed_to_agent,
+            wall_ms=(time.perf_counter() - q_start) * 1000,
         )
-        print(f"  Wall-clock latency: {q_ms:.0f} ms")
 
-    # Step 5: Run simple queries (direct RAG, no decomposition)
-    _section("Step 5: Simple queries (direct RAG)")
-
-    for i, (query, desc) in enumerate(SIMPLE_QUERIES, 1):
-        print(f"\n  Running simple query {i}/2: {desc}")
-
-        q_start = time.perf_counter()
-        response = await pipeline.query(
-            PipelineQuery(query=query, collection=COLLECTION)
+    # Step 8: Cache hit test — re-run first query; expect cache_hit=True
+    _section("Step 8: Cache hit test (re-running first agent query)")
+    first_query, first_desc = AGENT_QUERIES[0]
+    print(f"\n  Re-running: {first_desc}")
+    q_start = time.perf_counter()
+    response_hit = await pipeline.query(
+        PipelineQuery(
+            query=first_query,
+            collection=COLLECTION,
+            variant="chain",
+            top_k=5,
+            max_hops=3,
         )
-        q_ms = (time.perf_counter() - q_start) * 1000
+    )
+    _print_response(
+        label=f"CACHE HIT TEST — {first_desc}",
+        response=response_hit,
+        query=first_query,
+        wall_ms=(time.perf_counter() - q_start) * 1000,
+    )
+    print("  [OK] cache hit confirmed" if response_hit.cache_hit
+          else "  [INFO] cache miss (cold cache or cache disabled)")
 
-        routed_to_agent = (response.rag_variant == "agent")
-        _print_response(
-            label=f"SIMPLE QUERY {i} — {desc}",
-            response=response,
-            query=query,
-            routed_to_agent=routed_to_agent,
-        )
-        print(f"  Wall-clock latency: {q_ms:.0f} ms")
-
-    # Step 6: Teardown
     await pipeline.shutdown()
     _banner("TEST COMPLETE")
 
