@@ -20,7 +20,7 @@ Design:
         max_tokens is None → STRONG (generate() default — large / open-ended)
 
     Pool definitions:
-        FAST   : ["llama-3.1-8b-instant", "qwen/qwen3-32b"]
+        FAST   : ["llama-3.1-8b-instant", "openai/gpt-oss-20b", "qwen/qwen3-32b"]
         STRONG : ["moonshotai/kimi-k2-instruct", "llama-3.3-70b-versatile",
                   "qwen/qwen3-32b", "meta-llama/llama-4-scout-17b-16e-instruct"]
 
@@ -67,6 +67,7 @@ CallRole = Literal["FAST", "STRONG"]
 # Llama 3.1 8B is the workhorse; Qwen3 32B is the capacity overflow fallback
 _FAST_POOL: list[str] = [
     "llama-3.1-8b-instant",
+    "openai/gpt-oss-20b",
     "qwen/qwen3-32b",
 ]
 

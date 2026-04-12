@@ -87,6 +87,7 @@ MODEL_RATE_LIMITS: dict[str, _ModelLimits] = {
 
     # Groq — FAST pool
     "llama-3.1-8b-instant":                      _ModelLimits(rpm=30,  rpd=14_400, tpm=6_000,  tpd=500_000, pool="FAST"),
+    "openai/gpt-oss-20b":                        _ModelLimits(rpm=30,  rpd=1_000,  tpm=8_000,  tpd=200_000, pool="FAST"),
 
     # Groq — STRONG pool
     "moonshotai/kimi-k2-instruct":               _ModelLimits(rpm=60,  rpd=1_000,  tpm=10_000, tpd=300_000, pool="STRONG"),
