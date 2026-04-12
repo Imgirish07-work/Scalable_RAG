@@ -224,7 +224,7 @@ class RAGPipeline:
         async def _warmup_splade() -> None:
             if self._store and hasattr(self._store, "_get_sparse_embeddings"):
                 sparse = self._store._get_sparse_embeddings()
-                await asyncio.to_thread(sparse.embed, ["warmup"])
+                await asyncio.to_thread(sparse.embed_query, "warmup")
                 logger.debug("Warm-up: SPLADE model ready")
 
         async def _warmup_qdrant() -> None:
