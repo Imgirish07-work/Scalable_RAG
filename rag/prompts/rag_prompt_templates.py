@@ -147,11 +147,11 @@ CHAIN_COMPLETENESS_SYSTEM_PROMPT = (
     "You are a completeness evaluator. Assess whether a draft answer fully "
     "resolves the user's query or has unresolved references.\n\n"
     "Respond with ONLY a JSON object — no markdown fences, no preamble:\n"
-    '{{\n'
+    '{\n'
     '  "is_complete": true/false,\n'
     '  "reasoning": "Brief explanation of what is resolved or missing",\n'
     '  "follow_up_query": "Specific search query to retrieve missing information "\n'
-    "}}\n\n"
+    "}\n\n"
     "RULES:\n"
     '1. Set "is_complete" to true ONLY if the draft fully answers the query '
     "with no dangling references.\n"
