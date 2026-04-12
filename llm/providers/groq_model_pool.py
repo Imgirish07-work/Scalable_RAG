@@ -112,6 +112,7 @@ _QUEUE_MAX_SIZE: int = 50
 # To add a model: register it in model_limits.py AND add it here.
 _ALL_POOL_MODELS: list[str] = [
     "llama-3.1-8b-instant",                       # FAST primary
+    "openai/gpt-oss-20b",                         # FAST quality fallback (404-safe)
     "moonshotai/kimi-k2-instruct",                # STRONG priority-1 (unlisted; 404-safe)
     "llama-3.3-70b-versatile",                    # STRONG priority-2
     "qwen/qwen3-32b",                             # FAST overflow / STRONG priority-3

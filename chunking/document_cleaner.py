@@ -67,9 +67,13 @@ class DocumentCleaner:
     # Running header/footer detection thresholds.
     # A line seen verbatim on >= max(MIN_PAGES, PAGE_FRACTION * total_pages) pages
     # is classified as a running header and stripped from all pages before chunking.
-    # MAX_WORDS and MAX_CHARS cap what can qualify — real content lines are longer.
+    # MIN_CHARS/MIN_WORDS guard the lower bound — single characters and lone words
+    # (footnote markers, PDF bookmarks) are frequent but are not headers.
+    # MAX_WORDS and MAX_CHARS cap the upper bound — real content lines are longer.
     _RUNNING_HEADER_MIN_PAGES: int = 3
     _RUNNING_HEADER_PAGE_FRACTION: float = 0.15
+    _RUNNING_HEADER_MIN_CHARS: int = 6   # filters: 'g', 'h', '[a\']', short artifacts
+    _RUNNING_HEADER_MIN_WORDS: int = 2   # filters: 'Audio', any single-word token
     _RUNNING_HEADER_MAX_WORDS: int = 6
     _RUNNING_HEADER_MAX_CHARS: int = 80
 
@@ -363,6 +367,10 @@ class DocumentCleaner:
             for line in doc.page_content.splitlines():
                 stripped = line.strip()
                 if not stripped:
+                    continue
+                if len(stripped) < self._RUNNING_HEADER_MIN_CHARS:
+                    continue
+                if len(stripped.split()) < self._RUNNING_HEADER_MIN_WORDS:
                     continue
                 if len(stripped) > self._RUNNING_HEADER_MAX_CHARS:
                     continue
