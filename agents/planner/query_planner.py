@@ -139,7 +139,7 @@ def _parse_plan_response(
         parsed = _try_json_parse(stripped)
 
     if parsed is None:
-        logger.warning("Plan parsing failed, falling back to single sub-query")
+        logger.warning("Plan parsing failed | falling back to single sub-query")
         return _fallback_plan(original_query, default_collection)
 
     return _validate_plan(parsed, original_query, default_collection)
@@ -183,7 +183,7 @@ def _validate_plan(
     raw_sub_queries = raw.get("sub_queries", [])
 
     if not raw_sub_queries or not isinstance(raw_sub_queries, list):
-        logger.warning("Plan has no sub-queries, falling back")
+        logger.warning("Plan has no sub-queries | falling back to single sub-query")
         return _fallback_plan(original_query, default_collection)
 
     # Cap to prevent excessive parallelism and token usage.
@@ -213,8 +213,23 @@ def _validate_plan(
         ))
 
     if not sub_queries:
-        logger.warning("No valid sub-queries after validation, falling back")
+        logger.warning("No valid sub-queries after validation | falling back to single sub-query")
         return _fallback_plan(original_query, default_collection)
+
+    # Enforce minimum of 2 — should_decompose() already confirmed complexity.
+    # If the LLM returned only 1, add a broad context sub-query rather than
+    # letting the agent path silently behave like SimpleRAG.
+    if len(sub_queries) == 1:
+        logger.warning(
+            "Plan produced only 1 sub-query for complex query | "
+            "adding supplementary context sub-query | query='%s'",
+            original_query[:80],
+        )
+        sub_queries.append(SubQuery(
+            query=f"Background context and key concepts related to: {original_query}",
+            collection=sub_queries[0].collection,
+            purpose="Supplementary context to broaden the primary answer",
+        ))
 
     reasoning = str(raw.get("reasoning", ""))
     parallel_safe = raw.get("parallel_safe", True)

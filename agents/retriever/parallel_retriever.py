@@ -179,7 +179,7 @@ class ParallelRetriever:
             elapsed = (time.perf_counter() - start) * 1000
 
             logger.info(
-                "Sub-query '%s' succeeded in %.1fms, confidence=%.3f",
+                "Sub-query succeeded | sub_query_id=%s | elapsed_ms=%.1f | confidence=%.3f",
                 sub_query.sub_query_id, elapsed,
                 response.confidence.value if response.confidence else 0.0,
             )
@@ -190,13 +190,14 @@ class ParallelRetriever:
                 collection=sub_query.collection,
                 response=response,
                 latency_ms=elapsed,
+                purpose=sub_query.purpose,
             )
 
         except Exception as exc:
             elapsed = (time.perf_counter() - start) * 1000
 
             logger.warning(
-                "Sub-query '%s' failed in %.1fms: %s",
+                "Sub-query failed | sub_query_id=%s | elapsed_ms=%.1f | error=%s",
                 sub_query.sub_query_id, elapsed, exc,
             )
 
@@ -206,4 +207,5 @@ class ParallelRetriever:
                 collection=sub_query.collection,
                 reason=str(exc),
                 latency_ms=elapsed,
+                purpose=sub_query.purpose,
             )

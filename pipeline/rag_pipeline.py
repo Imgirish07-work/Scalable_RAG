@@ -146,7 +146,10 @@ class RAGPipeline:
 
             # Vector store
             if self._store is None:
-                self._store = QdrantStore(in_memory=settings.debug)
+                self._store = QdrantStore(
+                    in_memory=settings.debug,
+                    search_mode=settings.RAG_RETRIEVAL_MODE,
+                )
             await self._store.initialize()
             logger.info("Vector store initialized")
 
@@ -475,6 +478,7 @@ class RAGPipeline:
             ingest_store = QdrantStore(
                 collection_name=collection,
                 client=self._store._client,
+                search_mode=settings.RAG_RETRIEVAL_MODE,
             )
             await ingest_store.initialize()
             point_ids = await ingest_store.add_documents(chunks)
@@ -525,6 +529,21 @@ class RAGPipeline:
 
     # Internal — query execution and routing
 
+    def _should_use_agent(self, request: RAGRequest) -> bool:
+        """Decide whether to route this request through the agent layer.
+
+        Respects force_agent override in RAGConfig:
+            True  → always use agent (if configured)
+            False → never use agent
+            None  → auto-detect via should_decompose()
+        """
+        force = request.config.force_agent
+        if force is True:
+            return self._agent_orchestrator is not None
+        if force is False:
+            return False
+        return self._agent_orchestrator is not None and should_decompose(request.query)
+
     async def _execute_query(
         self,
         request: RAGRequest,
@@ -532,9 +551,8 @@ class RAGPipeline:
     ) -> RAGResponse:
         """Build the RAG variant and execute the query.
 
-        If the agent layer is configured and the query is complex,
-        routes to agent decomposition. Otherwise routes directly
-        to a RAG variant.
+        Routes complex queries through the agent layer (with cache check).
+        Simple queries go directly to a RAG variant.
 
         Args:
             request: Validated RAGRequest.
@@ -543,18 +561,103 @@ class RAGPipeline:
         Returns:
             RAGResponse from the selected execution path.
         """
-        # Route complex queries through the agent decomposition layer.
-        if self._agent_orchestrator and should_decompose(request.query):
+        if self._should_use_agent(request):
             logger.info(
-                "Routing request_id=%s to agent decomposition",
+                "Routing to agent decomposition | request_id=%s",
                 request.request_id,
             )
+            # Cache check before the expensive planner + parallel retrieval + synthesis.
+            if self._cache:
+                cached = await self._try_agent_cache_read(request)
+                if cached:
+                    return cached
+
             agent_response = await self._agent_orchestrator.execute(request)
-            return agent_response.to_rag_response()
+            rag_response = agent_response.to_rag_response()
+
+            if self._cache:
+                await self._try_agent_cache_write(request, rag_response)
+
+            return rag_response
 
         # Direct RAG path for simple queries.
         rag = await self._build_rag_for_request(request, llm)
         return await rag.query(request)
+
+    async def _try_agent_cache_read(self, request: RAGRequest) -> RAGResponse | None:
+        """Attempt to read a cached agent response. Returns None on miss or error.
+
+        Uses "__agent__" as the system_prompt discriminator so agent cache
+        keys never collide with SimpleRAG/ChainRAG keys for the same query.
+        """
+        try:
+            result = await self._cache.get_or_wait(
+                query=request.query,
+                model_name=self._llm.model_name,
+                temperature=0.1,          # synthesis temperature
+                system_prompt="__agent__",
+            )
+            if result.hit:
+                logger.info(
+                    "Agent cache hit | request_id=%s | layer=%s | similarity=%.3f",
+                    request.request_id, result.layer, result.similarity_score or 0.0,
+                )
+                from rag.models.rag_response import RetrievedChunk
+                cached_sources = [RetrievedChunk(**s) for s in result.sources]
+                return RAGResponse.from_cache(
+                    cached_response=result.response,
+                    request_id=request.request_id,
+                    rag_variant="agent",
+                    cache_layer=result.layer,
+                    lookup_latency_ms=result.lookup_latency_ms,
+                    sources=cached_sources,
+                    confidence_value=result.confidence_value,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Agent cache read failed | request_id=%s | error=%s",
+                request.request_id, exc,
+            )
+        return None
+
+    async def _try_agent_cache_write(
+        self,
+        request: RAGRequest,
+        response: RAGResponse,
+    ) -> None:
+        """Write a synthesized agent response to cache. Errors are caught and logged."""
+        try:
+            from llm.models.llm_response import LLMResponse
+            stub = LLMResponse(
+                text=response.answer,
+                model=response.model_name,
+                provider=self._llm.provider_name,
+                finish_reason="stop",
+                prompt_tokens=response.prompt_tokens,
+                completion_tokens=response.completion_tokens,
+                tokens_used=response.prompt_tokens + response.completion_tokens,
+                latency_ms=response.timings.total_ms,
+            )
+            await self._cache.set(
+                query=request.query,
+                model_name=self._llm.model_name,
+                temperature=0.1,
+                response=stub,
+                system_prompt="__agent__",
+                sources=[chunk.model_dump() for chunk in response.sources],
+                confidence_value=response.confidence.value if response.confidence else 0.0,
+            )
+            await self._cache.resolve_in_flight(
+                query=request.query,
+                model_name=self._llm.model_name,
+                temperature=0.1,
+                system_prompt="__agent__",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Agent cache write failed | request_id=%s | error=%s",
+                request.request_id, exc,
+            )
 
     async def _get_store_for_collection(self, collection_name: str) -> QdrantStore:
         """Return a QdrantStore scoped to the given collection.
@@ -577,6 +680,7 @@ class RAGPipeline:
             store = QdrantStore(
                 collection_name=collection_name,
                 client=self._store._client,
+                search_mode=settings.RAG_RETRIEVAL_MODE,
             )
             await store.initialize()
             self._collection_stores[collection_name] = store

@@ -128,7 +128,7 @@ def _format_sub_results(sub_results: list[SubQueryResult]) -> list[dict]:
     for result in sub_results:
         entry = {
             "query": result.query,
-            "purpose": "",
+            "purpose": result.purpose,
             "answer": result.answer if result.success else f"FAILED: {result.failure_reason}",
             "success": result.success,
         }

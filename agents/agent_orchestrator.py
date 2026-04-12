@@ -237,19 +237,17 @@ def _compute_agent_confidence(results: list[SubQueryResult]) -> ConfidenceScore:
 
 
 def _sum_tokens(results: list[SubQueryResult], token_type: str) -> int:
-    """Sum tokens across sub-query results.
-
-    Note: SubQueryResult doesn't track tokens directly — this is
-    a placeholder that returns 0. In production, you'd accumulate
-    tokens from the RAGResponse objects during retrieval.
+    """Sum prompt or completion tokens across all sub-query results.
 
     Args:
-        results: Sub-query results.
+        results: Sub-query results (success or failure).
         token_type: "prompt" or "completion".
 
     Returns:
-        Total token count (currently 0 — placeholder).
+        Total token count across all sub-queries.
     """
-    # SubQueryResult doesn't store token counts directly;
-    # the pipeline's cache and metrics layer tracks these.
+    if token_type == "prompt":
+        return sum(r.prompt_tokens for r in results)
+    if token_type == "completion":
+        return sum(r.completion_tokens for r in results)
     return 0

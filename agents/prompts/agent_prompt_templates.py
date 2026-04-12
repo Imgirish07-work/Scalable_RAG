@@ -28,7 +28,9 @@ PLANNING_SYSTEM_PROMPT = (
     "document retrieval.\n"
     "2. Sub-queries should target specific collections from the available list.\n"
     "3. Keep sub-queries focused — one aspect per sub-query.\n"
-    "4. If the query is already simple enough, return a single sub-query.\n"
+    "4. ALWAYS produce a minimum of 2 sub-queries. By the time this prompt is called "
+    "the query has already been classified as complex — find at least two distinct "
+    "aspects that benefit from independent retrieval.\n"
     "5. Maximum 6 sub-queries — if you need more, consolidate.\n\n"
     "Respond with ONLY a JSON object — no markdown fences, no preamble:\n"
     '{{\n'

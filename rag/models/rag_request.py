@@ -194,7 +194,7 @@ class RAGConfig(BaseModel):
         description="RAG variant: simple, chain. None = use settings default.",
     )
     retrieval_mode: str = Field(
-        default="dense",
+        default_factory=lambda: settings.RAG_RETRIEVAL_MODE,
         description="Retrieval mode: dense or hybrid (dense + SPLADE)",
     )
     top_k: int = Field(
@@ -204,7 +204,11 @@ class RAGConfig(BaseModel):
         description="Number of chunks to retrieve (1-50)",
     )
     rerank_strategy: str = Field(
-        default="mmr",
+        # When RERANKER_ENABLED=true, default to cross_encoder so the neural
+        # reranker actually runs. Otherwise fall back to the settings strategy.
+        default_factory=lambda: (
+            "cross_encoder" if settings.RERANKER_ENABLED else settings.RAG_RERANK_STRATEGY
+        ),
         description="Reranking strategy: none, mmr, cross_encoder",
     )
     max_context_tokens: int = Field(
@@ -241,6 +245,13 @@ class RAGConfig(BaseModel):
         ge=1,
         le=5,
         description="Maximum retrieval hops for CoRAG variant. None uses settings default.",
+    )
+    # Agent routing override — bypasses should_decompose() heuristic.
+    # True: always route to agent (if configured). False: never route to agent.
+    # None (default): auto-detect via should_decompose().
+    force_agent: Optional[bool] = Field(
+        default=None,
+        description="Override agent routing: True=always, False=never, None=auto-detect.",
     )
 
     # Field validators

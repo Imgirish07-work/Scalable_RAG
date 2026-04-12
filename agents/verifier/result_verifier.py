@@ -113,12 +113,15 @@ class ResultVerifier:
                     sub_query_id=result.sub_query_id,
                     query=result.query,
                     collection=result.collection,
+                    purpose=result.purpose,
                     answer=result.answer,
                     confidence=result.confidence,
                     sources=result.sources,
                     success=False,
                     failure_reason="Failed quality verification",
                     latency_ms=result.latency_ms,
+                    prompt_tokens=result.prompt_tokens,
+                    completion_tokens=result.completion_tokens,
                 ))
 
         passed = sum(1 for r in verified if r.success)
