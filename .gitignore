@@ -30,9 +30,20 @@ data/*
 *.ckpt
 *.onnx
 
-# IDE
+# IDE & AI tool configs
 .vscode/
 .idea/
+.cursor/
+.cursorrules
+.windsurfrules
+.claude/
+.mcp.json
+.opencode.json
+
+# AI tool instruction files
+CLAUDE.md
+AGENTS.md
+GEMINI.md
 
 # OS
 Thumbs.db
@@ -51,3 +62,5 @@ build/
 
 # Models
 /models/
+# Added by code-review-graph
+.code-review-graph/
