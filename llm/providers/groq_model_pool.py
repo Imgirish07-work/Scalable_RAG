@@ -118,6 +118,14 @@ _ALL_POOL_MODELS: list[str] = [
     "meta-llama/llama-4-scout-17b-16e-instruct",  # STRONG priority-4
 ]
 
+# Models that have a reasoning/thinking mode enabled by default.
+# We always disable it — thinking tokens waste quota and produce <think>...</think>
+# tags that break all JSON parsers in the RAG pipeline.
+# Add new thinking models here as they are added to _ALL_POOL_MODELS.
+_THINKING_MODELS: frozenset[str] = frozenset([
+    "qwen/qwen3-32b",
+])
+
 # Queue item dataclass
 
 
@@ -591,6 +599,12 @@ class GroqModelPool(BaseLLM):
         temperature = kwargs.get("temperature", provider._temperature)
         max_tokens  = kwargs.get("max_tokens",  provider._max_tokens)
 
+        # Disable thinking/reasoning mode for models that produce <think> tags.
+        # Thinking tokens waste quota and break all JSON parsers in the pipeline.
+        extra_body: dict = {}
+        if provider._model in _THINKING_MODELS:
+            extra_body = {"thinking": {"type": "disabled"}}
+
         try:
             # with_raw_response returns an object whose .parse() gives the
             # normal SDK response and whose .headers gives the HTTP headers.
@@ -600,6 +614,7 @@ class GroqModelPool(BaseLLM):
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                **({"extra_body": extra_body} if extra_body else {}),
             )
             latency_ms = (time.monotonic() - start_time) * 1000
 
