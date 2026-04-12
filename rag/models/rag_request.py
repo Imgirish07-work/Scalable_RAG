@@ -32,7 +32,7 @@ from config.settings import settings
 SUPPORTED_RETRIEVAL_MODES = {"dense", "hybrid"}
 SUPPORTED_RERANK_STRATEGIES = {"none", "mmr", "cross_encoder"}
 SUPPORTED_CONFIDENCE_METHODS = {"retrieval", "llm", "hybrid"}
-SUPPORTED_RAG_VARIANTS = {"simple", "corrective", "chain"}
+SUPPORTED_RAG_VARIANTS = {"simple", "chain"}
 SUPPORTED_FILTER_OPERATORS = {"eq", "neq", "gt", "gte", "lt", "lte", "in"}
 
 
@@ -191,7 +191,7 @@ class RAGConfig(BaseModel):
 
     rag_variant: str | None = Field(
         default=None,
-        description="RAG variant: simple, corrective, chain. None = use settings default.",
+        description="RAG variant: simple, chain. None = use settings default.",
     )
     retrieval_mode: str = Field(
         default="dense",
@@ -345,7 +345,7 @@ class RAGConfig(BaseModel):
         callers that don't get the global default.
 
         Returns:
-            Resolved variant name string (e.g. 'simple', 'corrective').
+            Resolved variant name string (e.g. 'simple', 'chain').
         """
         if self.rag_variant is not None:
             return self.rag_variant
@@ -376,7 +376,7 @@ class RAGRequest(BaseModel):
             query="What are the latest compliance rules?",
             collection_name="legal_docs",
             config=RAGConfig(
-                rag_variant="corrective",
+                rag_variant="chain",
                 retrieval_mode="hybrid",
                 top_k=10,
                 temperature=0.1,

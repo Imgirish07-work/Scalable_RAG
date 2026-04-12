@@ -10,7 +10,7 @@ Design:
     in the base class, keeping it out of each concrete retriever.
 
     Retrieval mode (dense vs hybrid) is orthogonal to RAG variant (simple vs
-    corrective). A SimpleRAG can use dense or hybrid; a CorrectiveRAG can too.
+    chain). A SimpleRAG can use dense or hybrid; a ChainRAG can too.
     Strategy decouples the two axes — changing retrieval doesn't touch variant
     code.
 

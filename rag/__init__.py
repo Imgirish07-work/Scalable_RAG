@@ -15,8 +15,7 @@ Build status:
     Step 2: Retrievers           ✅ Complete
     Step 3: Context + Prompts    ✅ Complete
     Step 4: BaseRAG + SimpleRAG  ✅ Complete
-    Step 5: CorrectiveRAG        ✅ Complete
-    Step 6: RAGFactory + Tests   ✅ Complete
+    Step 5: RAGFactory + Tests   ✅ Complete
 
 Import order follows project convention:
     models → exceptions → retrievers → context → prompts → base → variants → factory
@@ -65,8 +64,6 @@ from rag.prompts.rag_prompt_templates import (
     RAG_SYSTEM_PROMPT,
     RAG_SYSTEM_PROMPT_CONCISE,
     build_rag_prompt,
-    build_relevance_eval_prompt,
-    build_query_rewrite_prompt,
     build_conversation_refinement_prompt,
     format_conversation_history,
     build_chain_draft_prompt,
@@ -76,7 +73,6 @@ from rag.prompts.rag_prompt_templates import (
 # Base + Variants
 from rag.base_rag import BaseRAG
 from rag.variants.simple_rag import SimpleRAG
-from rag.variants.corrective_rag import CorrectiveRAG
 from rag.variants.chain_rag import ChainRAG
 
 # Factory — the primary entry point for creating RAG instances
@@ -111,8 +107,6 @@ __all__ = [
     "RAG_SYSTEM_PROMPT",
     "RAG_SYSTEM_PROMPT_CONCISE",
     "build_rag_prompt",
-    "build_relevance_eval_prompt",
-    "build_query_rewrite_prompt",
     "build_conversation_refinement_prompt",
     "format_conversation_history",
     "build_chain_draft_prompt",
@@ -120,7 +114,6 @@ __all__ = [
     # Base + Variants
     "BaseRAG",
     "SimpleRAG",
-    "CorrectiveRAG",
     "ChainRAG",
     # Factory
     "RAGFactory",

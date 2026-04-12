@@ -55,7 +55,7 @@ class SubQuery(BaseModel):
     )
     variant: Optional[str] = Field(
         default=None,
-        description="RAG variant: 'simple', 'corrective', 'chain'. None uses default.",
+        description="RAG variant: 'simple', 'chain'. None uses default.",
     )
     purpose: str = Field(
         default="",

@@ -61,7 +61,7 @@ class PipelineQuery(BaseModel):
     )
     variant: Optional[str] = Field(
         default=None,
-        description="RAG variant: 'simple', 'corrective', 'chain'. None uses default.",
+        description="RAG variant: 'simple', 'chain'. None uses default.",
     )
     conversation_history: Optional[list[ConversationTurn]] = Field(
         default=None,
@@ -110,7 +110,7 @@ class PipelineQuery(BaseModel):
         """
         if v is None:
             return None
-        allowed = {"simple", "corrective", "chain"}
+        allowed = {"simple", "chain"}
         normalized = v.strip().lower()
         if normalized not in allowed:
             msg = f"Unknown variant '{v}'. Allowed: {sorted(allowed)}"

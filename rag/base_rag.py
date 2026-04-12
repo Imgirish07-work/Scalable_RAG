@@ -141,7 +141,7 @@ class BaseRAG(ABC):
         """Return the variant identifier string.
 
         Returns:
-            Variant name e.g. 'simple', 'corrective'.
+            Variant name e.g. 'simple', 'chain'.
         """
 
     @abstractmethod
@@ -155,8 +155,7 @@ class BaseRAG(ABC):
         """Retrieve relevant chunks from the vector store.
 
         This is the primary hook every variant implements. SimpleRAG
-        calls the retriever directly. CorrectiveRAG adds relevance
-        evaluation and retry logic. ChainRAG uses request to resolve
+        calls the retriever directly. ChainRAG uses request to resolve
         per-request max_hops from RAGConfig.
 
         Args:
@@ -434,7 +433,7 @@ class BaseRAG(ABC):
         """Rerank retrieved chunks using the configured strategy.
 
         Default behavior: delegate to the injected ContextRanker.
-        CorrectiveRAG may override this to add relevance evaluation
+        Subclasses may override this to add variant-specific evaluation
         before or after reranking.
 
         Args:
@@ -713,7 +712,7 @@ class BaseRAG(ABC):
     def _get_low_confidence_flag(self) -> bool:
         """Return whether the current query result has low confidence.
 
-        Default: always False. CorrectiveRAG overrides this via its
+        Default: always False. Subclasses override this via the
         _is_low_confidence instance variable set during retrieve().
 
         Returns:
@@ -733,7 +732,7 @@ class BaseRAG(ABC):
         available — cross-encoder attends jointly to (query, chunk) and
         is a stronger relevance signal than cosine distance alone.
 
-        CorrectiveRAG overrides this to use LLM-evaluated relevance scores.
+        Subclasses may override this to use LLM-evaluated relevance scores.
 
         Args:
             chunks: Updated chunks with used_in_context flags set.

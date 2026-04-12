@@ -150,7 +150,7 @@ class ChainRAG(BaseRAG):
         """
         # Reset per-query state — instance is reused across queries, so stale
         # values from a prior query must be cleared before this one begins.
-        # CorrectiveRAG does the same at the top of its retrieve().
+        # Per-query state must be reset — instance is reused across queries.
         self._chain_completed = False
         self._chain_avg_relevance = 0.0
 

@@ -95,9 +95,6 @@ class Settings(BaseSettings):
         RAG_RERANK_STRATEGY: Post-retrieval reranking strategy ('mmr', 'cross_encoder').
         RAG_RETRIEVAL_MODE: Qdrant search mode ('dense', 'sparse', 'hybrid').
         RAG_CONFIDENCE_METHOD: Method used to compute retrieval confidence score.
-        CRAG_RELEVANCE_THRESHOLD_PASS: Corrective RAG score above which retrieval passes.
-        CRAG_RELEVANCE_THRESHOLD_RETRY: Corrective RAG score below which retrieval retries.
-        CRAG_MAX_RETRIES: Maximum corrective retrieval retries.
         CHAIN_RAG_MAX_HOPS: Maximum hops for Chain-of-RAG.
         CHAIN_RAG_DRAFT_MAX_TOKENS: Max tokens for CoRAG draft generation.
         CHAIN_RAG_COMPLETENESS_MAX_TOKENS: Max tokens for CoRAG completeness check.
@@ -328,11 +325,6 @@ class Settings(BaseSettings):
     RAG_RERANK_STRATEGY: str = "mmr"
     RAG_RETRIEVAL_MODE: str = "hybrid"
     RAG_CONFIDENCE_METHOD: str = "retrieval"
-
-    # CorrectiveRAG specific
-    CRAG_RELEVANCE_THRESHOLD_PASS: float = 0.7
-    CRAG_RELEVANCE_THRESHOLD_RETRY: float = 0.4
-    CRAG_MAX_RETRIES: int = 1
 
     # CoRAG (Chain-of-RAG)
     CHAIN_RAG_MAX_HOPS: int = 3

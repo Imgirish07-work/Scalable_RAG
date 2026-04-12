@@ -16,8 +16,6 @@ Design:
 
 Chain of Responsibility:
     build_rag_prompt() called by BaseRAG.generate()
-    build_relevance_eval_prompt() called by CorrectiveRAG._evaluate_single_chunk()
-    build_query_rewrite_prompt() called by CorrectiveRAG._rewrite_query()
     build_conversation_refinement_prompt() called by BaseRAG.pre_process()
     build_chain_draft_prompt() / build_chain_completeness_prompt() called by ChainRAG
 
@@ -77,51 +75,7 @@ RAG_USER_PROMPT_WITH_HISTORY = (
 )
 
 
-# 3. CorrectiveRAG prompts — relevance evaluation and query rewriting
-
-RELEVANCE_EVAL_SYSTEM_PROMPT = (
-    "You are a relevance evaluator. Your job is to assess whether a "
-    "retrieved document is relevant to the user's query. "
-    "Respond with ONLY a JSON object, no other text."
-)
-
-RELEVANCE_EVAL_USER_PROMPT = (
-    "Query: {query}\n"
-    "\n"
-    "Document:\n"
-    "{document}\n"
-    "\n"
-    "Rate the relevance of this document to the query on a scale of "
-    "0.0 to 1.0, where:\n"
-    "- 0.0 = completely irrelevant\n"
-    "- 0.5 = partially relevant (some related info but not directly answering)\n"
-    "- 1.0 = highly relevant (directly answers or contains key information)\n"
-    "\n"
-    'Respond with ONLY: {{"relevance": <score>, "reason": "<brief reason>"}}'
-)
-
-QUERY_REWRITE_SYSTEM_PROMPT = (
-    "You are a query rewriter. Given a query that failed to retrieve "
-    "relevant documents, rewrite it to improve retrieval. "
-    "Make the query more specific, use alternative terms, or "
-    "rephrase to better match document language. "
-    "Respond with ONLY the rewritten query, nothing else."
-)
-
-QUERY_REWRITE_USER_PROMPT = (
-    "Original query: {query}\n"
-    "\n"
-    "This query failed to retrieve sufficiently relevant documents. "
-    "Rewrite it to improve retrieval. Consider:\n"
-    "- Using more specific terminology\n"
-    "- Adding relevant context or qualifiers\n"
-    "- Rephrasing to match how the answer might be stated in documents\n"
-    "\n"
-    "Rewritten query:"
-)
-
-
-# 4. ChainRAG prompts — draft generation and completeness evaluation
+# 3. ChainRAG prompts — draft generation and completeness evaluation
 
 CHAIN_DRAFT_SYSTEM_PROMPT = (
     "You are a precise information extractor. Generate a concise draft answer "
@@ -222,41 +176,6 @@ def build_rag_prompt(
             query=query,
         )
 
-    return system, user
-
-
-def build_relevance_eval_prompt(
-    query: str,
-    document: str,
-) -> tuple[str, str]:
-    """Build the prompt pair for CorrectiveRAG relevance evaluation.
-
-    Args:
-        query: The user's original question.
-        document: Single chunk content to evaluate for relevance.
-
-    Returns:
-        Tuple of (system_prompt, user_prompt).
-    """
-    system = RELEVANCE_EVAL_SYSTEM_PROMPT
-    user = RELEVANCE_EVAL_USER_PROMPT.format(
-        query=query,
-        document=document,
-    )
-    return system, user
-
-
-def build_query_rewrite_prompt(query: str) -> tuple[str, str]:
-    """Build the prompt pair for CorrectiveRAG query rewriting.
-
-    Args:
-        query: The original query that produced low-relevance retrieval results.
-
-    Returns:
-        Tuple of (system_prompt, user_prompt).
-    """
-    system = QUERY_REWRITE_SYSTEM_PROMPT
-    user = QUERY_REWRITE_USER_PROMPT.format(query=query)
     return system, user
 
 

@@ -48,10 +48,10 @@ class SimpleRAG(BaseRAG):
         - Concept explanations ("Explain the CAP theorem")
         - Any query where retrieval quality is expected to be good
 
-    When to use CorrectiveRAG instead:
-        - High-stakes queries where wrong answers are costly
-        - Domains where retrieval often returns plausible but irrelevant chunks
-        - When confidence in retrieval quality must be verified explicitly
+    When to use ChainRAG instead:
+        - Multi-hop questions requiring information from multiple sections
+        - Queries where a single retrieval pass is insufficient
+        - When answer completeness needs to be verified iteratively
     """
 
     @property

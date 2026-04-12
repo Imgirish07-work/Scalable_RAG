@@ -4,7 +4,7 @@ End-to-end RAG pipeline test using a real PDF with no mocks.
 Test scope:
     End-to-end integration test covering the full ingestion and query pipeline:
     DocumentCleaner → StructurePreserver → Chunker → QdrantStore →
-    HybridRetriever → SimpleRAG / ChainRAG / CorrectiveRAG with CacheManager.
+    HybridRetriever → SimpleRAG / ChainRAG with CacheManager.
     Each query is run twice: first call is a cache miss, second is a cache hit.
 
 Flow:
@@ -13,7 +13,7 @@ Flow:
 
 Configuration (change these two lines to switch modes):
     SEARCH_MODE  : "hybrid" | "dense" | "sparse"
-    RAG_VARIANT  : "simple" | "chain" | "corrective"
+    RAG_VARIANT  : "simple" | "chain"
 
 Dependencies:
     GEMINI_API_KEY (and optionally GROQ_API_KEY) in .env; BGE embedding model;
@@ -38,7 +38,7 @@ logger = get_logger(__name__)
 
 # Configuration — change these two lines to switch modes
 SEARCH_MODE = "hybrid"       # "hybrid" | "dense" | "sparse"
-RAG_VARIANT = "simple"       # "simple" | "chain" | "corrective"
+RAG_VARIANT = "simple"       # "simple" | "chain"
 
 PDF_PATH = "./data/sample_docs/Attention is all you need.pdf"
 
@@ -69,26 +69,9 @@ _CHAIN_QUERIES = [
     ),
 ]
 
-# CorrectiveRAG: borderline or ambiguous questions that may trigger re-retrieval
-_CORRECTIVE_QUERIES = [
-    (
-        "Does the transformer architecture completely outperform all RNN and CNN models "
-        "on every NLP benchmark, or are there tasks where previous architectures are competitive?"
-    ),
-    (
-        "What are the limitations and failure modes of the transformer architecture "
-        "as acknowledged by the authors?"
-    ),
-    (
-        "Is scaled dot-product attention more or less computationally expensive than "
-        "additive attention, and under what conditions does that relationship change?"
-    ),
-]
-
 QUERIES = {
-    "simple":     _SIMPLE_QUERIES,
-    "chain":      _CHAIN_QUERIES,
-    "corrective": _CORRECTIVE_QUERIES,
+    "simple": _SIMPLE_QUERIES,
+    "chain":  _CHAIN_QUERIES,
 }[RAG_VARIANT]
 
 

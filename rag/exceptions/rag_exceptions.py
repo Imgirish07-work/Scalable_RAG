@@ -95,7 +95,7 @@ class RAGGenerationError(RAGError):
     Raised when:
         - LLM returns empty text after prompt assembly.
         - Generation produces output that fails RAG-specific validation.
-        - CorrectiveRAG's query rewrite and retry cycle is exhausted.
+        - Generation produces output after exhausting all retry attempts.
 
     Note:
         LLM-layer errors (LLMAuthError, LLMRateLimitError, etc.) are NOT
@@ -109,8 +109,8 @@ class RAGQualityError(RAGError):
     """Answer quality check failed.
 
     Raised when:
-        - CorrectiveRAG's relevance evaluation falls below the minimum
-          threshold after all retry attempts are exhausted.
+        - Relevance evaluation falls below the minimum threshold
+          after all retry attempts are exhausted.
         - Self-refinement (future RLM integration) detects persistent
           grounding failures.
         - Confidence score is below the acceptable floor and the variant
