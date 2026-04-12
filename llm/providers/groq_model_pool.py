@@ -519,6 +519,18 @@ class GroqModelPool(BaseLLM):
                     )
                     await self._router.on_429(model_id, retry_after=86_400)
                     # Loop back — router will skip the excluded model
+
+                elif "string_too_short" in error_msg or "at least 1 character" in error_msg:
+                    # Model returned HTTP 200 but with empty completion text.
+                    # Pydantic rejects empty strings — treat as a transient model
+                    # failure and retry with the next available model.
+                    logger.warning(
+                        "model=%s returned empty response — 30s cooldown | retrying with next model",
+                        model_id,
+                    )
+                    await self._router.on_429(model_id, retry_after=30)
+                    # Loop back — router will skip this model for 30 seconds
+
                 else:
                     # Auth errors, token limit exceeded, etc. —
                     # not recoverable by switching models; propagate immediately.

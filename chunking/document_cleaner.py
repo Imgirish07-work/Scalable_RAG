@@ -57,6 +57,8 @@ class DocumentCleaner:
         r"^\s*\d+\s*$",                   # standalone page numbers
         r"^\s*http[s]?://[^\s]+\s*$",     # standalone URL lines
         r"^\s*www\.[^\s]+\s*$",           # standalone www lines
+        r"^\s*[a-zA-Z]\s*$",             # single-letter artifact lines: 'g', 'h' (footnote markers)
+        r"^\s*\[[a-zA-Z][\\'\]]*\s*$",   # bracket-letter artifacts: '[a\', '[a\']' (OCR footnote refs)
     ]
 
     _BOILERPLATE_REGEX = re.compile(
