@@ -144,6 +144,8 @@ class ModelRouter:
         Returns:
             model_id string of the selected model, or None if no model is available.
         """
+        logger.debug("route() called | role=%s | est_tokens=%d", role, est_tokens)
+
         primary_pool = _FAST_POOL if role == "FAST" else _STRONG_POOL
         secondary_pool = _STRONG_POOL if role == "FAST" else _FAST_POOL
 
@@ -158,7 +160,14 @@ class ModelRouter:
             "Primary %s pool exhausted — attempting cross-pool overflow to %s pool",
             role, other_label,
         )
-        return await self._pick_from_pool(secondary_pool, est_tokens, pool_label=other_label)
+        result = await self._pick_from_pool(secondary_pool, est_tokens, pool_label=other_label)
+        if result is None:
+            logger.error(
+                "All pools exhausted — no model available in either pool | "
+                "role=%s | est_tokens=%d",
+                role, est_tokens,
+            )
+        return result
 
     async def on_429(
         self,

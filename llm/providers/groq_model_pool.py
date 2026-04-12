@@ -413,10 +413,15 @@ class GroqModelPool(BaseLLM):
             try:
                 response = await self._dispatch(item.messages, **item.kwargs)
                 item.future.set_result(response)
+                logger.debug("Worker %d request fulfilled | queue_remaining=%d", worker_id, self._queue.qsize())
             except Exception as exc:
                 # Surface all exceptions to the caller via the future — workers
                 # must never crash; they catch everything and keep running.
                 if not item.future.done():
+                    logger.warning(
+                        "Worker %d dispatch failed | error=%s: %s — surfacing exception to caller",
+                        worker_id, type(exc).__name__, str(exc)[:120],
+                    )
                     item.future.set_exception(exc)
             finally:
                 self._queue.task_done()
@@ -618,6 +623,10 @@ class GroqModelPool(BaseLLM):
                 ]
             else:
                 messages = [{"role": "system", "content": "/no_think"}, *messages]
+            logger.debug(
+                "Thinking mode suppressed | model=%s | method=reasoning_format_hidden+no_think",
+                provider._model,
+            )
 
         try:
             # with_raw_response returns an object whose .parse() gives the
@@ -650,9 +659,9 @@ class GroqModelPool(BaseLLM):
         except (AttributeError, TypeError):
             # with_raw_response not available on this SDK version — fall back to
             # a normal chat() call; headers will not be extracted this time.
-            logger.debug(
-                "with_raw_response unavailable for model=%s; "
-                "falling back to normal chat() — headers will not be extracted",
+            logger.warning(
+                "Header extraction unavailable | model=%s | fallback=provider.chat() "
+                "— rate limit headers missing, tracker accuracy reduced this call",
                 provider._model,
             )
             response = await provider.chat(messages, **kwargs)
@@ -686,9 +695,9 @@ class GroqModelPool(BaseLLM):
         Returns:
             "FAST" or "STRONG".
         """
-        if max_tokens is None or max_tokens > _FAST_MAX_TOKENS_THRESHOLD:
-            return "STRONG"
-        return "FAST"
+        role: CallRole = "STRONG" if (max_tokens is None or max_tokens > _FAST_MAX_TOKENS_THRESHOLD) else "FAST"
+        logger.debug("Role detected | role=%s | max_tokens=%s", role, max_tokens)
+        return role
 
     async def _estimate_tokens(
         self,
@@ -719,7 +728,12 @@ class GroqModelPool(BaseLLM):
 
         # Add expected completion size; default to 512 if not specified
         completion_budget = max_tokens if max_tokens is not None else 512
-        return prompt_tokens + completion_budget
+        total = prompt_tokens + completion_budget
+        logger.debug(
+            "Token estimate | prompt=%d | completion_budget=%d | total=%d",
+            prompt_tokens, completion_budget, total,
+        )
+        return total
 
     @staticmethod
     def _parse_retry_after(error_str: str) -> Optional[int]:
