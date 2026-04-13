@@ -276,7 +276,7 @@ class ChainRAG(BaseRAG):
         """Return True when the chain did not complete within max_hops."""
         return not self._chain_completed
 
-    # ── Private helpers ────────────────────────────────────────────────────────
+    # Private helpers
 
     def _get_reranker(self):
         """Return the CrossEncoderReranker instance if loaded, else None."""
@@ -293,8 +293,9 @@ class ChainRAG(BaseRAG):
         """Rerank merged chunks with cross-encoder; fall back to score-based filter.
 
         Runs blocking ONNX/PyTorch inference in a thread pool to keep the
-        async event loop responsive. Without a reranker, returns top_k chunks
-        sorted by dense relevance score.
+        async event loop responsive. After ranking, drops chunks below
+        CHAIN_RAG_MIN_CHUNK_SCORE to prevent noise accumulation across hops.
+        Always retains at least one chunk (the top scorer) to avoid stalling the chain.
         """
         if not chunks:
             return chunks
@@ -302,10 +303,20 @@ class ChainRAG(BaseRAG):
         reranker = self._get_reranker()
         if reranker:
             # Blocking model inference — run off the event loop
-            return await asyncio.to_thread(reranker.rerank, query, chunks, top_k)
+            candidates = await asyncio.to_thread(reranker.rerank, query, chunks, top_k)
+        else:
+            candidates = sorted(chunks, key=lambda c: c.relevance_score, reverse=True)[:top_k]
 
-        # Fallback: simple score-based cap
-        return sorted(chunks, key=lambda c: c.relevance_score, reverse=True)[:top_k]
+        # Drop chunks that score below the minimum quality floor.
+        # reranker_score is preferred; falls back to dense relevance_score.
+        min_score = settings.CHAIN_RAG_MIN_CHUNK_SCORE
+        filtered = [
+            c for c in candidates
+            if (c.reranker_score if c.reranker_score is not None else c.relevance_score)
+            >= min_score
+        ]
+        # Never return empty — the chain would stall with nothing to evaluate
+        return filtered if filtered else candidates[:1]
 
     def _check_gate1_sufficient(self, chunks: list[RetrievedChunk]) -> bool:
         """Return True if accumulated chunks are already good enough to skip the LLM.
@@ -498,8 +509,13 @@ def _merge_chunks(
 def _build_draft_context(chunks: list[RetrievedChunk]) -> str:
     """Build a context string from the top-scoring chunks for the combined LLM call.
 
-    Sorts by reranker_score (if set) or relevance_score descending and caps at
-    CHAIN_RAG_DRAFT_CONTEXT_MAX_CHUNKS to prevent token explosion.
+    Two-level cap:
+      1. Chunk count — CHAIN_RAG_DRAFT_CONTEXT_MAX_CHUNKS (prevents large-chunk spikes).
+      2. Character budget — CHAIN_RAG_DRAFT_CONTEXT_MAX_CHARS (~4 chars/token, targets
+         ~3 000 tokens). Stops appending once the running total would exceed the budget.
+
+    At least one chunk is always included regardless of budget to ensure the LLM
+    has something to work with.
 
     Args:
         chunks: Accumulated chunks to include in the context.
@@ -508,16 +524,27 @@ def _build_draft_context(chunks: list[RetrievedChunk]) -> str:
         Numbered, newline-separated chunk content string.
     """
     cap = settings.CHAIN_RAG_DRAFT_CONTEXT_MAX_CHUNKS
+    char_budget = settings.CHAIN_RAG_DRAFT_CONTEXT_MAX_CHARS
 
     # Sort by best available score — reranker_score is more accurate when set
     sorted_chunks = sorted(
         chunks,
-        key=lambda c: (c.reranker_score or 0.0) if c.reranker_score is not None
-                      else c.relevance_score,
+        key=lambda c: c.reranker_score if c.reranker_score is not None else c.relevance_score,
         reverse=True,
     )[:cap]
 
-    return "\n\n".join(f"[{i}] {c.content}" for i, c in enumerate(sorted_chunks, 1))
+    # Enforce character budget — stops token spikes from large chunks.
+    # First chunk is always included so the LLM is never handed an empty context.
+    selected: list[RetrievedChunk] = []
+    running_chars = 0
+    for chunk in sorted_chunks:
+        chunk_chars = len(chunk.content)
+        if selected and running_chars + chunk_chars > char_budget:
+            break
+        selected.append(chunk)
+        running_chars += chunk_chars
+
+    return "\n\n".join(f"[{i}] {c.content}" for i, c in enumerate(selected, 1))
 
 
 def _parse_combined_response(text: str) -> dict:

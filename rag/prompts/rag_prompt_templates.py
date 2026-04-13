@@ -142,8 +142,12 @@ CHAIN_COMBINED_SYSTEM_PROMPT = (
     "1. Answer ONLY from the provided context. Flag external references explicitly.\n"
     '2. Set "is_complete" to true ONLY if the draft fully answers the query.\n'
     '3. "follow_up_query" must be an empty string when is_complete is true.\n'
-    '4. Make "follow_up_query" targeted for vector similarity search — '
-    "not a restatement of the original query."
+    '4. "follow_up_query" must be a SHORT, SPECIFIC factual question — at most 12 words.\n'
+    "   - Identify exactly ONE fact or definition that is missing from your draft.\n"
+    "   - Write a precise retrieval question for that single missing fact.\n"
+    "   - Do NOT write topic phrases or broad expansions.\n"
+    '   - Good: "What replication factor does Cassandra use by default?"\n'
+    '   - Bad: "distributed replication and consistency trade-offs"'
 )
 
 CHAIN_COMBINED_USER_PROMPT = (
