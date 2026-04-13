@@ -124,6 +124,36 @@ CHAIN_COMPLETENESS_USER_PROMPT = (
 )
 
 
+# 4. ChainRAG combined prompt — draft + completeness in one LLM call
+
+CHAIN_COMBINED_SYSTEM_PROMPT = (
+    "You are a precise answer generator and completeness evaluator.\n\n"
+    "Given a query and retrieved context, do TWO things in ONE response:\n"
+    "1. Write a concise draft answer using ONLY the provided context.\n"
+    "2. Evaluate whether your draft fully resolves the query.\n\n"
+    "Respond with ONLY a JSON object — no markdown fences, no preamble:\n"
+    "{\n"
+    '  "draft": "Your concise answer here",\n'
+    '  "is_complete": true/false,\n'
+    '  "reasoning": "Brief explanation of what is resolved or missing",\n'
+    '  "follow_up_query": "Targeted search query for missing info, or empty string"\n'
+    "}\n\n"
+    "RULES:\n"
+    "1. Answer ONLY from the provided context. Flag external references explicitly.\n"
+    '2. Set "is_complete" to true ONLY if the draft fully answers the query.\n'
+    '3. "follow_up_query" must be an empty string when is_complete is true.\n'
+    '4. Make "follow_up_query" targeted for vector similarity search — '
+    "not a restatement of the original query."
+)
+
+CHAIN_COMBINED_USER_PROMPT = (
+    "Context:\n"
+    "{context}\n\n"
+    "Query: {query}\n\n"
+    "Generate the draft answer and evaluate completeness. Respond with JSON only."
+)
+
+
 # 5. Utility prompts — conversation-aware query refinement
 
 CONVERSATION_QUERY_REFINEMENT_PROMPT = (
@@ -255,6 +285,23 @@ def build_chain_draft_prompt(context: str, query: str) -> tuple[str, str]:
         query=query,
     )
     return CHAIN_DRAFT_SYSTEM_PROMPT, user_prompt
+
+
+def build_chain_combined_prompt(context: str, query: str) -> tuple[str, str]:
+    """Build system and user prompts for the combined ChainRAG draft + completeness call.
+
+    Replaces the two-call pattern (build_chain_draft_prompt + build_chain_completeness_prompt)
+    with a single LLM call that returns draft, is_complete, reasoning, and follow_up_query.
+
+    Args:
+        context: Assembled context string from accumulated retrieved chunks.
+        query: The original user query.
+
+    Returns:
+        Tuple of (system_prompt, user_prompt) for BaseLLM.chat().
+    """
+    user_prompt = CHAIN_COMBINED_USER_PROMPT.format(context=context, query=query)
+    return CHAIN_COMBINED_SYSTEM_PROMPT, user_prompt
 
 
 def build_chain_completeness_prompt(

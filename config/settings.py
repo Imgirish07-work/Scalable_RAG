@@ -330,6 +330,14 @@ class Settings(BaseSettings):
     CHAIN_RAG_MAX_HOPS: int = 3
     CHAIN_RAG_DRAFT_MAX_TOKENS: int = 512
     CHAIN_RAG_COMPLETENESS_MAX_TOKENS: int = 512
+    # Cross-encoder Gate 1 threshold — avg score ≥ this skips the LLM call entirely
+    CHAIN_RAG_RELEVANCE_THRESHOLD: float = Field(default=0.55, env="CHAIN_RAG_RELEVANCE_THRESHOLD")
+    # Max chunks fed to the combined prompt — prevents token explosion across hops
+    CHAIN_RAG_DRAFT_CONTEXT_MAX_CHUNKS: int = Field(default=8, env="CHAIN_RAG_DRAFT_CONTEXT_MAX_CHUNKS")
+    # Seconds to wait before one retry when the entire LLM pool is rate-limited
+    CHAIN_RAG_RATE_LIMIT_RETRY_WAIT: float = Field(default=30.0, env="CHAIN_RAG_RATE_LIMIT_RETRY_WAIT")
+    # Cross-encoder similarity threshold for follow-up rejection (≥ this = same question)
+    CHAIN_RAG_FOLLOWUP_SIMILARITY_THRESHOLD: float = Field(default=0.85, env="CHAIN_RAG_FOLLOWUP_SIMILARITY_THRESHOLD")
 
     # Cost per token — used to estimate savings from cache hits
     COST_PER_TOKEN_OPENAI: float = 0.000002

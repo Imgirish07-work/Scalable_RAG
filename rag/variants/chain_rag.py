@@ -2,13 +2,23 @@
 ChainRAG (CoRAG) — multi-hop retrieval that follows document reference chains.
 
 Design:
-    Overrides retrieve() to perform iterative retrieval. When an initial
-    retrieval reveals references to external documents, regulations, or
-    appendices not present in the first result set, ChainRAG generates a
-    draft answer, evaluates its completeness, and uses a targeted follow-up
-    query to retrieve the missing information. This repeats up to max_hops
-    times. Overrides _compute_confidence() and _get_low_confidence_flag()
-    to reflect whether the chain completed within the hop budget.
+    Overrides retrieve() to perform iterative retrieval. Per-hop flow:
+        1. Retrieve chunks for the current query (original or follow-up).
+        2. Merge + deduplicate against chunks from prior hops.
+        3. Rerank with cross-encoder (if enabled); cap to top_k to prevent
+           token explosion across hops.
+        4. Gate 1 (free): avg cross-encoder score ≥ threshold → context is
+           already sufficient, mark complete and skip the LLM call entirely.
+        5. Gate 2 (one LLM call): combined draft + completeness evaluation
+           in a single prompt — returns draft text, is_complete, reasoning,
+           and a targeted follow-up query when incomplete.
+        6. Validate the follow-up before the next hop: checks length, string
+           identity, word overlap, and cross-encoder semantic similarity.
+
+    LLM call reduction vs. the previous design:
+        Before: 2 calls/hop (draft + completeness) × max_hops = up to 6 calls.
+        After:  1 call/hop (combined)              × max_hops = up to 3 calls.
+                0 calls when Gate 1 fires on hop 1.
 
     All downstream steps (rank, assemble_context, generate, cache) are
     inherited unchanged from BaseRAG.
@@ -16,17 +26,20 @@ Design:
 Chain of Responsibility:
     Created by RAGFactory → BaseRAG.query() calls retrieve()
     → ChainRAG.retrieve() → _single_hop_retrieve() per hop
-    → _generate_draft() → _evaluate_completeness() → next hop or stop
+    → _rerank_and_filter() → Gate 1 (score threshold)
+    → _evaluate_combined() (Gate 2, single LLM call)
     → returns accumulated deduplicated list[RetrievedChunk].
 
 Dependencies:
     rag.base_rag (BaseRAG)
-    rag.prompts.rag_prompt_templates (build_chain_draft_prompt, build_chain_completeness_prompt)
+    rag.prompts.rag_prompt_templates (build_chain_combined_prompt)
     rag.exceptions.rag_exceptions (RAGRetrievalError)
+    llm.exceptions.llm_exceptions (LLMRateLimitError)
     config.settings (settings)
 """
 
 # stdlib
+import asyncio
 import hashlib
 import json
 import re
@@ -36,33 +49,33 @@ from typing import Optional
 # internal
 from config.settings import settings
 from llm.contracts.base_llm import BaseLLM
+from llm.exceptions.llm_exceptions import LLMRateLimitError
 from rag.base_rag import BaseRAG
 from rag.context.context_assembler import ContextAssembler
 from rag.context.context_ranker import ContextRanker
 from rag.exceptions.rag_exceptions import RAGRetrievalError
 from rag.models.rag_request import MetadataFilter, RAGRequest
 from rag.models.rag_response import ConfidenceScore, RetrievedChunk
-from rag.prompts.rag_prompt_templates import (
-    build_chain_completeness_prompt,
-    build_chain_draft_prompt,
-)
+from rag.prompts.rag_prompt_templates import build_chain_combined_prompt
 from rag.retrieval.base_retriever import BaseRetriever
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Draft generation token budget — kept low to minimise cost per hop
-_DRAFT_MAX_TOKENS = settings.CHAIN_RAG_DRAFT_MAX_TOKENS
-_COMPLETENESS_MAX_TOKENS = settings.CHAIN_RAG_COMPLETENESS_MAX_TOKENS
+# Combined call token budget = draft + completeness in one response
+_COMBINED_MAX_TOKENS = (
+    settings.CHAIN_RAG_DRAFT_MAX_TOKENS + settings.CHAIN_RAG_COMPLETENESS_MAX_TOKENS
+)
 
-# Reject follow-up queries that are suspiciously longer than the original
+# Reject follow-up queries far longer than the original (likely LLM explanation)
 _MAX_FOLLOW_UP_LENGTH_RATIO = 5
 
-# Safe fallback when completeness response cannot be parsed — treat as complete
-# to avoid an infinite loop on malformed LLM output.
-_FALLBACK_COMPLETENESS = {
+# Fallback when combined response cannot be parsed — treat as complete to
+# avoid an infinite loop on malformed LLM output.
+_FALLBACK_COMBINED = {
+    "draft": "",
     "is_complete": True,
-    "reasoning": "Completeness parsing failed — treating as complete",
+    "reasoning": "Response parsing failed — treating as complete",
     "follow_up_query": "",
 }
 
@@ -75,9 +88,12 @@ class ChainRAG(BaseRAG):
     iteratively until the full context is assembled or max_hops is reached.
 
     Overrides:
-        retrieve() — multi-hop retrieval with completeness evaluation.
-        _compute_confidence() — uses chain evaluation with an incomplete-chain penalty.
-        _get_low_confidence_flag() — True if max hops were exhausted without completion.
+        retrieve() — multi-hop retrieval with cross-encoder gating and a
+            single combined LLM call per hop (draft + completeness).
+        _compute_confidence() — uses chain evaluation with an incomplete-chain
+            penalty; prefers reranker_score over dense relevance_score.
+        _get_low_confidence_flag() — True if max hops were exhausted without
+            completion.
     """
 
     def __init__(
@@ -89,16 +105,6 @@ class ChainRAG(BaseRAG):
         assembler: Optional[ContextAssembler] = None,
         fallback_llm: Optional[BaseLLM] = None,
     ) -> None:
-        """Initialize the ChainRAG variant.
-
-        Args:
-            retriever: Retriever strategy (dense or hybrid).
-            llm: LLM provider for draft generation and completeness evaluation.
-            cache: Optional CacheManager instance.
-            ranker: Optional ContextRanker. Defaults to MMR in BaseRAG.
-            assembler: Optional ContextAssembler. Defaults in BaseRAG.
-            fallback_llm: Optional secondary LLM used when the primary fails.
-        """
         super().__init__(
             retriever=retriever,
             llm=llm,
@@ -109,16 +115,11 @@ class ChainRAG(BaseRAG):
         )
         # True when the chain resolves within max_hops; False when truncated
         self._chain_completed: bool = False
-        # Average relevance across all hops; used for confidence scoring
+        # Avg relevance across all hops — used for confidence scoring
         self._chain_avg_relevance: float = 0.0
 
     @property
     def variant_name(self) -> str:
-        """Return the variant identifier.
-
-        Returns:
-            The string 'chain'.
-        """
         return "chain"
 
     async def retrieve(
@@ -128,28 +129,20 @@ class ChainRAG(BaseRAG):
         filters: Optional[list[MetadataFilter]] = None,
         request: Optional[RAGRequest] = None,
     ) -> list[RetrievedChunk]:
-        """Multi-hop retrieval with completeness evaluation.
-
-        Retrieves chunks, generates a draft answer, evaluates completeness,
-        and issues a targeted follow-up query when references are unresolved.
-        Repeats until the draft is complete or max_hops is reached. All
-        chunks from all hops are merged with deduplication.
+        """Multi-hop retrieval with cross-encoder gating and combined LLM evaluation.
 
         Args:
             query: The user's original query.
             top_k: Number of chunks to retrieve per hop.
             filters: Optional metadata filters applied to every hop.
-            request: Optional RAGRequest for reading config overrides
-                such as per-request max_hops.
+            request: Optional RAGRequest for per-request config overrides.
 
         Returns:
-            Accumulated, deduplicated chunks from all hops.
+            Accumulated, deduplicated, reranked chunks from all hops.
 
         Raises:
             RAGRetrievalError: If the initial retrieval (hop 1) fails entirely.
         """
-        # Reset per-query state — instance is reused across queries, so stale
-        # values from a prior query must be cleared before this one begins.
         # Per-query state must be reset — instance is reused across queries.
         self._chain_completed = False
         self._chain_avg_relevance = 0.0
@@ -159,80 +152,90 @@ class ChainRAG(BaseRAG):
         current_query = query
 
         logger.info(
-            "CoRAG starting chain retrieval, max_hops=%d, query='%s'",
+            "CoRAG starting | max_hops=%d | reranker=%s | query='%s'",
             max_hops,
+            "enabled" if self._get_reranker() else "disabled",
             query[:100],
         )
 
         for hop in range(1, max_hops + 1):
             hop_start = time.perf_counter()
 
-            # Retrieve for the current query (original or follow-up)
-            hop_chunks = await self._single_hop_retrieve(
-                current_query, top_k, filters,
-            )
+            hop_chunks = await self._single_hop_retrieve(current_query, top_k, filters)
 
             if not hop_chunks and hop == 1:
-                # First hop returned nothing — no point continuing the chain
-                logger.warning("CoRAG hop 1 returned no chunks, aborting chain")
-                self._chain_completed = False
+                logger.warning("CoRAG hop 1 returned no chunks | aborting chain")
                 return []
 
             # Merge new chunks into accumulated set, deduplicating by chunk_id
             accumulated_chunks = _merge_chunks(accumulated_chunks, hop_chunks)
 
-            hop_ms = (time.perf_counter() - hop_start) * 1000
-            logger.info(
-                "CoRAG hop %d/%d retrieved %d chunks (%d accumulated) in %.1fms",
-                hop, max_hops, len(hop_chunks),
-                len(accumulated_chunks), hop_ms,
+            # Rerank merged set — filters noise, caps size, prevents token explosion
+            accumulated_chunks = await self._rerank_and_filter(
+                accumulated_chunks, query, top_k,
             )
 
-            # Generate a draft from all accumulated chunks so far
-            draft = await self._generate_draft(query, accumulated_chunks)
-            if not draft:
-                logger.warning("CoRAG hop %d draft generation returned empty", hop)
-                break
+            hop_ms = (time.perf_counter() - hop_start) * 1000
+            logger.info(
+                "CoRAG hop %d/%d | retrieved=%d | accumulated=%d | elapsed_ms=%.1f",
+                hop, max_hops, len(hop_chunks), len(accumulated_chunks), hop_ms,
+            )
 
-            # Evaluate completeness against the ORIGINAL query (not the follow-up)
-            completeness = await self._evaluate_completeness(query, draft)
-
-            if completeness["is_complete"]:
+            # Gate 1 (free): cross-encoder avg score above threshold — no LLM needed
+            if self._check_gate1_sufficient(accumulated_chunks):
                 logger.info(
-                    "CoRAG chain complete at hop %d: %s",
-                    hop, completeness["reasoning"],
+                    "CoRAG Gate 1 passed at hop %d | avg_score≥%.2f | 0 LLM calls",
+                    hop, settings.CHAIN_RAG_RELEVANCE_THRESHOLD,
                 )
                 self._chain_completed = True
                 break
 
-            # Draft is incomplete — prepare follow-up query for next hop
-            follow_up = completeness.get("follow_up_query", "")
-            if not self._is_valid_follow_up(follow_up, query):
+            # Gate 2: single combined LLM call — draft + completeness + follow-up
+            combined = await self._evaluate_combined(query, accumulated_chunks)
+
+            if combined["is_complete"]:
+                logger.info(
+                    "CoRAG Gate 2 complete at hop %d | reasoning='%s'",
+                    hop, combined["reasoning"],
+                )
+                self._chain_completed = True
+                break
+
+            # Validate follow-up before using it for the next retrieval hop
+            follow_up = combined.get("follow_up_query", "")
+            if not await self._is_valid_follow_up(follow_up, query):
                 logger.warning(
-                    "CoRAG hop %d produced invalid follow-up, stopping chain",
+                    "CoRAG hop %d | invalid or duplicate follow-up | stopping chain",
                     hop,
                 )
                 break
 
             logger.info(
-                "CoRAG hop %d incomplete, follow-up: '%s'",
+                "CoRAG hop %d incomplete | follow_up='%s'",
                 hop, follow_up[:100],
             )
             current_query = follow_up
 
         else:
-            # for-else: loop body never broke — max hops exhausted
+            # for-else: loop ran to completion without breaking — hops exhausted
             logger.warning(
                 "CoRAG exhausted max_hops=%d without completing chain", max_hops,
             )
             self._chain_completed = False
 
-        # Compute average relevance across all accumulated chunks for confidence
-        scores = [c.relevance_score for c in accumulated_chunks if c.relevance_score > 0]
+        # Prefer reranker_score for confidence (more accurate than dense scores)
+        reranker = self._get_reranker()
+        if reranker:
+            scores = [
+                c.reranker_score for c in accumulated_chunks
+                if c.reranker_score is not None and c.reranker_score > 0
+            ]
+        else:
+            scores = [c.relevance_score for c in accumulated_chunks if c.relevance_score > 0]
         self._chain_avg_relevance = sum(scores) / len(scores) if scores else 0.0
 
         logger.info(
-            "CoRAG chain finished, completed=%s, total_chunks=%d, avg_relevance=%.3f",
+            "CoRAG finished | completed=%s | total_chunks=%d | avg_relevance=%.3f",
             self._chain_completed, len(accumulated_chunks), self._chain_avg_relevance,
         )
         return accumulated_chunks
@@ -242,24 +245,25 @@ class ChainRAG(BaseRAG):
         chunks: list[RetrievedChunk],
         method: str = "retrieval",
     ) -> ConfidenceScore:
-        """Compute confidence from chain completion status and relevance.
+        """Compute confidence from chain completion status and chunk scores.
 
-        Averages relevance scores of chunks that were included in context.
-        Applies a 20% penalty when the chain did not complete within max_hops,
-        signalling that the answer may be missing referenced information.
-
-        Args:
-            chunks: All retrieved chunks with used_in_context flags set.
-            method: Ignored — ChainRAG always reports 'chain_eval'.
-
-        Returns:
-            ConfidenceScore with chain_eval method.
+        Prefers reranker_score (cross-encoder, more accurate) over relevance_score
+        (dense cosine). Applies a 20% penalty when the chain did not complete
+        within max_hops.
         """
         used = [c for c in chunks if c.used_in_context]
         if not used:
             return ConfidenceScore(value=0.0, method="chain_eval")
 
-        scores = [c.relevance_score for c in used if c.relevance_score > 0]
+        reranker = self._get_reranker()
+        if reranker:
+            scores = [
+                c.reranker_score for c in used
+                if c.reranker_score is not None and c.reranker_score > 0
+            ]
+        else:
+            scores = [c.relevance_score for c in used if c.relevance_score > 0]
+
         avg = sum(scores) / len(scores) if scores else 0.0
 
         # Penalise incomplete chains — answer may be missing referenced content
@@ -269,14 +273,63 @@ class ChainRAG(BaseRAG):
         return ConfidenceScore(value=round(min(avg, 1.0), 4), method="chain_eval")
 
     def _get_low_confidence_flag(self) -> bool:
-        """Return True when the chain did not complete within max_hops.
-
-        Returns:
-            True if the chain was truncated; False if it completed normally.
-        """
+        """Return True when the chain did not complete within max_hops."""
         return not self._chain_completed
 
-    # Private helpers
+    # ── Private helpers ────────────────────────────────────────────────────────
+
+    def _get_reranker(self):
+        """Return the CrossEncoderReranker instance if loaded, else None."""
+        if self._ranker and getattr(self._ranker, "_reranker", None):
+            return self._ranker._reranker
+        return None
+
+    async def _rerank_and_filter(
+        self,
+        chunks: list[RetrievedChunk],
+        query: str,
+        top_k: int,
+    ) -> list[RetrievedChunk]:
+        """Rerank merged chunks with cross-encoder; fall back to score-based filter.
+
+        Runs blocking ONNX/PyTorch inference in a thread pool to keep the
+        async event loop responsive. Without a reranker, returns top_k chunks
+        sorted by dense relevance score.
+        """
+        if not chunks:
+            return chunks
+
+        reranker = self._get_reranker()
+        if reranker:
+            # Blocking model inference — run off the event loop
+            return await asyncio.to_thread(reranker.rerank, query, chunks, top_k)
+
+        # Fallback: simple score-based cap
+        return sorted(chunks, key=lambda c: c.relevance_score, reverse=True)[:top_k]
+
+    def _check_gate1_sufficient(self, chunks: list[RetrievedChunk]) -> bool:
+        """Return True if accumulated chunks are already good enough to skip the LLM.
+
+        Compares avg score against CHAIN_RAG_RELEVANCE_THRESHOLD. Uses
+        reranker_score when available (more accurate); falls back to dense
+        relevance_score.
+        """
+        if not chunks:
+            return False
+
+        reranker = self._get_reranker()
+        if reranker:
+            scores = [
+                c.reranker_score for c in chunks
+                if c.reranker_score is not None and c.reranker_score > 0
+            ]
+        else:
+            scores = [c.relevance_score for c in chunks if c.relevance_score > 0]
+
+        if not scores:
+            return False
+
+        return (sum(scores) / len(scores)) >= settings.CHAIN_RAG_RELEVANCE_THRESHOLD
 
     async def _single_hop_retrieve(
         self,
@@ -284,146 +337,127 @@ class ChainRAG(BaseRAG):
         top_k: int,
         filters: Optional[list[MetadataFilter]],
     ) -> list[RetrievedChunk]:
-        """Execute a single retrieval hop via the injected retriever.
-
-        Args:
-            query: Query string for this hop (original or follow-up).
-            top_k: Number of chunks to retrieve.
-            filters: Optional metadata filters.
-
-        Returns:
-            Retrieved chunks for this hop.
-
-        Raises:
-            RAGRetrievalError: If retrieval fails.
-        """
         return await self._retriever.retrieve(
             query=query,
             top_k=top_k,
             filters=filters,
         )
 
-    async def _generate_draft(
+    async def _evaluate_combined(
         self,
         query: str,
         chunks: list[RetrievedChunk],
-    ) -> str:
-        """Generate a concise draft answer from the accumulated chunks.
-
-        Uses a low max_tokens budget to minimise cost per hop. Temperature
-        is fixed at 0.0 for deterministic, factual output.
-
-        Args:
-            query: The original user query.
-            chunks: All accumulated chunks from hops completed so far.
-
-        Returns:
-            Draft answer string, or empty string on failure.
-        """
-        # Build a lightweight context string for the draft prompt
-        context = _build_draft_context(chunks)
-        system_prompt, user_prompt = build_chain_draft_prompt(context, query)
-
-        try:
-            response = await self._llm.chat(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.0,
-                max_tokens=_DRAFT_MAX_TOKENS,
-            )
-            return response.text.strip()
-
-        except Exception:
-            logger.exception("CoRAG draft generation failed")
-            return ""
-
-    async def _evaluate_completeness(
-        self,
-        query: str,
-        draft_answer: str,
     ) -> dict:
-        """Evaluate whether the draft answer fully resolves the query.
+        """Single LLM call: generate draft + evaluate completeness + get follow-up.
 
-        Expects a structured JSON response from the LLM. Falls back to
-        treating the answer as complete when parsing fails — this prevents
-        infinite loops on malformed LLM output.
-
-        Args:
-            query: The original user query.
-            draft_answer: Current draft answer to evaluate.
+        On rate-limit, waits CHAIN_RAG_RATE_LIMIT_RETRY_WAIT seconds and
+        retries once before falling back to treating the answer as complete.
 
         Returns:
-            Dict with keys: is_complete (bool), reasoning (str),
+            Dict with keys: draft (str), is_complete (bool), reasoning (str),
             follow_up_query (str).
         """
-        system_prompt, user_prompt = build_chain_completeness_prompt(
-            query, draft_answer,
-        )
+        context = _build_draft_context(chunks)
+        system_prompt, user_prompt = build_chain_combined_prompt(context, query)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
-        try:
-            response = await self._llm.chat(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.0,
-                max_tokens=_COMPLETENESS_MAX_TOKENS,
-            )
-            return _parse_completeness_response(response.text)
+        for attempt in range(2):
+            try:
+                response = await self._llm.chat(
+                    messages=messages,
+                    temperature=0.0,
+                    max_tokens=_COMBINED_MAX_TOKENS,
+                )
+                return _parse_combined_response(response.text)
 
-        except Exception:
-            logger.exception("CoRAG completeness evaluation failed")
-            return _FALLBACK_COMPLETENESS.copy()
+            except LLMRateLimitError:
+                if attempt == 0:
+                    wait = settings.CHAIN_RAG_RATE_LIMIT_RETRY_WAIT
+                    logger.warning(
+                        "CoRAG combined eval rate-limited | "
+                        "waiting %.1fs then retrying | attempt=%d",
+                        wait, attempt + 1,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                # Second attempt also rate-limited — stop the chain gracefully
+                logger.warning(
+                    "CoRAG combined eval rate-limited after retry | "
+                    "treating as complete | stopping chain"
+                )
+                return _FALLBACK_COMBINED.copy()
 
-    def _is_valid_follow_up(self, follow_up: str, original_query: str) -> bool:
+            except Exception:
+                logger.exception("CoRAG combined eval failed")
+                return _FALLBACK_COMBINED.copy()
+
+        return _FALLBACK_COMBINED.copy()  # satisfies type checker
+
+    async def _is_valid_follow_up(
+        self,
+        follow_up: str,
+        original_query: str,
+    ) -> bool:
         """Validate a follow-up query before using it for the next hop.
 
-        Guards against empty follow-ups, queries identical to the original
-        (would cause an infinite loop), and suspiciously long follow-ups
-        (likely an LLM explanation rather than a query).
-
-        Args:
-            follow_up: The proposed follow-up query string.
-            original_query: The original user query for length comparison.
-
-        Returns:
-            True if the follow-up is safe to use for the next retrieval hop.
+        Checks in order from cheapest to most expensive:
+            1. Empty string.
+            2. Suspiciously long (likely LLM explanation, not a query).
+            3. Identical string to original (infinite loop guard).
+            4. High word overlap ≥ 75% (near-duplicate without exact match).
+            5. High cross-encoder similarity ≥ threshold (semantic duplicate).
         """
         if not follow_up or not follow_up.strip():
             return False
 
-        # Reject follow-ups that are far longer than the original query
         if len(follow_up) > len(original_query) * _MAX_FOLLOW_UP_LENGTH_RATIO:
             logger.warning(
-                "CoRAG follow-up too long: %d chars vs original %d chars",
+                "CoRAG follow-up too long | %d chars vs original %d chars",
                 len(follow_up), len(original_query),
             )
             return False
 
-        # Reject follow-ups identical to the original — would loop without progress
         if follow_up.strip().lower() == original_query.strip().lower():
-            logger.warning("CoRAG follow-up is identical to original query")
+            logger.warning("CoRAG follow-up identical to original query")
             return False
+
+        # Word overlap: >75% shared words → not a meaningful refinement
+        original_words = set(original_query.lower().split())
+        followup_words = set(follow_up.lower().split())
+        if original_words:
+            overlap = len(original_words & followup_words) / len(original_words)
+            if overlap > 0.75:
+                logger.warning(
+                    "CoRAG follow-up word overlap too high | overlap=%.2f", overlap,
+                )
+                return False
+
+        # Cross-encoder semantic similarity — catches rephrased duplicates
+        reranker = self._get_reranker()
+        if reranker:
+            scores = await asyncio.to_thread(
+                reranker._score_pairs, [[original_query, follow_up]],
+            )
+            if scores and scores[0] >= settings.CHAIN_RAG_FOLLOWUP_SIMILARITY_THRESHOLD:
+                logger.warning(
+                    "CoRAG follow-up semantically similar to original | "
+                    "cross_encoder_score=%.3f | threshold=%.2f",
+                    scores[0], settings.CHAIN_RAG_FOLLOWUP_SIMILARITY_THRESHOLD,
+                )
+                return False
 
         return True
 
     def _resolve_max_hops(self, request: Optional[RAGRequest]) -> int:
-        """Resolve the effective max_hops value for this query.
-
-        Args:
-            request: Optional RAGRequest carrying per-request config overrides.
-
-        Returns:
-            Resolved max_hops: per-request override if set, else settings default.
-        """
         if request and request.config:
             return request.config.resolve_max_hops()
         return settings.CHAIN_RAG_MAX_HOPS
 
 
-# Module-level pure functions — no class state, easily unit-testable
+# ── Module-level pure functions — no class state, easily unit-testable ─────────
 
 def _merge_chunks(
     existing: list[RetrievedChunk],
@@ -432,8 +466,8 @@ def _merge_chunks(
     """Merge new chunks into an existing list with deduplication.
 
     When a chunk_id appears in both lists, the copy with the higher
-    relevance score is kept. New unique chunks are appended. Chunk identity
-    falls back to SHA-256 of content when chunk_id is absent.
+    relevance score is kept. Chunk identity falls back to SHA-256 of
+    content when chunk_id is absent.
 
     Args:
         existing: Previously accumulated chunks from earlier hops.
@@ -442,9 +476,8 @@ def _merge_chunks(
     Returns:
         Merged, deduplicated chunk list.
     """
-    # Index existing chunks by chunk_id for O(1) lookup.
-    # SHA-256 content hash as fallback — never use id() since object
-    # identity changes across hops for semantically identical chunks.
+    # Index by chunk_id for O(1) lookup; SHA-256 content hash as fallback —
+    # never use id() since object identity changes across hops.
     chunk_map: dict[str, RetrievedChunk] = {}
     for chunk in existing:
         key = chunk.chunk_id or hashlib.sha256(chunk.content.encode()).hexdigest()
@@ -463,90 +496,76 @@ def _merge_chunks(
 
 
 def _build_draft_context(chunks: list[RetrievedChunk]) -> str:
-    """Build a lightweight context string from chunks for draft generation.
+    """Build a context string from the top-scoring chunks for the combined LLM call.
 
-    Uses minimal formatting — no source labels. Draft context is disposable;
-    the full formatting happens in ContextAssembler for the final generation.
+    Sorts by reranker_score (if set) or relevance_score descending and caps at
+    CHAIN_RAG_DRAFT_CONTEXT_MAX_CHUNKS to prevent token explosion.
 
     Args:
-        chunks: Chunks to include in the draft context.
+        chunks: Accumulated chunks to include in the context.
 
     Returns:
-        Newline-separated, numbered chunk content string.
+        Numbered, newline-separated chunk content string.
     """
-    parts = []
-    for i, chunk in enumerate(chunks, 1):
-        parts.append(f"[{i}] {chunk.content}")
-    return "\n\n".join(parts)
+    cap = settings.CHAIN_RAG_DRAFT_CONTEXT_MAX_CHUNKS
+
+    # Sort by best available score — reranker_score is more accurate when set
+    sorted_chunks = sorted(
+        chunks,
+        key=lambda c: (c.reranker_score or 0.0) if c.reranker_score is not None
+                      else c.relevance_score,
+        reverse=True,
+    )[:cap]
+
+    return "\n\n".join(f"[{i}] {c.content}" for i, c in enumerate(sorted_chunks, 1))
 
 
-def _parse_completeness_response(text: str) -> dict:
-    """Parse the LLM completeness evaluation response.
+def _parse_combined_response(text: str) -> dict:
+    """Parse the combined draft + completeness LLM response.
 
-    Two-stage parsing: try clean JSON first, then strip markdown fences
-    and retry. Falls back to treating the answer as complete when all
-    parsing fails — prevents infinite loops on malformed output.
+    Two-stage parsing: direct JSON, then markdown-fence-stripped JSON.
+    Falls back to _FALLBACK_COMBINED on all parsing failures.
 
     Args:
         text: Raw LLM response text.
 
     Returns:
-        Dict with guaranteed keys: is_complete (bool), reasoning (str),
-        follow_up_query (str).
+        Dict with guaranteed keys: draft, is_complete, reasoning, follow_up_query.
     """
     cleaned = text.strip()
 
-    # Stage 1 — try direct JSON parse
+    # Stage 1 — direct JSON parse
     result = _try_json_parse(cleaned)
     if result is not None:
-        return _validate_completeness_dict(result)
+        return _validate_combined_dict(result)
 
     # Stage 2 — strip markdown fences and retry
     stripped = re.sub(r"^```(?:json)?\s*", "", cleaned)
     stripped = re.sub(r"\s*```$", "", stripped).strip()
     result = _try_json_parse(stripped)
     if result is not None:
-        return _validate_completeness_dict(result)
+        return _validate_combined_dict(result)
 
-    # All parsing failed — safe fallback prevents an infinite loop
-    logger.warning("CoRAG completeness parse failed, raw text: '%s'", text[:200])
-    return _FALLBACK_COMPLETENESS.copy()
-
-
-def _try_json_parse(text: str) -> Optional[dict]:
-    """Attempt to parse text as JSON, returning None on any failure.
-
-    Args:
-        text: String to parse as JSON.
-
-    Returns:
-        Parsed dict if successful, None otherwise.
-    """
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except (json.JSONDecodeError, TypeError):
-        pass
-    return None
+    logger.warning("CoRAG combined parse failed | raw='%s'", text[:200])
+    return _FALLBACK_COMBINED.copy()
 
 
-def _validate_completeness_dict(raw: dict) -> dict:
-    """Validate and normalise a parsed completeness response dict.
+def _validate_combined_dict(raw: dict) -> dict:
+    """Validate and normalise a parsed combined response dict.
 
-    Ensures all required keys exist with correct types. Coerces unexpected
-    types gracefully rather than crashing. Clears follow_up_query when
-    is_complete is True.
+    Coerces unexpected types gracefully. Clears follow_up_query when
+    is_complete is True to prevent stale follow-ups from triggering a hop.
 
     Args:
-        raw: Raw parsed JSON dict from the LLM response.
+        raw: Parsed JSON dict from the LLM response.
 
     Returns:
-        Validated dict with guaranteed is_complete, reasoning, follow_up_query.
+        Validated dict with guaranteed draft, is_complete, reasoning, follow_up_query.
     """
+    draft = str(raw.get("draft", ""))
+
     is_complete = raw.get("is_complete")
     if not isinstance(is_complete, bool):
-        # Coerce truthy/falsy string representations
         is_complete = str(is_complete).lower() in ("true", "1", "yes")
 
     reasoning = str(raw.get("reasoning", ""))
@@ -557,7 +576,19 @@ def _validate_completeness_dict(raw: dict) -> dict:
         follow_up = ""
 
     return {
+        "draft": draft,
         "is_complete": is_complete,
         "reasoning": reasoning,
         "follow_up_query": follow_up,
     }
+
+
+def _try_json_parse(text: str) -> Optional[dict]:
+    """Attempt to parse text as JSON, returning None on any failure."""
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return None
