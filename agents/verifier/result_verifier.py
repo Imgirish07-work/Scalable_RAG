@@ -35,7 +35,7 @@ logger = get_logger(__name__)
 
 # Heuristic thresholds
 _MIN_ANSWER_LENGTH = 20
-_MIN_CONFIDENCE = 0.3
+_MIN_CONFIDENCE = 0.15
 
 # Phrases that indicate the LLM could not answer — treat as non-answers.
 _NON_ANSWER_PATTERNS = [

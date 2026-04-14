@@ -25,6 +25,7 @@ from typing import Optional
 
 # internal
 from agents.agent_orchestrator import AgentOrchestrator
+from agents.exceptions.agent_exceptions import AgentError
 from agents.planner.complexity_detector import should_decompose
 from cache.cache_manager import CacheManager
 from chunking.chunker import Chunker
@@ -572,15 +573,28 @@ class RAGPipeline:
                 if cached:
                     return cached
 
-            agent_response = await self._agent_orchestrator.execute(request)
-            rag_response = agent_response.to_rag_response()
+            try:
+                agent_response = await self._agent_orchestrator.execute(request)
+                rag_response = agent_response.to_rag_response()
 
-            if self._cache:
-                await self._try_agent_cache_write(request, rag_response)
+                if self._cache:
+                    await self._try_agent_cache_write(request, rag_response)
 
-            return rag_response
+                return rag_response
 
-        # Direct RAG path for simple queries.
+            except AgentError as exc:
+                # Agent path failed (all sub-queries failed retrieval or verification,
+                # or synthesis produced no output). Fall through to direct RAG so the
+                # user always receives an answer rather than a hard error.
+                logger.warning(
+                    "Agent path failed | request_id=%s | error=%s | reason=%s | "
+                    "falling back to direct RAG",
+                    request.request_id,
+                    type(exc).__name__,
+                    exc,
+                )
+
+        # Direct RAG path — used for simple queries and as agent fallback.
         rag = await self._build_rag_for_request(request, llm)
         return await rag.query(request)
 

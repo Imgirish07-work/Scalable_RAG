@@ -118,6 +118,10 @@ class AnswerSynthesizer:
 def _format_sub_results(sub_results: list[SubQueryResult]) -> list[dict]:
     """Format sub-query results for the synthesis prompt.
 
+    Failed results are represented with a neutral placeholder so internal
+    system details (error types, failure reasons) are never exposed in the
+    user-facing answer.
+
     Args:
         sub_results: List of SubQueryResult.
 
@@ -129,7 +133,7 @@ def _format_sub_results(sub_results: list[SubQueryResult]) -> list[dict]:
         entry = {
             "query": result.query,
             "purpose": result.purpose,
-            "answer": result.answer if result.success else f"FAILED: {result.failure_reason}",
+            "answer": result.answer if result.success else "[Information not available for this aspect of the query.]",
             "success": result.success,
         }
         formatted.append(entry)

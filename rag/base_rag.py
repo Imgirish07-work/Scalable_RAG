@@ -638,14 +638,25 @@ class BaseRAG(ABC):
             )
 
             if result.hit:
-                logger.info(
-                    "Cache hit | request_id=%s | layer=%s | "
-                    "similarity=%.3f | latency=%.1f ms",
-                    request.request_id,
-                    result.layer,
-                    result.similarity_score or 0.0,
-                    result.lookup_latency_ms,
-                )
+                if result.strategy.value == "semantic":
+                    logger.info(
+                        "Cache hit | request_id=%s | layer=%s | strategy=%s | "
+                        "similarity=%.3f | latency=%.1f ms",
+                        request.request_id,
+                        result.layer,
+                        result.strategy,
+                        result.similarity_score,
+                        result.lookup_latency_ms,
+                    )
+                else:
+                    logger.info(
+                        "Cache hit | request_id=%s | layer=%s | strategy=%s | "
+                        "latency=%.1f ms",
+                        request.request_id,
+                        result.layer,
+                        result.strategy,
+                        result.lookup_latency_ms,
+                    )
 
                 cached_sources = [RetrievedChunk(**s) for s in result.sources]
                 return RAGResponse.from_cache(
