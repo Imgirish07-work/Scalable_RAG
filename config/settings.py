@@ -327,6 +327,11 @@ class Settings(BaseSettings):
     RAG_RERANK_STRATEGY: str = "mmr"
     RAG_RETRIEVAL_MODE: str = "hybrid"
     RAG_CONFIDENCE_METHOD: str = "retrieval"
+    # Minimum chunks that must reach context assembly.
+    # If cross-encoder ratio filtering leaves fewer chunks than this, the pipeline
+    # backfills from the already-retrieved coarse pool (zero extra retrieval cost).
+    # Prevents single-chunk generation which produces consistently incomplete answers.
+    RAG_MIN_CONTEXT_CHUNKS: int = 2
 
 
     # Cost per token — used to estimate savings from cache hits

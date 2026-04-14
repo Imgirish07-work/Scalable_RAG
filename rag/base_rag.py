@@ -332,6 +332,55 @@ class BaseRAG(ABC):
                         top_reranker_score,
                     )
 
+        # Step 4c: Minimum context guarantee.
+        #
+        # The cross-encoder ratio filter (SCORE_RATIO × top_score) can reduce
+        # ranked_chunks to 1 even when the query is valid and data exists.
+        # Example: scores=[0.65, 0.08, 0.06] with RATIO=0.4 → threshold=0.26
+        #   → only 0.65 survives. top_score=0.65 > THRESHOLD=0.12, so the
+        #   MMR recovery (step 4b) does NOT trigger. 1 chunk reaches the assembler.
+        #
+        # Fix: backfill from the original coarse pool (already in memory — no
+        # extra retrieval) up to RAG_MIN_CONTEXT_CHUNKS. Backfill candidates are
+        # sorted by their Qdrant relevance_score so the best are always added first.
+        from config.settings import settings as _s
+        _min_ctx = getattr(_s, "RAG_MIN_CONTEXT_CHUNKS", 2)
+        if ranked_chunks and len(ranked_chunks) < _min_ctx:
+            already_ids = {c.chunk_id for c in ranked_chunks}
+            backfill = sorted(
+                (c for c in chunks if c.chunk_id not in already_ids),
+                key=lambda c: c.relevance_score,
+                reverse=True,
+            )
+            needed = _min_ctx - len(ranked_chunks)
+            if backfill:
+                ranked_chunks = ranked_chunks + backfill[:needed]
+                logger.info(
+                    "Min-context backfill | added=%d | total=%d | min_required=%d",
+                    min(needed, len(backfill)), len(ranked_chunks), _min_ctx,
+                )
+            elif active_strategy != "cross_encoder":
+                # Backfill pool is exhausted because no coarse over-fetch was done
+                # (MMR/none strategies only retrieve config.top_k candidates, not
+                # RERANKER_COARSE_TOP_K). Expand to 2×top_k and re-retrieve once.
+                # This is the only path where an extra retrieval call is justified.
+                expanded_k = config.top_k * 2
+                logger.info(
+                    "Adaptive top_k expansion | original_k=%d | expanded_k=%d",
+                    config.top_k,
+                    expanded_k,
+                )
+                expanded_chunks = await self.retrieve(
+                    query=processed_query,
+                    top_k=expanded_k,
+                    filters=config.metadata_filters,
+                    request=request,
+                )
+                ranked_chunks = await self.rank(
+                    expanded_chunks, processed_query, strategy=active_strategy
+                )
+                ranking_ms = (time.perf_counter() - ranking_start) * 1000
+
         # Step 5: Assemble context
         context_str, updated_chunks, context_tokens = await self.assemble_context(
             ranked_chunks

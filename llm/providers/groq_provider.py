@@ -94,3 +94,25 @@ class GroqProvider(OpenAIProvider):
     def provider_name(self) -> str:
         """Returns the provider identifier string 'groq'."""
         return "groq"
+
+    async def count_tokens(self, text: str) -> int:
+        """Count tokens using cl100k_base — best tiktoken approximation for Groq models.
+
+        LLaMA 3 (128k vocab) and Qwen models are not in tiktoken's registry.
+        OpenAIProvider's fallback uses o200k_base (200k vocab, GPT-4o encoder),
+        which undercounts by ~8-15% because its larger vocabulary merges more
+        subword units. cl100k_base (100k vocab, GPT-4 encoder) is a closer
+        approximation to LLaMA's 128k vocab and avoids the undercount that causes
+        context assembler to pack more text than the model window actually allows.
+
+        Args:
+            text: Input text to count tokens for.
+
+        Returns:
+            Token count as integer. Returns 0 for empty input.
+        """
+        if not text:
+            return 0
+        import tiktoken
+        encoder = tiktoken.get_encoding("cl100k_base")
+        return len(encoder.encode(text))
