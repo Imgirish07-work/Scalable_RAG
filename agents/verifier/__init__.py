@@ -1,4 +1,1 @@
-"""Agent verifier package."""
-from agents.verifier.result_verifier import ResultVerifier
-
-__all__ = ["ResultVerifier"]
+"""Agent verifier package — unused, kept for package structure."""

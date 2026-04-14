@@ -22,7 +22,7 @@ Design:
 
            This is zero-touch for all existing RAG variants — they already pass
            explicit small max_tokens for lightweight calls and omit / use large
-           values for generate(). No changes to SimpleRAG or ChainRAG are needed.
+           values for generate(). No changes to SimpleRAG are needed.
 
         2. Asks ModelRouter to pick the best available model.
 
@@ -694,7 +694,7 @@ class GroqModelPool(BaseLLM):
 
         All existing RAG variant calls already pass explicit small max_tokens
         for lightweight operations, so this detection requires zero changes
-        to SimpleRAG or ChainRAG.
+        to SimpleRAG.
 
         Mapping:
             max_tokens is None → STRONG (open-ended generate())

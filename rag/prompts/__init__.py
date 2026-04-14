@@ -21,18 +21,10 @@ from rag.prompts.rag_prompt_templates import (
     RAG_USER_PROMPT,
     RAG_USER_PROMPT_WITH_HISTORY,
     CONVERSATION_QUERY_REFINEMENT_PROMPT,
-    # ChainRAG template constants
-    CHAIN_DRAFT_SYSTEM_PROMPT,
-    CHAIN_DRAFT_USER_PROMPT,
-    CHAIN_COMPLETENESS_SYSTEM_PROMPT,
-    CHAIN_COMPLETENESS_USER_PROMPT,
     # Builder functions
     build_rag_prompt,
     build_conversation_refinement_prompt,
     format_conversation_history,
-    # ChainRAG builder functions
-    build_chain_draft_prompt,
-    build_chain_completeness_prompt,
 )
 
 __all__ = [
@@ -42,16 +34,8 @@ __all__ = [
     "RAG_USER_PROMPT",
     "RAG_USER_PROMPT_WITH_HISTORY",
     "CONVERSATION_QUERY_REFINEMENT_PROMPT",
-    # ChainRAG templates
-    "CHAIN_DRAFT_SYSTEM_PROMPT",
-    "CHAIN_DRAFT_USER_PROMPT",
-    "CHAIN_COMPLETENESS_SYSTEM_PROMPT",
-    "CHAIN_COMPLETENESS_USER_PROMPT",
     # Builders
     "build_rag_prompt",
     "build_conversation_refinement_prompt",
     "format_conversation_history",
-    # ChainRAG builders
-    "build_chain_draft_prompt",
-    "build_chain_completeness_prompt",
 ]

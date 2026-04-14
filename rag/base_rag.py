@@ -155,15 +155,14 @@ class BaseRAG(ABC):
         """Retrieve relevant chunks from the vector store.
 
         This is the primary hook every variant implements. SimpleRAG
-        calls the retriever directly. ChainRAG uses request to resolve
-        per-request max_hops from RAGConfig.
+        calls the retriever directly.
 
         Args:
             query: Processed query string (output of pre_process).
             top_k: Maximum chunks to retrieve.
             filters: Optional metadata filters from RAGConfig.
-            request: Full RAGRequest. ChainRAG reads config.max_hops from it.
-                Other variants may ignore it.
+            request: Full RAGRequest for any variant-specific config.
+                SimpleRAG ignores it.
 
         Returns:
             List of RetrievedChunk ordered by relevance.

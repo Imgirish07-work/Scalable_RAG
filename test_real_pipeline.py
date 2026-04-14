@@ -4,16 +4,15 @@ End-to-end RAG pipeline test using a real PDF with no mocks.
 Test scope:
     End-to-end integration test covering the full ingestion and query pipeline:
     DocumentCleaner → StructurePreserver → Chunker → QdrantStore →
-    HybridRetriever → SimpleRAG / ChainRAG with CacheManager.
+    HybridRetriever → SimpleRAG with CacheManager.
     Each query is run twice: first call is a cache miss, second is a cache hit.
 
 Flow:
     Load PDF → chunk → upsert to Qdrant → initialize cache → pre-warm LLM
     → run queries (miss + hit pairs) → print structured response summaries.
 
-Configuration (change these two lines to switch modes):
-    SEARCH_MODE  : "hybrid" | "dense" | "sparse"
-    RAG_VARIANT  : "simple" | "chain"
+Configuration (change this line to switch search mode):
+    SEARCH_MODE : "hybrid" | "dense"
 
 Dependencies:
     GEMINI_API_KEY (and optionally GROQ_API_KEY) in .env; BGE embedding model;
@@ -36,43 +35,16 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Configuration — change these two lines to switch modes
-SEARCH_MODE = "hybrid"       # "hybrid" | "dense" | "sparse"
-RAG_VARIANT = "simple"       # "simple" | "chain"
+# Configuration — change this line to switch search mode
+SEARCH_MODE = "hybrid"   # "hybrid" | "dense"
 
 PDF_PATH = "./data/sample_docs/Attention is all you need.pdf"
 
-# Query sets — each variant gets queries matched to its strengths
-
-# SimpleRAG: direct factual, single-hop questions
-_SIMPLE_QUERIES = [
+QUERIES = [
     "explain the transformer model architecture",
     "describe how multi-headed attention works",
     "what BLEU scores did the transformer get on WMT?",
 ]
-
-# ChainRAG: multi-hop questions that require connecting multiple sections
-_CHAIN_QUERIES = [
-    (
-        "How does positional encoding work in the transformer, and why is it necessary "
-        "given that the architecture uses no recurrence or convolution?"
-    ),
-    (
-        "Explain the full training procedure of the transformer: what optimizer was used, "
-        "what learning rate schedule was applied, and what regularisation techniques "
-        "were used to prevent overfitting?"
-    ),
-    (
-        "How does the transformer's multi-head attention differ from single-head attention, "
-        "and what is the computational cost tradeoff between the number of heads "
-        "and the dimension per head?"
-    ),
-]
-
-QUERIES = {
-    "simple": _SIMPLE_QUERIES,
-    "chain":  _CHAIN_QUERIES,
-}[RAG_VARIANT]
 
 
 def _print_response(response, query_num: int, query_text: str) -> None:
@@ -88,7 +60,7 @@ def _print_response(response, query_num: int, query_text: str) -> None:
         model_label = response.model_name
 
     print(f"\n{'=' * 60}")
-    print(f"[ QUERY {query_num} | {RAG_VARIANT.upper()} | {SEARCH_MODE} | {execution_path} ]")
+    print(f"[ QUERY {query_num} | SIMPLE | {SEARCH_MODE} | {execution_path} ]")
     print(f"QUERY      : {query_text}")
     print(f"CACHE HIT  : {response.cache_hit} | layer={response.cache_layer}")
     if response.low_confidence:
@@ -109,7 +81,7 @@ def _print_response(response, query_num: int, query_text: str) -> None:
 
 async def run() -> None:
     """Load the PDF, ingest it into Qdrant, initialize the cache, and run all queries."""
-    logger.info("Pipeline config | variant=%s | search_mode=%s", RAG_VARIANT, SEARCH_MODE)
+    logger.info("Pipeline config | variant=simple | search_mode=%s", SEARCH_MODE)
 
     # Step 1: Load and clean the PDF
     logger.info("Loading PDF: %s", PDF_PATH)
@@ -151,14 +123,12 @@ async def run() -> None:
     retriever = HybridRetriever(store)
     try:
         llm = LLMFactory.create_groq_pool()
-        fallback_llm = LLMFactory.create_rate_limited("gemini")
-        logger.info("LLM: %s | fallback: %s", llm.model_name, fallback_llm.model_name)
+        logger.info("LLM: %s (GroqModelPool)", llm.model_name)
     except Exception as e:
         logger.warning("Groq unavailable (%s) — using Gemini as primary", e)
         llm = LLMFactory.create_rate_limited("gemini")
-        fallback_llm = None
 
-    # Pre-warm Gemini to open TCP+TLS before Q1
+    # Pre-warm LLM to open TCP+TLS before Q1
     async def _pre_warm_llm(provider, name):
         try:
             await provider.generate("Reply with: OK", max_tokens=2)
@@ -167,35 +137,28 @@ async def run() -> None:
             err = str(exc)
             if "<html" in err.lower() or "<!doctype" in err.lower():
                 logger.warning(
-                    "LLM pre-warm skipped (%s): blocked by corporate proxy/firewall "
-                    "(request to provider API was intercepted)", name,
+                    "LLM pre-warm skipped (%s): blocked by corporate proxy/firewall", name,
                 )
             else:
                 logger.warning("LLM pre-warm failed (%s): %s", name, err[:200])
 
-    # Pre-warm whichever LLM is Gemini — Groq is Zscaler-blocked on corp network.
-    # Normal path: Gemini is fallback_llm. Groq-unavailable path: Gemini is llm.
-    _gemini_llm = fallback_llm if fallback_llm is not None else llm
-    await _pre_warm_llm(_gemini_llm, _gemini_llm.model_name)
+    await _pre_warm_llm(llm, llm.model_name)
 
-    # ChainRAG config: tighter top_k per hop — it accumulates across hops
     rag_config = RAGConfig(
-        top_k=3 if RAG_VARIANT == "chain" else 5,
+        top_k=5,
         rerank_strategy="cross_encoder",
-        max_hops=3 if RAG_VARIANT == "chain" else 1,
     )
 
     rag = RAGFactory.create(
-        RAG_VARIANT,
+        "simple",
         retriever=retriever,
         llm=llm,
         cache=cache,
-        fallback_llm=fallback_llm,
     )
 
     logger.info(
-        "RAG pipeline ready | variant=%s | search_mode=%s | queries=%d",
-        RAG_VARIANT, SEARCH_MODE, len(QUERIES),
+        "RAG pipeline ready | variant=simple | search_mode=%s | queries=%d",
+        SEARCH_MODE, len(QUERIES),
     )
 
     # Step 5: Run each query twice — first call is a miss, second is a cache hit

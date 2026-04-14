@@ -66,14 +66,11 @@ from rag.prompts.rag_prompt_templates import (
     build_rag_prompt,
     build_conversation_refinement_prompt,
     format_conversation_history,
-    build_chain_draft_prompt,
-    build_chain_completeness_prompt,
 )
 
 # Base + Variants
 from rag.base_rag import BaseRAG
 from rag.variants.simple_rag import SimpleRAG
-from rag.variants.chain_rag import ChainRAG
 
 # Factory — the primary entry point for creating RAG instances
 from rag.rag_factory import RAGFactory
@@ -109,12 +106,9 @@ __all__ = [
     "build_rag_prompt",
     "build_conversation_refinement_prompt",
     "format_conversation_history",
-    "build_chain_draft_prompt",
-    "build_chain_completeness_prompt",
     # Base + Variants
     "BaseRAG",
     "SimpleRAG",
-    "ChainRAG",
     # Factory
     "RAGFactory",
     # Constants

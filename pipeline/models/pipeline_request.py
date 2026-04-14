@@ -36,11 +36,10 @@ class PipelineQuery(BaseModel):
     Attributes:
         query: The user's natural language question.
         collection: Target Qdrant collection name.
-        variant: RAG variant override. None uses settings default.
+        variant: RAG variant override ('simple'). None uses settings default.
         conversation_history: Optional prior turns for multi-turn queries.
         temperature: LLM temperature override. None uses settings default.
         top_k: Number of chunks to retrieve. None uses settings default.
-        max_hops: Maximum retrieval hops for chain variant. None uses default.
         include_sources: Whether to include source chunks in the response.
         request_id: Optional caller-provided request ID for tracing.
     """
@@ -61,7 +60,7 @@ class PipelineQuery(BaseModel):
     )
     variant: Optional[str] = Field(
         default=None,
-        description="RAG variant: 'simple', 'chain'. None uses default.",
+        description="RAG variant: 'simple'. None uses default.",
     )
     conversation_history: Optional[list[ConversationTurn]] = Field(
         default=None,
@@ -78,12 +77,6 @@ class PipelineQuery(BaseModel):
         ge=1,
         le=100,
         description="Number of chunks to retrieve.",
-    )
-    max_hops: Optional[int] = Field(
-        default=None,
-        ge=1,
-        le=5,
-        description="Max retrieval hops for chain variant.",
     )
     include_sources: bool = Field(
         default=True,
@@ -110,7 +103,7 @@ class PipelineQuery(BaseModel):
         """
         if v is None:
             return None
-        allowed = {"simple", "chain"}
+        allowed = {"simple"}
         normalized = v.strip().lower()
         if normalized not in allowed:
             msg = f"Unknown variant '{v}'. Allowed: {sorted(allowed)}"
@@ -137,8 +130,6 @@ class PipelineQuery(BaseModel):
             config_kwargs["top_k"] = self.top_k
         if self.temperature is not None:
             config_kwargs["temperature"] = self.temperature
-        if self.max_hops is not None:
-            config_kwargs["max_hops"] = self.max_hops
         config = RAGConfig(**config_kwargs)
 
         return RAGRequest(

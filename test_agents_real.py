@@ -162,9 +162,8 @@ async def run() -> None:
     pipeline.configure_agents(
         collections=COLLECTIONS,
         max_concurrent=3,
-        use_llm_verification=False,
     )
-    print("  Agent layer configured — planner + parallel retriever + synthesizer")
+    print("  Agent layer configured — planner + chunk retriever + quality gate + context fusion")
 
     # Step 6: Routing check — confirm all queries are flagged for decomposition
     _section("Step 6: Routing check (complexity detector)")
@@ -181,9 +180,7 @@ async def run() -> None:
             PipelineQuery(
                 query=query,
                 collection=COLLECTION,
-                variant="chain",
                 top_k=5,
-                max_hops=3,
             )
         )
         _print_response(
@@ -202,9 +199,7 @@ async def run() -> None:
         PipelineQuery(
             query=first_query,
             collection=COLLECTION,
-            variant="chain",
             top_k=5,
-            max_hops=3,
         )
     )
     _print_response(

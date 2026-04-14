@@ -14,7 +14,7 @@ Design:
 
 Chain of Responsibility:
     Instantiated by RAGFactory.create_retriever(mode="dense")
-    → called by SimpleRAG.retrieve() / ChainRAG.retrieve()
+    → called by SimpleRAG.retrieve()
     → QdrantStore.similarity_search_with_vectors()
     → returns list[RetrievedChunk].
 

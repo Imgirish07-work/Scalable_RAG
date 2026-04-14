@@ -11,7 +11,7 @@ Design:
 Chain of Responsibility:
     External callers (FastAPI, CLI, tests) → RAGPipeline.query()
     → if complex: AgentOrchestrator.execute() else: BaseRAG.query()
-    RAGPipeline.query_raw() is called by ParallelRetriever for sub-queries.
+    RAGPipeline.query_raw() provides raw RAGRequest access for advanced callers.
 
 Dependencies:
     agents.agent_orchestrator, cache.cache_manager, chunking.*,
@@ -298,31 +298,38 @@ class RAGPipeline:
         self,
         collections: dict[str, str],
         max_concurrent: int = 4,
-        use_llm_verification: bool = False,
     ) -> None:
         """Configure the agent layer for query decomposition.
 
-        Must be called after initialize(). Creates the AgentOrchestrator
-        with the pipeline's LLM and this pipeline instance as the
-        sub-query executor.
+        Must be called after initialize(). Creates AgentOrchestrator with
+        a strong LLM (planning + synthesis) and a fast LLM (weak sub-query
+        rewriting). The store_factory provides per-collection QdrantStore
+        instances for parallel retrieval.
 
         Args:
             collections: Dict of collection_name -> description.
                 Used by the planner to route sub-queries.
-            max_concurrent: Max concurrent sub-query executions.
-            use_llm_verification: Whether to use LLM-based verification.
+            max_concurrent: Max concurrent sub-query retrieval executions.
         """
         self._ensure_initialized()
         self._collections = collections
+
+        # Fast LLM for weak sub-query rewriting — cheaper model, bounded use.
+        # Falls back silently to strong LLM if creation fails.
+        fast_llm = self._try_create_fast_llm()
+
         self._agent_orchestrator = AgentOrchestrator(
-            llm=self._llm,
-            pipeline=self,
+            strong_llm=self._llm,
+            fast_llm=fast_llm or self._llm,
+            store_factory=self._get_store_for_collection,
             collections=collections,
+            embeddings_fn=get_embeddings,
             max_concurrent=max_concurrent,
-            use_llm_verification=use_llm_verification,
         )
         logger.info(
-            "Agent layer configured with %d collections", len(collections),
+            "Agent layer configured | collections=%d | fast_llm=%s",
+            len(collections),
+            fast_llm.model_name if fast_llm else "fallback_to_strong",
         )
 
     # Query — the main entry point
@@ -407,9 +414,6 @@ class RAGPipeline:
         query_start = time.perf_counter()
 
         try:
-            # Bypass agent routing — query_raw() is called by ParallelRetriever
-            # to execute sub-queries and must NEVER re-enter the agent layer
-            # (would cause infinite recursion).
             rag = await self._build_rag_for_request(request, self._llm)
             response = await rag.query(request)
             self._log_query_metrics(request, response, query_start)
@@ -602,7 +606,7 @@ class RAGPipeline:
         """Attempt to read a cached agent response. Returns None on miss or error.
 
         Uses "__agent__" as the system_prompt discriminator so agent cache
-        keys never collide with SimpleRAG/ChainRAG keys for the same query.
+        keys never collide with SimpleRAG keys for the same query.
         """
         try:
             result = await self._cache.get_or_wait(
@@ -960,6 +964,29 @@ class RAGPipeline:
             return f"degraded: {exc}"
 
     # Internal — LLM factory helpers
+
+    def _try_create_fast_llm(self) -> Optional[BaseLLM]:
+        """Attempt to create a fast LLM for weak sub-query rewriting.
+
+        Uses GROQ_MODEL_FAST from settings when available. Non-fatal —
+        configure_agents() falls back to the strong LLM if this fails.
+
+        Returns:
+            Fast BaseLLM instance, or None if creation fails.
+        """
+        try:
+            fast = LLMFactory.create_rate_limited(
+                provider_name=getattr(settings, "LLM_PROVIDER", "groq"),
+                model_name=getattr(settings, "GROQ_MODEL_FAST", None),
+            )
+            logger.info(
+                "Fast LLM created for agent rewrites: %s/%s",
+                fast.provider_name, fast.model_name,
+            )
+            return fast
+        except Exception:
+            logger.warning("Could not create fast LLM — agent rewrites will use strong LLM")
+            return None
 
     def _try_create_fallback_llm(self) -> Optional[BaseLLM]:
         """Attempt to create a fallback LLM provider.

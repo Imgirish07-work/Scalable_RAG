@@ -95,15 +95,6 @@ class Settings(BaseSettings):
         RAG_RERANK_STRATEGY: Post-retrieval reranking strategy ('mmr', 'cross_encoder').
         RAG_RETRIEVAL_MODE: Qdrant search mode ('dense', 'sparse', 'hybrid').
         RAG_CONFIDENCE_METHOD: Method used to compute retrieval confidence score.
-        CHAIN_RAG_MAX_HOPS: Maximum hops for Chain-of-RAG.
-        CHAIN_RAG_DRAFT_MAX_TOKENS: Max tokens for CoRAG draft generation.
-        CHAIN_RAG_COMPLETENESS_MAX_TOKENS: Max tokens for CoRAG completeness check.
-        CHAIN_RAG_MIN_CHUNK_SCORE: Minimum score a chunk must meet to be kept after
-            reranking. Chunks below this are dropped as noise. At least one chunk
-            (the top scorer) is always retained to prevent chain stalls.
-        CHAIN_RAG_DRAFT_CONTEXT_MAX_CHARS: Character budget for the combined LLM
-            context string (~4 chars/token). Caps at ~3 000 tokens by default,
-            preventing token spikes that trigger rate limiting.
         COST_PER_TOKEN_OPENAI: Approximate cost per token for OpenAI (gpt-3.5-turbo).
         COST_PER_TOKEN_GEMINI: Approximate cost per token for Gemini (2.5-flash).
         COST_PER_TOKEN_GROQ: Approximate cost per token for Groq (free tier).
@@ -332,25 +323,6 @@ class Settings(BaseSettings):
     RAG_RETRIEVAL_MODE: str = "hybrid"
     RAG_CONFIDENCE_METHOD: str = "retrieval"
 
-    # CoRAG (Chain-of-RAG)
-    CHAIN_RAG_MAX_HOPS: int = 3
-    CHAIN_RAG_DRAFT_MAX_TOKENS: int = 512
-    CHAIN_RAG_COMPLETENESS_MAX_TOKENS: int = 512
-    # Cross-encoder Gate 1 threshold — avg score ≥ this skips the LLM call entirely
-    CHAIN_RAG_RELEVANCE_THRESHOLD: float = Field(default=0.55, env="CHAIN_RAG_RELEVANCE_THRESHOLD")
-    # Max chunks fed to the combined prompt — prevents token explosion across hops
-    CHAIN_RAG_DRAFT_CONTEXT_MAX_CHUNKS: int = Field(default=8, env="CHAIN_RAG_DRAFT_CONTEXT_MAX_CHUNKS")
-    # Seconds to wait before one retry when the entire LLM pool is rate-limited
-    CHAIN_RAG_RATE_LIMIT_RETRY_WAIT: float = Field(default=30.0, env="CHAIN_RAG_RATE_LIMIT_RETRY_WAIT")
-    # Cross-encoder similarity threshold for follow-up rejection (≥ this = same question)
-    CHAIN_RAG_FOLLOWUP_SIMILARITY_THRESHOLD: float = Field(default=0.85, env="CHAIN_RAG_FOLLOWUP_SIMILARITY_THRESHOLD")
-    # Minimum per-chunk score to retain after reranking — drops noise before accumulation.
-    # Uses reranker_score when available, otherwise dense relevance_score.
-    # At least one chunk is always kept so the chain never stalls.
-    CHAIN_RAG_MIN_CHUNK_SCORE: float = Field(default=0.30, env="CHAIN_RAG_MIN_CHUNK_SCORE")
-    # Character budget for the combined LLM context string (≈ 4 chars/token).
-    # Default 12 000 chars ≈ 3 000 tokens — prevents token spikes and 429s.
-    CHAIN_RAG_DRAFT_CONTEXT_MAX_CHARS: int = Field(default=12000, env="CHAIN_RAG_DRAFT_CONTEXT_MAX_CHARS")
 
     # Cost per token — used to estimate savings from cache hits
     COST_PER_TOKEN_OPENAI: float = 0.000002

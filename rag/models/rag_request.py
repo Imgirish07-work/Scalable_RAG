@@ -32,7 +32,7 @@ from config.settings import settings
 SUPPORTED_RETRIEVAL_MODES = {"dense", "hybrid"}
 SUPPORTED_RERANK_STRATEGIES = {"none", "mmr", "cross_encoder"}
 SUPPORTED_CONFIDENCE_METHODS = {"retrieval", "llm", "hybrid"}
-SUPPORTED_RAG_VARIANTS = {"simple", "chain"}
+SUPPORTED_RAG_VARIANTS = {"simple"}
 SUPPORTED_FILTER_OPERATORS = {"eq", "neq", "gt", "gte", "lt", "lte", "in"}
 
 
@@ -183,15 +183,13 @@ class RAGConfig(BaseModel):
             'retrieval' = average retrieval similarity (free).
             'llm' = LLM self-assessment (1 extra call).
             'hybrid' = weighted combination of both.
-        max_hops: Maximum retrieval hops for ChainRAG. None uses the
-            settings default.
     """
 
     model_config = ConfigDict(frozen=False)
 
     rag_variant: str | None = Field(
         default=None,
-        description="RAG variant: simple, chain. None = use settings default.",
+        description="RAG variant: 'simple'. None = use settings default.",
     )
     retrieval_mode: str = Field(
         default_factory=lambda: settings.RAG_RETRIEVAL_MODE,
@@ -238,13 +236,6 @@ class RAGConfig(BaseModel):
     confidence_method: str = Field(
         default="retrieval",
         description="Confidence scoring method: retrieval, llm, hybrid",
-    )
-    # ChainRAG config
-    max_hops: Optional[int] = Field(
-        default=None,
-        ge=1,
-        le=5,
-        description="Maximum retrieval hops for CoRAG variant. None uses settings default.",
     )
     # Agent routing override — bypasses should_decompose() heuristic.
     # True: always route to agent (if configured). False: never route to agent.
@@ -352,25 +343,13 @@ class RAGConfig(BaseModel):
         """Resolve the effective RAG variant name.
 
         Explicit per-request override wins over the settings default.
-        This is the smart default pattern: callers that care specify it,
-        callers that don't get the global default.
 
         Returns:
-            Resolved variant name string (e.g. 'simple', 'chain').
+            Resolved variant name string.
         """
         if self.rag_variant is not None:
             return self.rag_variant
         return getattr(settings, "RAG_DEFAULT_VARIANT", "simple").strip().lower()
-
-    def resolve_max_hops(self) -> int:
-        """Resolve the effective max_hops value for ChainRAG.
-
-        Returns:
-            Explicit per-request override if set, else the settings default.
-        """
-        if self.max_hops is not None:
-            return self.max_hops
-        return settings.CHAIN_RAG_MAX_HOPS
 
 
 class RAGRequest(BaseModel):
@@ -387,7 +366,7 @@ class RAGRequest(BaseModel):
             query="What are the latest compliance rules?",
             collection_name="legal_docs",
             config=RAGConfig(
-                rag_variant="chain",
+                rag_variant="simple",
                 retrieval_mode="hybrid",
                 top_k=10,
                 temperature=0.1,

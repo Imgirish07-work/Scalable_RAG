@@ -16,7 +16,7 @@ Chain of Responsibility:
     resolves variant and retriever from RAGConfig.
 
 Dependencies:
-    rag.variants (SimpleRAG, ChainRAG)
+    rag.variants (SimpleRAG)
     rag.retrieval (DenseRetriever, HybridRetriever)
     rag.context (ContextRanker, ContextAssembler)
     llm.contracts.base_llm (BaseLLM)
@@ -28,7 +28,6 @@ from typing import Optional
 
 from llm.contracts.base_llm import BaseLLM
 from rag.base_rag import BaseRAG
-from rag.variants.chain_rag import ChainRAG
 from rag.variants.simple_rag import SimpleRAG
 from rag.retrieval.base_retriever import BaseRetriever
 from rag.retrieval.dense_retriever import DenseRetriever
@@ -59,7 +58,6 @@ class RAGFactory:
     # Variant registry — maps name → class
     _variant_registry: dict[str, type[BaseRAG]] = {
         "simple": SimpleRAG,
-        "chain": ChainRAG,
     }
 
     # Retriever registry — maps mode → class
@@ -87,7 +85,7 @@ class RAGFactory:
         already been constructed by the caller.
 
         Args:
-            variant_name: Variant to create ('simple', 'chain').
+            variant_name: Variant to create ('simple').
             retriever: Pre-built BaseRetriever instance.
             llm: Pre-built BaseLLM instance.
             cache: Optional CacheManager instance.

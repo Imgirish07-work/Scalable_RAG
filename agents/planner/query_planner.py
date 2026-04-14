@@ -29,8 +29,8 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Safety caps to prevent runaway decomposition.
-_MAX_SUB_QUERIES = 6
+# Safety caps — must match the prompt's stated maximum (3).
+_MAX_SUB_QUERIES = 3
 _PLANNING_MAX_TOKENS = 1024
 
 

@@ -1,4 +1,4 @@
 """Agent retriever package."""
-from agents.retriever.parallel_retriever import ParallelRetriever
+from agents.retriever.chunk_retriever import ChunkRetriever
 
-__all__ = ["ParallelRetriever"]
+__all__ = ["ChunkRetriever"]

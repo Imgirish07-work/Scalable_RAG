@@ -48,10 +48,9 @@ class SimpleRAG(BaseRAG):
         - Concept explanations ("Explain the CAP theorem")
         - Any query where retrieval quality is expected to be good
 
-    When to use ChainRAG instead:
-        - Multi-hop questions requiring information from multiple sections
-        - Queries where a single retrieval pass is insufficient
-        - When answer completeness needs to be verified iteratively
+    For complex multi-part questions, the agent layer (AgentOrchestrator)
+    decomposes them into sub-queries — each sub-query uses this variant
+    for retrieval-only execution.
     """
 
     @property
@@ -80,7 +79,7 @@ class SimpleRAG(BaseRAG):
             query: Processed query string (output of pre_process).
             top_k: Maximum number of chunks to retrieve.
             filters: Optional metadata filters from RAGConfig.
-            request: Unused. Accepted for interface compatibility with ChainRAG.
+            request: Unused. Accepted for BaseRAG interface compliance.
 
         Returns:
             List of RetrievedChunk ordered by relevance (highest first).

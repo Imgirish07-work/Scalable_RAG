@@ -17,7 +17,6 @@ Design:
 Chain of Responsibility:
     build_rag_prompt() called by BaseRAG.generate()
     build_conversation_refinement_prompt() called by BaseRAG.pre_process()
-    build_chain_draft_prompt() / build_chain_completeness_prompt() called by ChainRAG
 
 Dependencies:
     None (stdlib only).
@@ -75,90 +74,7 @@ RAG_USER_PROMPT_WITH_HISTORY = (
 )
 
 
-# 3. ChainRAG prompts — draft generation and completeness evaluation
-
-CHAIN_DRAFT_SYSTEM_PROMPT = (
-    "You are a precise information extractor. Generate a concise draft answer "
-    "using ONLY the provided context.\n\n"
-    "CRITICAL RULES:\n"
-    "1. Use only information explicitly stated in the context.\n"
-    "2. If the context references external documents, regulations, appendices, "
-    "or sections that are NOT included in the context, explicitly flag them. "
-    'Example: "As referenced in Regulation 7.3 (not available in current context)."\n'
-    "3. Keep the draft concise — focus on directly answering the query.\n"
-    "4. Do NOT fabricate information to fill gaps."
-)
-
-CHAIN_DRAFT_USER_PROMPT = (
-    "Context:\n"
-    "{context}\n\n"
-    "Query: {query}\n\n"
-    "Generate a concise draft answer. Explicitly flag any references to external "
-    "documents or sections not present in the context above."
-)
-
-CHAIN_COMPLETENESS_SYSTEM_PROMPT = (
-    "You are a completeness evaluator. Assess whether a draft answer fully "
-    "resolves the user's query or has unresolved references.\n\n"
-    "Respond with ONLY a JSON object — no markdown fences, no preamble:\n"
-    '{\n'
-    '  "is_complete": true/false,\n'
-    '  "reasoning": "Brief explanation of what is resolved or missing",\n'
-    '  "follow_up_query": "Specific search query to retrieve missing information "\n'
-    "}\n\n"
-    "RULES:\n"
-    '1. Set "is_complete" to true ONLY if the draft fully answers the query '
-    "with no dangling references.\n"
-    '2. Set "follow_up_query" to an empty string if is_complete is true.\n'
-    '3. Make "follow_up_query" specific and targeted — it will be used for '
-    "vector similarity search.\n"
-    "4. Focus on unresolved references to regulations, appendices, sections, "
-    "or external documents mentioned but not included."
-)
-
-CHAIN_COMPLETENESS_USER_PROMPT = (
-    "Original query: {query}\n\n"
-    "Draft answer:\n"
-    "{draft_answer}\n\n"
-    "Evaluate completeness and respond with JSON only."
-)
-
-
-# 4. ChainRAG combined prompt — draft + completeness in one LLM call
-
-CHAIN_COMBINED_SYSTEM_PROMPT = (
-    "You are a precise answer generator and completeness evaluator.\n\n"
-    "Given a query and retrieved context, do TWO things in ONE response:\n"
-    "1. Write a concise draft answer using ONLY the provided context.\n"
-    "2. Evaluate whether your draft fully resolves the query.\n\n"
-    "Respond with ONLY a JSON object — no markdown fences, no preamble:\n"
-    "{\n"
-    '  "draft": "Your concise answer here",\n'
-    '  "is_complete": true/false,\n'
-    '  "reasoning": "Brief explanation of what is resolved or missing",\n'
-    '  "follow_up_query": "Targeted search query for missing info, or empty string"\n'
-    "}\n\n"
-    "RULES:\n"
-    "1. Answer ONLY from the provided context. Flag external references explicitly.\n"
-    '2. Set "is_complete" to true ONLY if the draft fully answers the query.\n'
-    '3. "follow_up_query" must be an empty string when is_complete is true.\n'
-    '4. "follow_up_query" must be a SHORT, SPECIFIC factual question — at most 12 words.\n'
-    "   - Identify exactly ONE fact or definition that is missing from your draft.\n"
-    "   - Write a precise retrieval question for that single missing fact.\n"
-    "   - Do NOT write topic phrases or broad expansions.\n"
-    '   - Good: "What replication factor does Cassandra use by default?"\n'
-    '   - Bad: "distributed replication and consistency trade-offs"'
-)
-
-CHAIN_COMBINED_USER_PROMPT = (
-    "Context:\n"
-    "{context}\n\n"
-    "Query: {query}\n\n"
-    "Generate the draft answer and evaluate completeness. Respond with JSON only."
-)
-
-
-# 5. Utility prompts — conversation-aware query refinement
+# 3. Utility prompts — conversation-aware query refinement
 
 CONVERSATION_QUERY_REFINEMENT_PROMPT = (
     "Given the conversation history and the latest user query, "
@@ -274,55 +190,3 @@ def format_conversation_history(
     return "\n".join(lines)
 
 
-def build_chain_draft_prompt(context: str, query: str) -> tuple[str, str]:
-    """Build system and user prompts for ChainRAG draft generation.
-
-    Args:
-        context: Assembled context string from accumulated retrieved chunks.
-        query: The current query (original or follow-up hop query).
-
-    Returns:
-        Tuple of (system_prompt, user_prompt) for BaseLLM.chat().
-    """
-    user_prompt = CHAIN_DRAFT_USER_PROMPT.format(
-        context=context,
-        query=query,
-    )
-    return CHAIN_DRAFT_SYSTEM_PROMPT, user_prompt
-
-
-def build_chain_combined_prompt(context: str, query: str) -> tuple[str, str]:
-    """Build system and user prompts for the combined ChainRAG draft + completeness call.
-
-    Replaces the two-call pattern (build_chain_draft_prompt + build_chain_completeness_prompt)
-    with a single LLM call that returns draft, is_complete, reasoning, and follow_up_query.
-
-    Args:
-        context: Assembled context string from accumulated retrieved chunks.
-        query: The original user query.
-
-    Returns:
-        Tuple of (system_prompt, user_prompt) for BaseLLM.chat().
-    """
-    user_prompt = CHAIN_COMBINED_USER_PROMPT.format(context=context, query=query)
-    return CHAIN_COMBINED_SYSTEM_PROMPT, user_prompt
-
-
-def build_chain_completeness_prompt(
-    query: str,
-    draft_answer: str,
-) -> tuple[str, str]:
-    """Build system and user prompts for ChainRAG completeness evaluation.
-
-    Args:
-        query: The original user query (not a follow-up hop query).
-        draft_answer: The draft answer to evaluate for completeness.
-
-    Returns:
-        Tuple of (system_prompt, user_prompt) for BaseLLM.chat().
-    """
-    user_prompt = CHAIN_COMPLETENESS_USER_PROMPT.format(
-        query=query,
-        draft_answer=draft_answer,
-    )
-    return CHAIN_COMPLETENESS_SYSTEM_PROMPT, user_prompt

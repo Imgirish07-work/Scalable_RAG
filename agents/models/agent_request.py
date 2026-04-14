@@ -8,9 +8,8 @@ Design:
     planner reasoning).
 
 Chain of Responsibility:
-    QueryPlanner produces DecompositionPlan → ParallelRetriever iterates
-    SubQuery items → SubQuery.to_rag_request() converts each to RAGRequest
-    → pipeline.query_raw() executes.
+    QueryPlanner produces DecompositionPlan → ChunkRetriever executes
+    retrieval-only calls per SubQuery → SubQueryResult per sub-query.
 
 Dependencies:
     pydantic, rag.models.rag_request
@@ -36,7 +35,6 @@ class SubQuery(BaseModel):
     Attributes:
         query: The sub-query text for retrieval.
         collection: Target Qdrant collection name.
-        variant: RAG variant to use. None uses settings default.
         purpose: Brief description of what this sub-query resolves.
         sub_query_id: Unique ID for tracing.
     """
@@ -55,7 +53,7 @@ class SubQuery(BaseModel):
     )
     variant: Optional[str] = Field(
         default=None,
-        description="RAG variant: 'simple', 'chain'. None uses default.",
+        description="RAG variant override. None uses settings default.",
     )
     purpose: str = Field(
         default="",
