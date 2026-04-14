@@ -2,180 +2,191 @@
 End-to-end RAG pipeline test using a real PDF with no mocks.
 
 Test scope:
-    End-to-end integration test covering the full ingestion and query pipeline:
+    Full pipeline test covering ingestion and query routing:
     DocumentCleaner → StructurePreserver → Chunker → QdrantStore →
-    HybridRetriever → SimpleRAG with CacheManager.
-    Each query is run twice: first call is a cache miss, second is a cache hit.
+    RAGPipeline → auto-routes: simple queries → SimpleRAG,
+    complex queries → AgentOrchestrator (decompose + fuse + synthesize).
 
 Flow:
-    Load PDF → chunk → upsert to Qdrant → initialize cache → pre-warm LLM
-    → run queries (miss + hit pairs) → print structured response summaries.
+    Load PDF → chunk → upsert to Qdrant → initialize cache → configure agents
+    → run queries (auto-routed by complexity detector).
 
-Configuration (change this line to switch search mode):
+Configuration:
     SEARCH_MODE : "hybrid" | "dense"
+    COLLECTION  : Qdrant collection name
+    PDF_PATH    : Path to the source PDF
 
 Dependencies:
-    GEMINI_API_KEY (and optionally GROQ_API_KEY) in .env; BGE embedding model;
-    sample PDF at data/sample_docs/Attention is all you need.pdf.
+    GEMINI_API_KEY (and optionally GROQ_API_KEY) in .env; BGE embedding model.
 """
 
 import asyncio
+import time
 
-from chunking.document_cleaner import DocumentCleaner
-from chunking.structure_preserver import StructurePreserver
-from chunking.chunker import Chunker
-from vectorstore.qdrant_store import QdrantStore
-from rag.retrieval.hybrid_retriever import HybridRetriever
-from llm.llm_factory import LLMFactory
-from rag.models.rag_request import RAGRequest, RAGConfig
-from rag.rag_factory import RAGFactory
 from cache.cache_manager import CacheManager
 from config.settings import settings
+from llm.llm_factory import LLMFactory
+from pipeline.models.pipeline_request import PipelineQuery
+from pipeline.rag_pipeline import RAGPipeline
+from agents.planner.complexity_detector import should_decompose
+from vectorstore.qdrant_store import QdrantStore
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Configuration — change this line to switch search mode
+# Configuration
+
 SEARCH_MODE = "hybrid"   # "hybrid" | "dense"
 
-PDF_PATH = "./data/sample_docs/Attention is all you need.pdf"
+COLLECTION = "A Dance with Dragons"
+PDF_PATH   = "./data/sample_docs/A Dance with Dragons.pdf"
 
+# Description is read by the agent planner to route sub-queries — be specific.
+COLLECTIONS = {
+    COLLECTION: (
+        "A Dance with Dragons by George R.R. Martin. Covers Jon Snow commanding "
+        "the Night's Watch at Castle Black, Daenerys ruling Meereen and managing "
+        "dragons, Tyrion's journey through Essos, Bran's training beyond the Wall, "
+        "and political conflicts across Westeros including the Iron Throne."
+    )
+}
+
+# Mix of simple and complex queries — pipeline auto-routes each one.
 QUERIES = [
-    "explain the transformer model architecture",
-    "describe how multi-headed attention works",
-    "what BLEU scores did the transformer get on WMT?",
+    # Simple — single-hop, direct factual → SimpleRAG
+    "Who is Jon Snow?",
+    "Where is Daenerys at the start of the book?",
+    "What is the Night's Watch?",
+
+    # Complex — multi-aspect, multi-character → AgentOrchestrator
+    (
+        "Analyze Jon Snow's leadership at the Wall: what major decisions does he make, "
+        "how do they affect the Night's Watch and the wildlings, and what conflicts "
+        "arise that ultimately lead to his downfall?"
+    ),
+    (
+        "Examine Daenerys Targaryen's rule in Meereen: what challenges does she face in "
+        "governing, how do her decisions impact stability and slavery, and how do these "
+        "events influence her control over dragons and her future direction?"
+    ),
+    (
+        "Compare the storylines of Jon Snow, Daenerys, and Tyrion: how do their leadership "
+        "styles differ, what challenges do they face, and how do their decisions shape "
+        "their respective arcs?"
+    ),
+    (
+        "Analyze the political instability across Westeros: what factions are involved, "
+        "how do their conflicts evolve during the story, and how do these power struggles "
+        "impact the overall state of the realm?"
+    ),
 ]
 
+# Print helper
 
-def _print_response(response, query_num: int, query_text: str) -> None:
-    """Print a structured summary of a RAGResponse for manual inspection."""
+def _print_response(response, query_num: int, query_text: str, wall_ms: float) -> None:
+    """Print a structured summary of a RAGResponse."""
     if response.cache_hit:
-        execution_path = f"cache HIT ({response.cache_layer})"
-        model_label = f"[cached] {response.model_name}"
-    elif response.timings.generation_ms == 0.0 and response.low_confidence:
-        execution_path = "low-confidence guard (no LLM call)"
-        model_label = response.model_name
+        execution_path = f"CACHE HIT ({response.cache_layer})"
     else:
-        execution_path = f"cache MISS — called {response.model_name}"
-        model_label = response.model_name
+        execution_path = "CACHE MISS"
 
-    print(f"\n{'=' * 60}")
-    print(f"[ QUERY {query_num} | SIMPLE | {SEARCH_MODE} | {execution_path} ]")
-    print(f"QUERY      : {query_text}")
-    print(f"CACHE HIT  : {response.cache_hit} | layer={response.cache_layer}")
-    if response.low_confidence:
-        print("LOW CONFIDENCE: retrieval threshold not met — answer may be empty")
-    print(f"ANSWER:\n{response.answer}")
-    print("\nSOURCES:")
-    for chunk in response.sources:
-        print(f"  [{chunk.source_file}] score={chunk.relevance_score:.2f}")
-        print(f"    {chunk.content[:150]}...")
-    print(f"\nCONFIDENCE : {response.confidence.value:.4f} (method={response.confidence.method})")
-    print(f"LATENCY    : {response.timings.total_ms:.1f} ms  "
+    route = "AGENT" if response.rag_variant == "agent" else "SIMPLE RAG"
+
+    print(f"\n{'=' * 70}")
+    print(f"[ Q{query_num} | {route} | {SEARCH_MODE.upper()} | {execution_path} ]")
+    print(f"QUERY      : {query_text[:120]}{'...' if len(query_text) > 120 else ''}")
+    print(f"VARIANT    : {response.rag_variant}")
+    print(f"MODEL      : {response.model_name}")
+    print(f"CONFIDENCE : {response.confidence.value:.4f} ({response.confidence.method})")
+    print(f"LATENCY    : {wall_ms:.0f} ms total  "
           f"[retrieval={response.timings.retrieval_ms:.0f}ms | "
           f"ranking={response.timings.ranking_ms:.0f}ms | "
           f"generation={response.timings.generation_ms:.0f}ms]")
-    print(f"MODEL      : {model_label}")
-    print("=" * 60 + "\n")
+    if response.low_confidence:
+        print("  [!] LOW CONFIDENCE — retrieval threshold not met")
+    print(f"\nANSWER:\n{response.answer}")
+    if response.sources:
+        print(f"\nSOURCES ({len(response.sources)} chunks):")
+        for chunk in response.sources[:3]:
+            print(f"  score={chunk.relevance_score:.3f} | {chunk.content[:120]}...")
+    print("=" * 70 + "\n")
 
+# Main 
 
 async def run() -> None:
-    """Load the PDF, ingest it into Qdrant, initialize the cache, and run all queries."""
-    logger.info("Pipeline config | variant=simple | search_mode=%s", SEARCH_MODE)
+    logger.info("Pipeline config | search_mode=%s | collection=%s", SEARCH_MODE, COLLECTION)
 
-    # Step 1: Load and clean the PDF
-    logger.info("Loading PDF: %s", PDF_PATH)
-    cleaner   = DocumentCleaner()
-    preserver = StructurePreserver()
-    chunker   = Chunker()
+    # Step 1: Build LLM
+    try:
+        llm = LLMFactory.create_groq_pool()
+        logger.info("Primary LLM: %s (GroqModelPool)", llm.model_name)
+    except Exception as exc:
+        logger.warning("Groq unavailable (%s) — using Gemini", exc)
+        llm = LLMFactory.create_rate_limited("gemini")
 
-    raw_docs   = await asyncio.to_thread(cleaner.load_and_clean, PDF_PATH)
-    logger.info("Loaded %d pages from PDF", len(raw_docs))
-
-    structured = await asyncio.to_thread(preserver.preserve, raw_docs)
-    chunks     = await asyncio.to_thread(chunker.split_documents, structured)
-    logger.info("Split into %d chunks", len(chunks))
-
-    # Step 2: Build Qdrant store and ingest chunks
+    # Step 2: Build pipeline
     store = QdrantStore(
-        collection_name="attention_paper",
+        collection_name=COLLECTION,
         in_memory=False,
         search_mode=SEARCH_MODE,
     )
-    await store.initialize()
-
-    ids = await store.add_documents(chunks)
-    logger.info("Ingested %d chunks into Qdrant", len(ids))
-
-    # Warm up HNSW index in RAM; skip if all chunks were already present (duplicates)
-    if ids:
-        try:
-            await store.similarity_search_with_vectors("warmup", k=1)
-            logger.info("Post-ingest HNSW warmup complete")
-        except Exception:
-            pass
-
-    # Step 3: Initialize the cache
-    cache = CacheManager(settings)
-    await cache.initialize()
-
-    # Step 4: Build the RAG pipeline
-    retriever = HybridRetriever(store)
-    try:
-        llm = LLMFactory.create_groq_pool()
-        logger.info("LLM: %s (GroqModelPool)", llm.model_name)
-    except Exception as e:
-        logger.warning("Groq unavailable (%s) — using Gemini as primary", e)
-        llm = LLMFactory.create_rate_limited("gemini")
-
-    # Pre-warm LLM to open TCP+TLS before Q1
-    async def _pre_warm_llm(provider, name):
-        try:
-            await provider.generate("Reply with: OK", max_tokens=2)
-            logger.info("LLM pre-warm complete: %s", name)
-        except Exception as exc:
-            err = str(exc)
-            if "<html" in err.lower() or "<!doctype" in err.lower():
-                logger.warning(
-                    "LLM pre-warm skipped (%s): blocked by corporate proxy/firewall", name,
-                )
-            else:
-                logger.warning("LLM pre-warm failed (%s): %s", name, err[:200])
-
-    await _pre_warm_llm(llm, llm.model_name)
-
-    rag_config = RAGConfig(
-        top_k=5,
-        rerank_strategy="cross_encoder",
-    )
-
-    rag = RAGFactory.create(
-        "simple",
-        retriever=retriever,
+    pipeline = RAGPipeline(
         llm=llm,
-        cache=cache,
+        store=store,
+        cache=CacheManager(settings),
     )
+    await pipeline.initialize()
+    logger.info("Pipeline initialized")
 
+    # Step 3: Health check
+    health = await pipeline.health_check()
+    if not health.ready:
+        logger.error("Pipeline not ready — aborting | llm=%s | store=%s", health.llm, health.vector_store)
+        await pipeline.shutdown()
+        return
+
+    # Step 4: Ingest PDF
+    logger.info("Ingesting PDF: %s", PDF_PATH)
+    result = await pipeline.ingest(file_path=PDF_PATH, collection=COLLECTION)
     logger.info(
-        "RAG pipeline ready | variant=simple | search_mode=%s | queries=%d",
-        SEARCH_MODE, len(QUERIES),
+        "Ingestion complete | stored=%d | total=%d | duplicates=%d",
+        result.chunks_stored, result.total_chunks, result.duplicates_skipped,
     )
 
-    # Step 5: Run each query twice — first call is a miss, second is a cache hit
+    # Step 5: Configure agents — enables automatic routing for complex queries
+    pipeline.configure_agents(collections=COLLECTIONS, max_concurrent=3)
+    logger.info("Agent layer configured | collections=%d", len(COLLECTIONS))
+
+    # Step 6: Show routing preview
+    print(f"\n{'─' * 70}")
+    print("  ROUTING PREVIEW (complexity detector)")
+    print(f"{'─' * 70}")
+    for q in QUERIES:
+        route = "→ AGENT" if should_decompose(q) else "→ SIMPLE RAG"
+        print(f"  {route} | {q[:80]}{'...' if len(q) > 80 else ''}")
+    print(f"{'─' * 70}\n")
+
+    # Step 7: Run all queries — auto-routed by pipeline
     for q_idx, query_text in enumerate(QUERIES, start=1):
-        request = RAGRequest(
-            query=query_text,
-            collection_name="attention_paper",
-            config=rag_config,
+        logger.info("Running query %d/%d | route=%s | query='%s'",
+                    q_idx, len(QUERIES),
+                    "AGENT" if should_decompose(query_text) else "SIMPLE",
+                    query_text[:80])
+
+        q_start = time.perf_counter()
+        response = await pipeline.query(
+            PipelineQuery(
+                query=query_text,
+                collection=COLLECTION,
+                top_k=5,
+            )
         )
+        wall_ms = (time.perf_counter() - q_start) * 1000
 
-        logger.info("=== QUERY %d/%d (first call): %s ===", q_idx, len(QUERIES), query_text[:80])
-        resp_miss = await rag.query(request)
-        _print_response(resp_miss, q_idx * 2 - 1, query_text)
+        _print_response(response, q_idx, query_text, wall_ms)
 
-        logger.info("=== QUERY %d/%d (second call — cache): %s ===", q_idx, len(QUERIES), query_text[:80])
-        resp_hit = await rag.query(request)
-        _print_response(resp_hit, q_idx * 2, query_text)
+    await pipeline.shutdown()
+    logger.info("Pipeline shutdown complete")
 
 
 if __name__ == "__main__":
