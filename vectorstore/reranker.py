@@ -223,11 +223,11 @@ class CrossEncoderReranker:
         Score filtering rule:
             keep chunk if score >= max(top_score × RATIO, MIN_ABS_FLOOR)
             RATIO=0.4 → chunk must reach 40% of the best chunk's score.
-            MIN_ABS_FLOOR=0.1 → safety net when all chunks score low.
+            MIN_ABS_FLOOR=0.05 → safety net when all chunks score low.
             Examples:
                 top=0.984, ratio=0.4 → threshold=0.394  (drops 0.231)
-                top=0.200, ratio=0.4 → threshold=0.100  (floor overrides 0.08)
-                top=0.000, ratio=0.4 → threshold=0.100  (all filtered → keep top-1)
+                top=0.200, ratio=0.4 → threshold=0.080  (floor overrides to 0.05 — kept)
+                top=0.000, ratio=0.4 → threshold=0.050  (all filtered → keep top-1)
 
         Pipeline-level RERANKER_SCORE_THRESHOLD handles the case where even
         the top-1 chunk is irrelevant (checked upstream in base_rag.py).

@@ -31,6 +31,10 @@ _MIN_CHUNKS = 2
 
 # Minimum average reranker/relevance score to pass as strong.
 # Below this the sub-query is weak — has signal but not enough.
+# Calibrated for BGE Reranker Base: relevant content scores 0.40-0.95,
+# moderately relevant 0.25-0.55, irrelevant 0.02-0.20.
+# 0.25 is the lower boundary of the "moderately relevant" band — sub-queries
+# averaging below this have genuinely marginal retrieval and benefit from rewrite.
 _MIN_AVG_SCORE = 0.25
 
 

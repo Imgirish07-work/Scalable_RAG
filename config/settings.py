@@ -214,26 +214,31 @@ class Settings(BaseSettings):
     # Falls back to RERANKER_MODEL_PATH on CPU-only machines.
     RERANKER_MODEL_PATH_CUDA: str = Field(default="", env="RERANKER_MODEL_PATH_CUDA")
     RERANKER_BATCH_SIZE: int = Field(default=32, env="RERANKER_BATCH_SIZE")
-    # Should be 2-3x top_k so the reranker has enough candidates to work with.
-    RERANKER_COARSE_TOP_K: int = Field(default=10, env="RERANKER_COARSE_TOP_K")
+    # Should be 3x top_k so the reranker has enough candidates to work with.
+    # 15 (3x default top_k=5) gives the cross-encoder a meaningful candidate pool
+    # and reduces the chance that the only relevant chunk falls outside the window.
+    RERANKER_COARSE_TOP_K: int = Field(default=15, env="RERANKER_COARSE_TOP_K")
     # Minimum cross-encoder score to consider a retrieval useful.
-    # If the top chunk scores below this after reranking, the pipeline returns
-    # a transparent "no relevant context" message instead of hallucinating.
-    # Range: 0.0-1.0 (sigmoid). 0.1 rejects near-zero-confidence retrievals.
-    RERANKER_SCORE_THRESHOLD: float = Field(default=0.1, env="RERANKER_SCORE_THRESHOLD")
+    # If the top chunk scores below this after reranking, the pipeline first
+    # attempts an MMR fallback before returning a "no relevant context" response.
+    # Range: 0.0-1.0 (sigmoid). Calibrated for BGE Reranker Base which scores
+    # relevant content 0.4-0.95 and irrelevant content 0.02-0.20.
+    RERANKER_SCORE_THRESHOLD: float = Field(default=0.12, env="RERANKER_SCORE_THRESHOLD")
     # Relative score filtering — adapts to each query's score distribution.
     # A chunk is kept only if: score >= top_score * RATIO  AND  score >= MIN_ABS_FLOOR
     # RATIO=0.4 means a chunk must score at least 40% of the best chunk's score.
-    # Example: top=0.984 → threshold=0.394. top=0.200 → threshold=0.100 (floor kicks in).
-    RERANKER_SCORE_RATIO: float = Field(default=0.7, env="RERANKER_SCORE_RATIO")
+    # Example: top=0.70 → threshold=max(0.28, 0.08)=0.28 (retains moderately relevant chunks).
+    # NOTE: 0.7 was the previous (wrong) default — it collapsed most queries to top-1.
+    RERANKER_SCORE_RATIO: float = Field(default=0.4, env="RERANKER_SCORE_RATIO")
     # Absolute floor — safety net when all chunks score low (poor retrieval).
-    # Prevents keeping chunks that score above ratio but are still near-zero quality.
-    RERANKER_MIN_ABS_FLOOR: float = Field(default=0.1, env="RERANKER_MIN_ABS_FLOOR")
+    # MUST be lower than RERANKER_SCORE_THRESHOLD so relative filter applies first
+    # and the no-context guard only fires when even the best chunk is near-zero.
+    RERANKER_MIN_ABS_FLOOR: float = Field(default=0.08, env="RERANKER_MIN_ABS_FLOOR")
     # Pre-filter: keep only top-N candidates by RRF rank before cross-encoding.
     # Drops bottom (RERANKER_COARSE_TOP_K - RERANKER_PREFILTER_TOP_N) chunks that
     # ranked last in both dense + sparse retrieval — cross-encoder has never rescued
     # these in practice. Set equal to RERANKER_COARSE_TOP_K to disable pre-filtering.
-    RERANKER_PREFILTER_TOP_N: int = Field(default=8, env="RERANKER_PREFILTER_TOP_N")
+    RERANKER_PREFILTER_TOP_N: int = Field(default=12, env="RERANKER_PREFILTER_TOP_N")
     # 0 = let ORT decide (usually 1). 4-6 is optimal for i5/i7 CPUs.
     RERANKER_INTRA_OP_THREADS: int = Field(default=4, env="RERANKER_INTRA_OP_THREADS")
 

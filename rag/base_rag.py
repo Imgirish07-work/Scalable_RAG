@@ -240,71 +240,96 @@ class BaseRAG(ABC):
         ranked_chunks = await self.rank(chunks, processed_query, strategy=active_strategy)
         ranking_ms = (time.perf_counter() - ranking_start) * 1000
 
-        # Step 4b: Reranker threshold guard
-        # If all cross-encoder scores are near-zero, the reranker found nothing
-        # relevant. Assembling context from irrelevant chunks causes hallucination.
-        # Return a transparent "no context" response instead.
+        # Step 4b: Reranker quality check + MMR recovery.
+        #
+        # When cross-encoder scores fall below threshold (common in narrative/
+        # domain-specific corpora where ms-marco-MiniLM is miscalibrated), we
+        # do NOT immediately fail. Instead, re-rank the same coarse candidates
+        # with MMR — no extra retrieval call, zero added latency for the normal
+        # path. Only if MMR also returns nothing do we return "no context".
+        #
+        # This eliminates the retrieval-reranker domain-mismatch failure mode
+        # without adding any network calls.
         if ranked_chunks:
             reranker_scores = [
                 c.reranker_score for c in ranked_chunks if c.reranker_score is not None
             ]
             if reranker_scores:
                 from config.settings import settings as _s
-                threshold = getattr(_s, "RERANKER_SCORE_THRESHOLD", 0.1)
+                threshold = getattr(_s, "RERANKER_SCORE_THRESHOLD", 0.05)
                 top_reranker_score = max(reranker_scores)
                 if top_reranker_score < threshold:
-                    total_ms = (time.perf_counter() - total_start) * 1000
                     logger.warning(
-                        "Reranker threshold not met | top_score=%.4f | "
-                        "threshold=%.2f | returning low-confidence response",
+                        "Cross-encoder threshold not met | top_score=%.4f | "
+                        "threshold=%.2f | re-ranking coarse candidates with MMR",
                         top_reranker_score,
                         threshold,
                     )
-                    # Unblock any coalesced requests waiting on this key.
-                    # The normal path calls resolve_in_flight inside _try_cache_write.
-                    # The early-return path skips that, leaving the event unset and
-                    # causing the next caller to wait the full 10s coalescing timeout.
-                    if self._cache:
-                        try:
-                            await self._cache.resolve_in_flight(
-                                query=request.query,
-                                model_name=self._llm.model_name,
-                                temperature=request.config.temperature,
-                                system_prompt=request.config.system_prompt or "",
-                            )
-                        except Exception:
-                            pass
+                    # Re-rank the original coarse candidates (still in `chunks`)
+                    # with MMR — MMR is corpus-agnostic and does not depend on
+                    # ms-marco calibration.
+                    ranked_chunks = await self._ranker.rank(
+                        chunks, processed_query, strategy="mmr"
+                    )
+                    ranking_ms = (time.perf_counter() - ranking_start) * 1000
 
-                    no_context_answer = (
-                        "I couldn't find sufficiently relevant information in the "
-                        "provided documents to answer this question confidently. "
-                        "Please try rephrasing your query or check that the relevant "
-                        "document has been indexed."
-                    )
-                    from llm.models.llm_response import LLMResponse as _LLMResponse
-                    stub_llm_response = _LLMResponse(
-                        text=no_context_answer,
-                        model=self._llm.model_name,
-                        provider=self._llm.provider_name,
-                        finish_reason="stop",
-                        prompt_tokens=0,
-                        completion_tokens=len(no_context_answer.split()),
-                        tokens_used=len(no_context_answer.split()),
-                        latency_ms=0.0,
-                    )
-                    return RAGResponse.from_generation(
-                        answer=no_context_answer,
-                        llm_response=stub_llm_response,
-                        sources=[],
-                        timings=RAGTimings(
-                            retrieval_ms=round(retrieval_ms, 2),
-                            ranking_ms=round(ranking_ms, 2),
-                            total_ms=round(total_ms, 2),
-                        ),
-                        confidence=ConfidenceScore(value=top_reranker_score, method="reranker"),
-                        request_id=request.request_id,
-                        rag_variant=self.variant_name,
-                        low_confidence=True,
+                    if not ranked_chunks:
+                        # Genuine zero-retrieval failure — nothing to recover from.
+                        total_ms = (time.perf_counter() - total_start) * 1000
+                        logger.warning(
+                            "MMR fallback returned no chunks — returning "
+                            "low-confidence response | request_id=%s",
+                            request.request_id,
+                        )
+                        # Unblock any coalesced requests waiting on this key.
+                        if self._cache:
+                            try:
+                                await self._cache.resolve_in_flight(
+                                    query=request.query,
+                                    model_name=self._llm.model_name,
+                                    temperature=request.config.temperature,
+                                    system_prompt=request.config.system_prompt or "",
+                                )
+                            except Exception:
+                                pass
+
+                        no_context_answer = (
+                            "I couldn't find sufficiently relevant information in the "
+                            "provided documents to answer this question confidently. "
+                            "Please try rephrasing your query or check that the relevant "
+                            "document has been indexed."
+                        )
+                        from llm.models.llm_response import LLMResponse as _LLMResponse
+                        stub_llm_response = _LLMResponse(
+                            text=no_context_answer,
+                            model=self._llm.model_name,
+                            provider=self._llm.provider_name,
+                            finish_reason="stop",
+                            prompt_tokens=0,
+                            completion_tokens=len(no_context_answer.split()),
+                            tokens_used=len(no_context_answer.split()),
+                            latency_ms=0.0,
+                        )
+                        return RAGResponse.from_generation(
+                            answer=no_context_answer,
+                            llm_response=stub_llm_response,
+                            sources=[],
+                            timings=RAGTimings(
+                                retrieval_ms=round(retrieval_ms, 2),
+                                ranking_ms=round(ranking_ms, 2),
+                                total_ms=round(total_ms, 2),
+                            ),
+                            confidence=ConfidenceScore(value=top_reranker_score, method="reranker"),
+                            request_id=request.request_id,
+                            rag_variant=self.variant_name,
+                            low_confidence=True,
+                        )
+
+                    logger.info(
+                        "MMR fallback succeeded | chunks_recovered=%d | "
+                        "original_top_score=%.4f",
+                        len(ranked_chunks),
+                        top_reranker_score,
                     )
 
         # Step 5: Assemble context
