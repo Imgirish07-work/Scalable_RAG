@@ -613,14 +613,24 @@ class RAGPipeline:
             result = await self._cache.get_or_wait(
                 query=request.query,
                 model_name=self._llm.model_name,
-                temperature=0.1,          # synthesis temperature
+                temperature=0.0,          # synthesis temperature
                 system_prompt="__agent__",
             )
             if result.hit:
-                logger.info(
-                    "Agent cache hit | request_id=%s | layer=%s | similarity=%.3f",
-                    request.request_id, result.layer, result.similarity_score or 0.0,
-                )
+                if result.strategy.value == "semantic":
+                    logger.info(
+                        "Agent cache hit | request_id=%s | layer=%s | strategy=%s | "
+                        "similarity=%.3f | latency=%.1f ms",
+                        request.request_id, result.layer, result.strategy,
+                        result.similarity_score, result.lookup_latency_ms,
+                    )
+                else:
+                    logger.info(
+                        "Agent cache hit | request_id=%s | layer=%s | strategy=%s | "
+                        "latency=%.1f ms",
+                        request.request_id, result.layer, result.strategy,
+                        result.lookup_latency_ms,
+                    )
                 from rag.models.rag_response import RetrievedChunk
                 cached_sources = [RetrievedChunk(**s) for s in result.sources]
                 return RAGResponse.from_cache(
@@ -645,6 +655,13 @@ class RAGPipeline:
         response: RAGResponse,
     ) -> None:
         """Write a synthesized agent response to cache. Errors are caught and logged."""
+        # Never cache a degraded response — both LLMs failed, answer is a stub.
+        if response.model_name == "unavailable":
+            logger.warning(
+                "Agent cache write skipped — degraded response | request_id=%s",
+                request.request_id,
+            )
+            return
         try:
             from llm.models.llm_response import LLMResponse
             stub = LLMResponse(
@@ -660,7 +677,7 @@ class RAGPipeline:
             await self._cache.set(
                 query=request.query,
                 model_name=self._llm.model_name,
-                temperature=0.1,
+                temperature=0.0,
                 response=stub,
                 system_prompt="__agent__",
                 sources=[chunk.model_dump() for chunk in response.sources],
@@ -669,7 +686,7 @@ class RAGPipeline:
             await self._cache.resolve_in_flight(
                 query=request.query,
                 model_name=self._llm.model_name,
-                temperature=0.1,
+                temperature=0.0,
                 system_prompt="__agent__",
             )
         except Exception as exc:
