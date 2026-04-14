@@ -86,6 +86,10 @@ class PipelineQuery(BaseModel):
         default=None,
         description="Caller-provided request ID for tracing.",
     )
+    domain: Optional[str] = Field(
+        default=None,
+        description="Domain profile: 'technical' or 'story'. None = no profile.",
+    )
 
     @field_validator("variant")
     @classmethod
@@ -119,17 +123,24 @@ class PipelineQuery(BaseModel):
         Returns:
             RAGRequest ready for BaseRAG.query().
         """
+        from rag.domain_profiles import apply_domain_profile
+
         # Only pass optional fields when explicitly set — RAGConfig fields
         # top_k and temperature are non-optional (int/float), so passing None
         # would fail Pydantic validation. Omitting them uses the field defaults.
         config_kwargs: dict = {
             "rag_variant": self.variant,
             "include_sources": self.include_sources,
+            "domain": self.domain,
         }
         if self.top_k is not None:
             config_kwargs["top_k"] = self.top_k
         if self.temperature is not None:
             config_kwargs["temperature"] = self.temperature
+
+        # Apply domain profile defaults — caller-supplied values above win.
+        config_kwargs = apply_domain_profile(config_kwargs, self.domain)
+
         config = RAGConfig(**config_kwargs)
 
         return RAGRequest(

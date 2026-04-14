@@ -37,6 +37,7 @@ logger = get_logger(__name__)
 # Configuration
 
 SEARCH_MODE = "hybrid"   # "hybrid" | "dense"
+DOMAIN      = None       # None (technical default) | "story"
 
 COLLECTION = "A Dance with Dragons"
 PDF_PATH   = "./data/sample_docs/A Dance with Dragons.pdf"
@@ -91,9 +92,10 @@ def _print_response(response, query_num: int, query_text: str, wall_ms: float) -
         execution_path = "CACHE MISS"
 
     route = "AGENT" if response.rag_variant == "agent" else "SIMPLE RAG"
+    domain_label = (DOMAIN or "technical").upper()
 
     print(f"\n{'=' * 70}")
-    print(f"[ Q{query_num} | {route} | {SEARCH_MODE.upper()} | {execution_path} ]")
+    print(f"[ Q{query_num} | {route} | {SEARCH_MODE.upper()} | {domain_label} | {execution_path} ]")
     print(f"QUERY      : {query_text[:120]}{'...' if len(query_text) > 120 else ''}")
     print(f"VARIANT    : {response.rag_variant}")
     print(f"MODEL      : {response.model_name}")
@@ -114,7 +116,10 @@ def _print_response(response, query_num: int, query_text: str, wall_ms: float) -
 # Main 
 
 async def run() -> None:
-    logger.info("Pipeline config | search_mode=%s | collection=%s", SEARCH_MODE, COLLECTION)
+    logger.info(
+        "Pipeline config | search_mode=%s | domain=%s | collection=%s",
+        SEARCH_MODE, DOMAIN or "technical", COLLECTION,
+    )
 
     # Step 1: Build LLM
     try:
@@ -178,7 +183,7 @@ async def run() -> None:
             PipelineQuery(
                 query=query_text,
                 collection=COLLECTION,
-                top_k=5,
+                domain=DOMAIN,
             )
         )
         wall_ms = (time.perf_counter() - q_start) * 1000

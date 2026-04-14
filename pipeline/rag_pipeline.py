@@ -325,6 +325,7 @@ class RAGPipeline:
             collections=collections,
             embeddings_fn=get_embeddings,
             max_concurrent=max_concurrent,
+            fallback_llm=self._fallback_llm,
         )
         logger.info(
             "Agent layer configured | collections=%d | fast_llm=%s",

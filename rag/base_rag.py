@@ -255,8 +255,7 @@ class BaseRAG(ABC):
                 c.reranker_score for c in ranked_chunks if c.reranker_score is not None
             ]
             if reranker_scores:
-                from config.settings import settings as _s
-                threshold = getattr(_s, "RERANKER_SCORE_THRESHOLD", 0.05)
+                threshold = config.reranker_score_threshold
                 top_reranker_score = max(reranker_scores)
                 if top_reranker_score < threshold:
                     logger.warning(
@@ -343,8 +342,7 @@ class BaseRAG(ABC):
         # Fix: backfill from the original coarse pool (already in memory — no
         # extra retrieval) up to RAG_MIN_CONTEXT_CHUNKS. Backfill candidates are
         # sorted by their Qdrant relevance_score so the best are always added first.
-        from config.settings import settings as _s
-        _min_ctx = getattr(_s, "RAG_MIN_CONTEXT_CHUNKS", 2)
+        _min_ctx = config.min_context_chunks
         if ranked_chunks and len(ranked_chunks) < _min_ctx:
             already_ids = {c.chunk_id for c in ranked_chunks}
             backfill = sorted(

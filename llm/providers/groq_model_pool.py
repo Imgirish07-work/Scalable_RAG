@@ -530,8 +530,22 @@ class GroqModelPool(BaseLLM):
                     await self._router.on_429(model_id, retry_after=30)
                     # Loop back — router will skip this model for 30 seconds
 
+                elif "413" in error_msg or "request too large" in error_msg or (
+                    "rate_limit_exceeded" in error_msg and "tokens per minute" in error_msg
+                ):
+                    # HTTP 413 — this specific model's per-request token cap is exceeded.
+                    # This is model-specific (e.g. qwen3-32b TPM=6000 on free tier).
+                    # Cooldown and try the next model — do NOT propagate.
+                    logger.warning(
+                        "model=%s rejected request (413 payload too large) — "
+                        "60s cooldown | switching to next model",
+                        model_id,
+                    )
+                    await self._router.on_429(model_id, retry_after=60)
+                    # Loop back — router will skip this model
+
                 else:
-                    # Auth errors, token limit exceeded, etc. —
+                    # Auth errors, unexpected provider failures —
                     # not recoverable by switching models; propagate immediately.
                     raise
 

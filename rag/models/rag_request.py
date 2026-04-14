@@ -244,6 +244,27 @@ class RAGConfig(BaseModel):
         default=None,
         description="Override agent routing: True=always, False=never, None=auto-detect.",
     )
+    # Domain profile selection — explicit only, never auto-detected.
+    # 'technical' (default) or 'story'. None = no profile applied.
+    domain: str | None = Field(
+        default=None,
+        description="Domain profile: 'technical' or 'story'. None = no profile.",
+    )
+    # Minimum chunks to guarantee after reranker filtering.
+    # Profile or caller can raise this; backfill from coarse pool fills the gap.
+    min_context_chunks: int = Field(
+        default_factory=lambda: settings.RAG_MIN_CONTEXT_CHUNKS,
+        ge=1,
+        description="Minimum chunks passed to context assembly.",
+    )
+    # Cross-encoder quality gate threshold — per-request override.
+    # When top reranker score < this, MMR recovery is triggered (step 4b).
+    reranker_score_threshold: float = Field(
+        default_factory=lambda: settings.RERANKER_SCORE_THRESHOLD,
+        ge=0.0,
+        le=1.0,
+        description="Minimum reranker score before MMR recovery triggers.",
+    )
 
     # Field validators
 

@@ -83,6 +83,7 @@ class AgentOrchestrator:
         collections: dict[str, str],
         embeddings_fn: Optional[object] = None,
         max_concurrent: int = 4,
+        fallback_llm: Optional[BaseLLM] = None,
     ) -> None:
         """Initialize AgentOrchestrator with all required dependencies.
 
@@ -119,6 +120,7 @@ class AgentOrchestrator:
         self._context_fusion = ContextFusion(ranker=ranker, assembler=assembler)
         self._strong_llm = strong_llm
         self._fast_llm = fast_llm
+        self._fallback_llm = fallback_llm
 
     async def execute(self, request: RAGRequest) -> AgentResponse:
         """Execute the full complex query flow.
@@ -195,14 +197,27 @@ class AgentOrchestrator:
         fusion_ms = (time.perf_counter() - fusion_start) * 1000
 
         # Step 6: generate final answer (strong LLM, 1 call).
+        # Both LLMs failing is gracefully degraded — retrieval work is preserved.
         generation_start = time.perf_counter()
-        answer, gen_prompt_tokens, gen_completion_tokens = await self._generate_answer(
-            query=query,
-            structured_context=structured_context,
-        )
+        gen_model_name = "unavailable"
+        try:
+            answer, gen_prompt_tokens, gen_completion_tokens, gen_model_name = await self._generate_answer(
+                query=query,
+                structured_context=structured_context,
+            )
+            total_prompt_tokens += gen_prompt_tokens
+            total_completion_tokens += gen_completion_tokens
+        except Exception as exc:
+            logger.error(
+                "All LLMs failed for synthesis — degraded response | "
+                "request_id=%s | error=%s",
+                request_id, exc,
+            )
+            answer = (
+                "Generation unavailable — all LLM providers failed. "
+                "Retrieved context is available in sources."
+            )
         generation_ms = (time.perf_counter() - generation_start) * 1000
-        total_prompt_tokens += gen_prompt_tokens
-        total_completion_tokens += gen_completion_tokens
 
         total_ms = (time.perf_counter() - total_start) * 1000
         successful = [r for r in sub_results if r.success and r.chunks]
@@ -232,7 +247,7 @@ class AgentOrchestrator:
                 total_ms=round(total_ms, 1),
             ),
             request_id=request_id,
-            model_name=self._strong_llm.model_name,
+            model_name=gen_model_name,
             prompt_tokens=total_prompt_tokens,
             completion_tokens=total_completion_tokens,
         )
@@ -377,20 +392,43 @@ class AgentOrchestrator:
         Returns:
             Tuple of (answer_text, prompt_tokens, completion_tokens).
         """
+        from llm.exceptions.llm_exceptions import LLMError
+
         system_prompt, user_prompt = build_synthesis_prompt(
             query=query,
             structured_context=structured_context,
         )
-        response = await self._strong_llm.chat(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.1,
-            max_tokens=_SYNTHESIS_MAX_TOKENS,
-        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        active_llm = self._strong_llm
+        try:
+            response = await self._strong_llm.chat(
+                messages=messages,
+                temperature=0.0,
+                max_tokens=_SYNTHESIS_MAX_TOKENS,
+            )
+        except LLMError as exc:
+            # All pool models exhausted (429s) or hard provider error.
+            # Route to fallback LLM (Gemini) to avoid crashing the pipeline.
+            if self._fallback_llm is None:
+                raise
+            logger.warning(
+                "Strong LLM failed for synthesis — routing to fallback | "
+                "error=%s | fallback=%s",
+                type(exc).__name__, self._fallback_llm.provider_name,
+            )
+            active_llm = self._fallback_llm
+            response = await self._fallback_llm.chat(
+                messages=messages,
+                temperature=0.0,
+                max_tokens=_SYNTHESIS_MAX_TOKENS,
+            )
+
         answer = response.text.strip()
-        return answer, response.prompt_tokens, response.completion_tokens
+        return answer, response.prompt_tokens, response.completion_tokens, active_llm.model_name
 
 
 def _compute_confidence(results: list[SubQueryResult]) -> ConfidenceScore:
