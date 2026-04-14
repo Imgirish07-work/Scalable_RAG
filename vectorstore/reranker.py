@@ -34,9 +34,11 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import List
+from typing import TYPE_CHECKING, List
 
-from rag.models.rag_response import RetrievedChunk
+if TYPE_CHECKING:
+    from rag.models.rag_response import RetrievedChunk
+
 from config.settings import settings
 from utils.logger import get_logger
 from vectorstore.embeddings import _ONNX_PROVIDERS
