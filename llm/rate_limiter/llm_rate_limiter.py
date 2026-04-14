@@ -125,6 +125,14 @@ class LLMRateLimiter(BaseLLM):
         Returns:
             LLMResponse from the wrapped provider.
         """
+        logger.info(
+            "Request added to queue | provider=%s | type=generate | "
+            "slots_free=%d/%d | query='%s'",
+            self._provider.provider_name,
+            max(0, self._semaphore._value),
+            self._config.max_concurrent,
+            prompt[:100],
+        )
         async with self._semaphore:
             await self._throttle()
             return await self._provider.generate(prompt, **kwargs)
@@ -139,6 +147,18 @@ class LLMRateLimiter(BaseLLM):
         Returns:
             LLMResponse from the wrapped provider.
         """
+        last_user_msg = next(
+            (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"),
+            "",
+        )
+        logger.info(
+            "Request added to queue | provider=%s | type=chat | "
+            "slots_free=%d/%d | query='%s'",
+            self._provider.provider_name,
+            self._semaphore._value,
+            self._config.max_concurrent,
+            last_user_msg[:100],
+        )
         async with self._semaphore:
             await self._throttle()
             return await self._provider.chat(messages, **kwargs)
