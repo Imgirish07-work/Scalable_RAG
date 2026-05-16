@@ -64,3 +64,6 @@ build/
 /models/
 # Added by code-review-graph
 .code-review-graph/
+
+#backup file
+backup_file.py

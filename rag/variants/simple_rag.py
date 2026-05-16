@@ -87,18 +87,24 @@ class SimpleRAG(BaseRAG):
         Raises:
             RAGRetrievalError: If the retriever fails.
         """
+        # Read user_id from the request when present so per-user scoping
+        # flows from the API layer down to QdrantStore.filter_user_id.
+        user_id = request.user_id if request is not None else ""
+
         logger.info(
             "SimpleRAG retrieving | query_len=%d | top_k=%d | "
-            "has_filters=%s",
+            "has_filters=%s | user_scoped=%s",
             len(query),
             top_k,
             filters is not None,
+            bool(user_id),
         )
 
         chunks = await self._retriever.retrieve(
             query=query,
             top_k=top_k,
             filters=filters,
+            user_id=user_id,
         )
 
         logger.info(

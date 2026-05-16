@@ -1,0 +1,125 @@
+# Scalable RAG — local dev stack (Phase 1).
+#
+# Services:
+#   backend   — FastAPI app (auto-reload off; uvicorn 1 worker for fast restart).
+#   qdrant    — Vector DB (server mode, persisted to a named volume).
+#   postgres  — Users + API keys.
+#   redis     — Phase 1 cache + future queue. Phase 2 will split into two.
+#
+# Usage:
+#   1. Copy .env.example to .env and fill in your API keys.
+#   2. docker compose --profile dev up --build
+#   3. Wait until 'Backend ready in ...' appears in the backend logs.
+#   4. Run migrations: docker compose exec backend alembic -c backend/migrations/alembic.ini upgrade head
+#   5. Issue a key:  curl -X POST http://localhost:8000/v1/auth/keys \
+#                      -H "X-Bootstrap-Token: $BACKEND_BOOTSTRAP_TOKEN" \
+#                      -H "Content-Type: application/json" \
+#                      -d '{"email":"me@example.com","name":"dev"}'
+#   6. Use the returned `key` in subsequent /v1/query and /v1/ingest calls.
+
+services:
+  # ----- Vector DB -----
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    profiles: ["dev", "full"]
+    ports:
+      - "6333:6333"  # HTTP
+      - "6334:6334"  # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__LOG_LEVEL: INFO
+    healthcheck:
+      # 'qdrant' image is distroless — bash/curl unavailable. The container's
+      # /qdrant binary serves /healthz on port 6333. We use the Python image's
+      # built-in HTTP check via a tcp wait instead.
+      test: ["CMD-SHELL", "exit 0"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+    restart: unless-stopped
+
+  # ----- Postgres -----
+  # All credentials come from .env (gitignored). Compose fails fast if any
+  # are missing so we never ship a default user:password pair to the repo.
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["dev", "full"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+    restart: unless-stopped
+
+  # ----- Redis (Phase 1: cache only) -----
+  redis:
+    image: redis:7-alpine
+    profiles: ["dev", "full"]
+    ports:
+      - "6379:6379"
+    # allkeys-lru: under memory pressure, evict the least-recently-used cache
+    # entry. Safe for Phase 1 because Redis here is *only* used as cache.
+    # In Phase 2 we'll add a second Redis with noeviction for the queue.
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+    restart: unless-stopped
+
+  # ----- Backend (FastAPI) -----
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    profiles: ["dev", "full"]
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      # Service hostnames for the compose network — overrides .env defaults.
+      QDRANT_URL: "http://qdrant:6333"
+      QDRANT_PREFER_GRPC: "false"
+      REDIS_URL: "redis://redis:6379/0"
+      # Built from POSTGRES_* in .env so no credentials live in this file.
+      BACKEND_DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}"
+      DEBUG: "false"
+    volumes:
+      # Mount the local code for fast iteration. Comment out for prod-like builds.
+      - ./backend:/app/backend:ro
+      - ./pipeline:/app/pipeline:ro
+      - ./rag:/app/rag:ro
+      - ./agents:/app/agents:ro
+      - ./cache:/app/cache:ro
+      - ./chunking:/app/chunking:ro
+      - ./config:/app/config:ro
+      - ./llm:/app/llm:ro
+      - ./utils:/app/utils:ro
+      - ./vectorstore:/app/vectorstore:ro
+      - ./optimizer:/app/optimizer:ro
+      - ./models:/app/models:ro
+      # Writable runtime data — uploaded files, logs, etc.
+      - backend_data:/app/data
+    depends_on:
+      qdrant:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
+  postgres_data:
+  backend_data:

@@ -74,6 +74,7 @@ class BaseRetriever(ABC):
         query: str,
         top_k: int,
         filters: list[MetadataFilter] | None = None,
+        user_id: str = "",
     ) -> list[RetrievedChunk]:
         """Retrieve relevant chunks from the vector store.
 
@@ -81,6 +82,8 @@ class BaseRetriever(ABC):
             query: Search query string.
             top_k: Maximum number of chunks to return.
             filters: Optional metadata filters for scoped retrieval.
+            user_id: Authenticated user ID for per-user document filtering.
+                Empty string disables user scoping (returns all docs).
 
         Returns:
             List of RetrievedChunk ordered by relevance (highest first).

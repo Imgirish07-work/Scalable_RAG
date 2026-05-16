@@ -1260,6 +1260,11 @@ class QdrantStore(BaseVectorStore):
             logger.exception("Error deleting collection: %s", e)
             raise
 
+    async def list_all_collections(self) -> List[str]:
+        """Return every collection name visible in the connected Qdrant cluster."""
+        raw = await asyncio.to_thread(self._client.get_collections)
+        return [c.name for c in raw.collections]
+
     async def get_collection_stats(self) -> dict:
         """Return collection statistics for observability dashboards.
 

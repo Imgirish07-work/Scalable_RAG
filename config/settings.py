@@ -265,8 +265,7 @@ class Settings(BaseSettings):
     """Local Redis URL. Used when REDIS_ENV=local."""
 
     REDIS_CLOUD_URL: str = ""
-    """Redis Cloud URL with credentials. Used when REDIS_ENV=cloud.
-    Example: rediss://user:password@host:port/0"""
+    """TLS Redis URL including credentials. Used when REDIS_ENV=cloud."""
 
     REDIS_MAX_CONNECTIONS: int = 20
     """Maximum connections in the Redis async connection pool."""

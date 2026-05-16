@@ -1,0 +1,96 @@
+# syntax=docker/dockerfile:1.7
+#
+# Scalable RAG Backend — multi-stage build.
+#
+# Stage 1 (builder): install build-time tooling and Python deps into a venv.
+# Stage 2 (runtime): copy the venv + app code into a slim image. No compilers.
+#
+# Total image size target: ~2.5 GB (most of which is BGE + SPLADE + reranker
+# ONNX model files baked into the image, ~1.5 GB combined).
+#
+# Build:
+#   docker build -f Dockerfile.backend -t scalable-rag-backend:dev .
+#
+# Run:
+#   docker run --rm -p 8000:8000 --env-file .env scalable-rag-backend:dev
+
+ARG PYTHON_VERSION=3.12
+
+# ----- Stage 1: builder -----
+FROM python:${PYTHON_VERSION}-slim AS builder
+
+# Build-time toolchain + libraries needed by:
+#  - onnxruntime (CPU build needs libgomp1)
+#  - pdfminer / pdfplumber (need libjpeg, zlib, freetype)
+#  - python-magic (libmagic)
+#  - sentencepiece / tokenizers (need a C++ compiler)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc \
+        g++ \
+        git \
+        curl \
+        libmagic1 \
+        libjpeg-dev \
+        zlib1g-dev \
+        libfreetype6-dev \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install deps into an isolated venv so we can copy /opt/venv into the runtime.
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY requirements.txt /app/requirements.txt
+
+# Upgrade pip once, then install pinned deps.
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir -r requirements.txt
+
+# ----- Stage 2: runtime -----
+FROM python:${PYTHON_VERSION}-slim AS runtime
+
+# Runtime-only system libraries.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libmagic1 \
+        libgomp1 \
+        libjpeg62-turbo \
+        libfreetype6 \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root user for the app.
+ARG APP_UID=1000
+ARG APP_GID=1000
+RUN groupadd -g ${APP_GID} app \
+    && useradd -m -u ${APP_UID} -g ${APP_GID} -s /bin/bash app
+
+WORKDIR /app
+
+# Copy the venv from the builder.
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+# Copy application code. .dockerignore keeps tests/data/venv/etc out.
+COPY --chown=app:app . /app
+
+# Create runtime directories the app writes to.
+RUN mkdir -p /app/data/uploads /app/data/logs /app/data/cache \
+    && chown -R app:app /app/data
+
+USER app
+
+EXPOSE 8000
+
+# Healthcheck hits /healthz (no auth required).
+HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=3 \
+    CMD curl -fsS http://localhost:8000/healthz || exit 1
+
+# Default entrypoint = Uvicorn serving the FastAPI app.
+# K8s ingest-worker Deployment overrides this with: python -m backend.workers.ingest_worker
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]

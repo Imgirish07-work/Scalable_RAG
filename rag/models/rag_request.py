@@ -435,6 +435,10 @@ class RAGRequest(BaseModel):
         default_factory=lambda: uuid.uuid4().hex,
         description="Unique request ID for tracing (auto-generated)",
     )
+    user_id: str = Field(
+        default="",
+        description="Authenticated user ID. Empty string = no per-user scoping.",
+    )
 
     # Field validators
 

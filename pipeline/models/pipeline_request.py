@@ -90,6 +90,10 @@ class PipelineQuery(BaseModel):
         default=None,
         description="Domain profile: 'technical' or 'story'. None = no profile.",
     )
+    user_id: str = Field(
+        default="",
+        description="Authenticated user ID. Empty string = no user scoping.",
+    )
 
     @field_validator("variant")
     @classmethod
@@ -149,6 +153,7 @@ class PipelineQuery(BaseModel):
             config=config,
             conversation_history=self.conversation_history,
             request_id=self.request_id or str(uuid4()),
+            user_id=self.user_id,
         )
 
 

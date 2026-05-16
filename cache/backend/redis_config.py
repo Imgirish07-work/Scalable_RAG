@@ -10,7 +10,7 @@ Design:
 
     Environments:
         local  — redis://localhost:6379/0, no TLS, dev prefix
-        cloud  — rediss://user:pass@host:port/0, TLS, prod prefix
+        cloud  — rediss scheme with TLS, prod prefix, credentials from env
         test   — redis://localhost:6379/1, separate DB, test prefix
 
 Chain of Responsibility:

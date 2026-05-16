@@ -109,6 +109,7 @@ class HybridRetriever(BaseRetriever):
         query: str,
         top_k: int,
         filters: list[MetadataFilter] | None = None,
+        user_id: str = "",
     ) -> list[RetrievedChunk]:
         """Retrieve chunks using dense + SPLADE hybrid search.
 
@@ -134,14 +135,15 @@ class HybridRetriever(BaseRetriever):
             return []
 
         qdrant_filter = self.build_qdrant_filter(filters)
+        filter_user_id = user_id if user_id else None
 
         start = time.perf_counter()
 
-        docs = await self._try_hybrid_search(query, top_k, qdrant_filter)
+        docs = await self._try_hybrid_search(query, top_k, qdrant_filter, filter_user_id)
 
         if docs is None:
             # Hybrid unavailable or failed — fall back to dense-only
-            docs = await self._fallback_dense_search(query, top_k, qdrant_filter)
+            docs = await self._fallback_dense_search(query, top_k, qdrant_filter, filter_user_id)
 
         elapsed_ms = (time.perf_counter() - start) * 1000
 
@@ -163,6 +165,7 @@ class HybridRetriever(BaseRetriever):
         query: str,
         top_k: int,
         qdrant_filter: dict | None,
+        filter_user_id: str | None = None,
     ) -> list | None:
         """Attempt hybrid search via QdrantStore.
 
@@ -194,6 +197,7 @@ class HybridRetriever(BaseRetriever):
             docs = await self._store.hybrid_search_with_vectors(
                 query=query,
                 k=top_k,
+                filter_user_id=filter_user_id,
             )
             return docs
         except Exception as e:
@@ -208,6 +212,7 @@ class HybridRetriever(BaseRetriever):
         query: str,
         top_k: int,
         qdrant_filter: dict | None,
+        filter_user_id: str | None = None,
     ) -> list:
         """Fall back to dense-only search when hybrid is unavailable.
 
@@ -226,6 +231,7 @@ class HybridRetriever(BaseRetriever):
             docs = await self._store.similarity_search_with_vectors(
                 query=query,
                 k=top_k,
+                filter_user_id=filter_user_id,
             )
             logger.info(
                 "Dense fallback succeeded | results=%d",

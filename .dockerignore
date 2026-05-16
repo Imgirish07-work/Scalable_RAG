@@ -1,0 +1,46 @@
+# Build artifacts and IDE noise
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.swo
+
+# Virtual envs (we install fresh in the builder)
+venv/
+.venv/
+env/
+
+# Local data + logs (created in container by the app)
+data/logs/
+data/cache/
+data/uploads/
+*.log
+
+# Test/scratch
+test_*.py
+failed.txt
+notebooks/
+
+# Git
+.git/
+.gitignore
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Local secrets — never bake into images
+.env
+.env.local
+
+# CI / docs that don't belong in the image
+.github/
+docs/
+README.md
+WORKFLOW.md
+Optimizations.md

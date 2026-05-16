@@ -160,6 +160,7 @@ class AgentOrchestrator:
         sub_results = await self._chunk_retriever.retrieve_all(
             sub_queries=plan.sub_queries,
             parent_request_id=request_id,
+            user_id=request.user_id,
         )
         retrieval_ms = (time.perf_counter() - retrieval_start) * 1000
 
@@ -171,6 +172,7 @@ class AgentOrchestrator:
         sub_results, rewrite_tokens = await self._rewrite_and_refetch_weak(
             sub_results=sub_results,
             parent_request_id=request_id,
+            user_id=request.user_id,
         )
         rewrite_ms = (time.perf_counter() - rewrite_start) * 1000
         total_prompt_tokens += rewrite_tokens[0]
@@ -256,6 +258,7 @@ class AgentOrchestrator:
         self,
         sub_results: list[SubQueryResult],
         parent_request_id: str,
+        user_id: str = "",
     ) -> tuple[list[SubQueryResult], tuple[int, int]]:
         """Rewrite weak sub-queries with the fast LLM then re-retrieve once.
 
@@ -320,7 +323,7 @@ class AgentOrchestrator:
         # Re-retrieve all rewritten sub-queries in parallel.
         if rewritten_sub_queries:
             refetch_tasks = [
-                self._chunk_retriever.retrieve_one(sq, parent_request_id)
+                self._chunk_retriever.retrieve_one(sq, parent_request_id, user_id)
                 for _, sq in rewritten_sub_queries
             ]
             refetch_results = await asyncio.gather(*refetch_tasks, return_exceptions=True)
