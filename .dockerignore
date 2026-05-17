@@ -17,6 +17,9 @@ data/cache/
 data/uploads/
 *.log
 
+# Model files — mounted as a volume by docker-compose, never baked in.
+models/
+
 # Test/scratch
 test_*.py
 failed.txt
