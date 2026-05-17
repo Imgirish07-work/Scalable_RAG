@@ -1,10 +1,11 @@
 # syntax=docker/dockerfile:1.7
 #
-# Scalable RAG Backend — multi-stage build, slim Python base.
+# Scalable RAG Backend — slim Python base, GPU via pip-installed NVIDIA libs.
 #
-# onnxruntime-gpu==1.17.3 bundles both CUDA 11.8 runtime libs AND cuDNN 8 inside
-# the wheel, so no NVIDIA CUDA base image is needed. Works on hosts with or
-# without a GPU — falls back to CPU automatically when no device is attached.
+# torch pulls in nvidia-cudnn-cu12, nvidia-cuda-runtime-cu12, etc. as deps.
+# onnxruntime-gpu reuses those same libs. We register them via ldconfig so
+# the dynamic linker finds them without relying on LD_LIBRARY_PATH.
+# Falls back to CPU automatically when no GPU is attached.
 
 ARG PYTHON_VERSION=3.12
 
@@ -31,17 +32,16 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 COPY requirements.txt /app/requirements.txt
 
-# Install CPU torch first — prevents transformers/accelerate/sentence-transformers
-# from pulling in 3+ GB of CUDA-12 NVIDIA wheels via the default torch package.
-# GPU work in this pipeline is done by onnxruntime-gpu, not by torch.
-# onnxruntime-gpu==1.17.3 bundles CUDA 11.8 + cuDNN 8 inside its wheel.
+# Install all deps (torch pulls in CUDA 12 + cuDNN 9 wheels), then swap CPU
+# onnxruntime for the GPU build pinned to a version that matches torch's CUDA/cuDNN.
+# Use the CUDA-12 extra index URL to guarantee the right onnxruntime-gpu build.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip setuptools wheel \
-    && pip install --index-url https://download.pytorch.org/whl/cpu \
-        torch==2.5.1 torchvision==0.20.1 \
     && pip install -r requirements.txt \
     && pip uninstall -y onnxruntime \
-    && pip install onnxruntime-gpu==1.17.3
+    && pip install \
+        --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ \
+        onnxruntime-gpu==1.20.1
 
 # ----- Stage 2: runtime -----
 FROM python:${PYTHON_VERSION}-slim AS runtime
@@ -54,14 +54,35 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
+WORKDIR /app
+
+COPY --from=builder /opt/venv /opt/venv
+
+# Register pip-installed NVIDIA libraries with the dynamic linker. ldconfig
+# is more reliable than LD_LIBRARY_PATH — it works regardless of how the
+# process is launched and doesn't get wiped by env-handling middleware.
+RUN set -e \
+    && NV_LIB_BASE=/opt/venv/lib/python3.12/site-packages/nvidia \
+    && printf "%s\n" \
+        "$NV_LIB_BASE/cudnn/lib" \
+        "$NV_LIB_BASE/cuda_runtime/lib" \
+        "$NV_LIB_BASE/cublas/lib" \
+        "$NV_LIB_BASE/cufft/lib" \
+        "$NV_LIB_BASE/curand/lib" \
+        "$NV_LIB_BASE/cusparse/lib" \
+        "$NV_LIB_BASE/cusolver/lib" \
+        "$NV_LIB_BASE/nvjitlink/lib" \
+        "$NV_LIB_BASE/nccl/lib" \
+        "$NV_LIB_BASE/cuda_nvrtc/lib" \
+        > /etc/ld.so.conf.d/nvidia-pip.conf \
+    && ldconfig
+
+# Non-root user.
 ARG APP_UID=1000
 ARG APP_GID=1000
 RUN groupadd -g ${APP_GID} app \
     && useradd -m -u ${APP_UID} -g ${APP_GID} -s /bin/bash app
 
-WORKDIR /app
-
-COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
