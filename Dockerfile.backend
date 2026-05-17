@@ -31,11 +31,14 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 COPY requirements.txt /app/requirements.txt
 
-# Swap CPU onnxruntime for the GPU build. The 1.17.3 Linux wheel bundles
-# CUDA 11.8 + cuDNN 8 inside the package, so no system CUDA libraries needed.
-# BuildKit cache mount keeps downloaded wheels across rebuilds.
+# Install CPU torch first — prevents transformers/accelerate/sentence-transformers
+# from pulling in 3+ GB of CUDA-12 NVIDIA wheels via the default torch package.
+# GPU work in this pipeline is done by onnxruntime-gpu, not by torch.
+# onnxruntime-gpu==1.17.3 bundles CUDA 11.8 + cuDNN 8 inside its wheel.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip setuptools wheel \
+    && pip install --index-url https://download.pytorch.org/whl/cpu \
+        torch==2.5.1 torchvision==0.20.1 \
     && pip install -r requirements.txt \
     && pip uninstall -y onnxruntime \
     && pip install onnxruntime-gpu==1.17.3
