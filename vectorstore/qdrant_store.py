@@ -165,7 +165,7 @@ class QdrantStore(BaseVectorStore):
             # Collection creation is sync — offload to thread to avoid blocking.
             await asyncio.to_thread(self._create_collection_if_missing)
 
-            self._store = self._build_vector_store()
+            self._store = await asyncio.to_thread(self._build_vector_store)
 
             # Start keepalive only for gRPC server connections — not in-memory
             # or injected clients (caller manages their lifecycle).
@@ -302,7 +302,7 @@ class QdrantStore(BaseVectorStore):
 
             # GIL-atomic swap — readers see old or new, never None.
             self._client = new_client
-            self._store = self._build_vector_store()  # pure object construction, no I/O
+            self._store = await asyncio.to_thread(self._build_vector_store)
 
             logger.info(
                 "Qdrant gRPC reconnect successful | collection=%s",

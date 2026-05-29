@@ -221,13 +221,13 @@ class RAGPipeline:
         logger.info("Pipeline warm-up starting...")
 
         async def _warmup_embeddings() -> None:
-            model = get_embeddings()
+            model = await asyncio.to_thread(get_embeddings)
             await asyncio.to_thread(model.embed_query, "warmup")
             logger.debug("Warm-up: embedding model ready")
 
         async def _warmup_splade() -> None:
             if self._store and hasattr(self._store, "_get_sparse_embeddings"):
-                sparse = self._store._get_sparse_embeddings()
+                sparse = await asyncio.to_thread(self._store._get_sparse_embeddings)
                 await asyncio.to_thread(sparse.embed_query, "warmup")
                 logger.debug("Warm-up: SPLADE model ready")
 

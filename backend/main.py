@@ -1,5 +1,6 @@
 """FastAPI app with lifespan-managed RAGPipeline singleton."""
 
+import asyncio
 import os
 
 os.environ.setdefault("HF_HUB_DISABLE_SSL_VERIFICATION", "1")
@@ -31,51 +32,93 @@ from vectorstore.qdrant_store import QdrantStore
 logger = get_logger(__name__)
 
 
+async def _initialize_pipeline(app: FastAPI) -> None:
+    """Build and warm up the RAG pipeline; flip `app.state.ready` on success.
+
+    Runs in the background after the lifespan yields, so uvicorn can serve
+    health checks and reject non-ready /v1/* calls with a clean 503 while
+    the heavy ONNX/SPLADE/Qdrant boot continues. Every blocking sync call
+    downstream is already routed through `asyncio.to_thread`, so this
+    coroutine never holds the event loop.
+    """
+    start = time.perf_counter()
+    try:
+        llm = LLMFactory.create_from_settings()
+        logger.info("LLM ready | %s/%s", llm.provider_name, llm.model_name)
+
+        store = QdrantStore(in_memory=False, search_mode=settings.RAG_RETRIEVAL_MODE)
+        cache = CacheManager(settings) if settings.cache_enabled else None
+
+        pipeline = RAGPipeline(llm=llm, store=store, cache=cache)
+        await pipeline.initialize()
+
+        # Single physical Qdrant collection; tenancy enforced via user_id filter.
+        agent_collections = {
+            settings.qdrant_collection_name: "All user documents",
+        }
+        pipeline.configure_agents(
+            collections=agent_collections,
+            max_concurrent=backend_settings.max_concurrent_subqueries,
+        )
+        logger.info(
+            "Agent layer configured | physical_collection=%s",
+            settings.qdrant_collection_name,
+        )
+
+        app.state.pipeline = pipeline
+        app.state.ready = True
+        logger.info("Backend ready in %.0f ms", (time.perf_counter() - start) * 1000)
+
+    except asyncio.CancelledError:
+        # Triggered when shutdown arrives mid-boot; cleanup runs in lifespan.
+        logger.info("Pipeline initialization cancelled mid-boot")
+        raise
+    except Exception:
+        # Stay alive in not-ready state instead of crash-looping — operators
+        # can inspect logs and `/readyz` will keep reporting 503 cleanly.
+        logger.exception(
+            "Pipeline initialization failed — backend will remain not-ready"
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Boot subsystems on startup; tear them down on shutdown."""
-    logger.info("Backend starting | app=%s v%s", settings.app_name, settings.app_version)
+    """Boot quickly; defer heavy init to a background task.
+
+    Yielding right after spawning the init task lets uvicorn begin handling
+    requests immediately. Docker's healthcheck on `/healthz` therefore passes
+    from process start, eliminating the restart loop that occurs when an
+    aggressive healthcheck window is shorter than the model-load time.
+    """
+    logger.info(
+        "Backend starting | app=%s v%s", settings.app_name, settings.app_version
+    )
     app.state.ready = False
     app.state.pipeline = None
 
-    start = time.perf_counter()
-
-    llm = LLMFactory.create_from_settings()
-    logger.info("LLM ready | %s/%s", llm.provider_name, llm.model_name)
-
-    store = QdrantStore(in_memory=False, search_mode=settings.RAG_RETRIEVAL_MODE)
-    cache = CacheManager(settings) if settings.cache_enabled else None
-
-    pipeline = RAGPipeline(llm=llm, store=store, cache=cache)
-    await pipeline.initialize()
-
-    # Every user's chunks share a single physical Qdrant collection; tenancy
-    # is enforced via the user_id payload filter. The agent planner therefore
-    # routes every sub-query to this one collection.
-    agent_collections = {
-        settings.qdrant_collection_name: "All user documents",
-    }
-    pipeline.configure_agents(
-        collections=agent_collections,
-        max_concurrent=backend_settings.max_concurrent_subqueries,
+    init_task = asyncio.create_task(
+        _initialize_pipeline(app), name="pipeline-init",
     )
-    logger.info(
-        "Agent layer configured | physical_collection=%s",
-        settings.qdrant_collection_name,
-    )
-
-    app.state.pipeline = pipeline
-    app.state.ready = True
-    logger.info("Backend ready in %.0f ms", (time.perf_counter() - start) * 1000)
 
     yield
 
     logger.info("Backend shutting down")
     app.state.ready = False
+
+    # Cancel any in-flight init before tearing down dependencies it might own.
+    if not init_task.done():
+        init_task.cancel()
     try:
-        await pipeline.shutdown()
-    except Exception:
-        logger.exception("Pipeline shutdown failed")
+        await init_task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    pipeline = getattr(app.state, "pipeline", None)
+    if pipeline is not None:
+        try:
+            await pipeline.shutdown()
+        except Exception:
+            logger.exception("Pipeline shutdown failed")
     try:
         await dispose_engine()
     except Exception:
