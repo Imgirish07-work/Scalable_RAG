@@ -1,7 +1,6 @@
 """Backend HTTP-layer settings, separate from pipeline settings."""
 
 from functools import lru_cache
-from typing import Optional
 
 from pydantic import Field
 from pydantic_settings import BaseSettings
@@ -13,8 +12,6 @@ class BackendSettings(BaseSettings):
     # No default — must be set explicitly via BACKEND_DATABASE_URL so the
     # repository never contains a connection string with embedded credentials.
     database_url: str = Field(default="", env="BACKEND_DATABASE_URL")
-    api_key_prefix: str = Field(default="rag_", env="BACKEND_API_KEY_PREFIX")
-    bootstrap_token: Optional[str] = Field(default=None, env="BACKEND_BOOTSTRAP_TOKEN")
 
     # Pipe-separated "name:description" pairs for the agent planner.
     collections_registry: str = Field(default="", env="BACKEND_COLLECTIONS_REGISTRY")

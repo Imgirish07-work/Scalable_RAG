@@ -14,9 +14,8 @@ from fastapi import (
     status,
 )
 
-from backend.auth.principal import Principal
 from backend.config import backend_settings
-from backend.deps import get_pipeline, get_principal
+from backend.deps import get_pipeline
 from backend.models.ingest import ApiIngestResponse
 from backend.observability.metrics import ingest_chunks_total, ingest_total
 from pipeline.rag_pipeline import RAGPipeline
@@ -28,13 +27,15 @@ router = APIRouter(prefix="/v1", tags=["ingest"])
 
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 
+# Hardcoded while auth is removed. Replaced by real identity in Phase 8.
+DEV_USER_ID = "dev-user"
+
 
 @router.post("/ingest", response_model=ApiIngestResponse, status_code=status.HTTP_201_CREATED)
 async def ingest(
     request: Request,
     file: UploadFile = File(..., description="PDF, DOCX, TXT, MD, or HTML"),
     collection: str = Form(..., description="Target Qdrant collection"),
-    principal: Principal = Depends(get_principal),
     pipeline: RAGPipeline = Depends(get_pipeline),
 ) -> ApiIngestResponse:
     """Stream the upload to a temp file, run pipeline.ingest, then delete the temp."""
@@ -64,14 +65,14 @@ async def ingest(
                     out.write(chunk)
 
             logger.info(
-                "Ingest received | request_id=%s | user_id=%s | doc_id=%s | bytes=%d",
-                request_id, principal.user_id, doc_id, total_bytes,
+                "Ingest received | request_id=%s | doc_id=%s | bytes=%d",
+                request_id, doc_id, total_bytes,
             )
 
             result = await pipeline.ingest(
                 file_path=str(temp_path),
                 collection=collection,
-                user_id=principal.user_id,
+                user_id=DEV_USER_ID,
                 doc_id=doc_id,
             )
         except HTTPException:

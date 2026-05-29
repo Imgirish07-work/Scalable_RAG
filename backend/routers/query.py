@@ -2,8 +2,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from backend.auth.principal import Principal
-from backend.deps import get_pipeline, get_principal
+from backend.deps import get_pipeline
 from backend.models.query import ApiQueryRequest
 from backend.observability.metrics import queries_total
 from pipeline.exceptions.pipeline_exceptions import PipelineValidationError
@@ -16,15 +15,17 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["query"])
 
+# Hardcoded while auth is removed. Replaced by real identity in Phase 8.
+DEV_USER_ID = "dev-user"
+
 
 @router.post("/query", response_model=RAGResponse)
 async def query(
     body: ApiQueryRequest,
     request: Request,
-    principal: Principal = Depends(get_principal),
     pipeline: RAGPipeline = Depends(get_pipeline),
 ) -> RAGResponse:
-    """Execute a RAG query; user_id is pulled from the Principal, not the body."""
+    """Execute a RAG query."""
     request_id = getattr(request.state, "request_id", None)
 
     try:
@@ -38,7 +39,7 @@ async def query(
             include_sources=body.include_sources,
             domain=body.domain,
             request_id=request_id,
-            user_id=principal.user_id,
+            user_id=DEV_USER_ID,
         )
         response = await pipeline.query(pipeline_query)
     except PipelineValidationError as exc:
@@ -49,8 +50,8 @@ async def query(
         raise
     except Exception as exc:
         logger.exception(
-            "Query failed | request_id=%s | user_id=%s | error=%s",
-            request_id, principal.user_id, exc,
+            "Query failed | request_id=%s | error=%s",
+            request_id, exc,
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

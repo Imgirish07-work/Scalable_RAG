@@ -16,7 +16,6 @@ from backend.config import backend_settings
 from backend.middleware.request_id import RequestIDMiddleware
 from backend.repos.base import dispose_engine
 from backend.routers import (
-    auth as auth_router,
     collections as collections_router,
     health as health_router,
     ingest as ingest_router,
@@ -96,7 +95,6 @@ def create_app() -> FastAPI:
     app.add_middleware(RequestIDMiddleware)
 
     app.include_router(health_router.router)
-    app.include_router(auth_router.router)
     app.include_router(query_router.router)
     app.include_router(ingest_router.router)
     app.include_router(collections_router.router)

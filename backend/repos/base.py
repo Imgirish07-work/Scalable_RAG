@@ -46,7 +46,7 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
 
 @asynccontextmanager
 async def session_scope() -> AsyncIterator[AsyncSession]:
-    """Transactional session for scripts; FastAPI routes use get_db instead."""
+    """Transactional session for scripts and routers that need DB access."""
     factory = get_session_factory()
     async with factory() as session:
         try:
