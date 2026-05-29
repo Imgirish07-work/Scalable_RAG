@@ -84,6 +84,7 @@ class BaseVectorStore(ABC):
         k: int = 3,
         score_threshold: Optional[float] = None,
         filter_user_id: Optional[str] = None,
+        filter_collection: Optional[str] = None,
     ) -> List[Document]:
         """Return top-k semantically similar documents for the given query.
 
@@ -97,7 +98,10 @@ class BaseVectorStore(ABC):
             score_threshold: Minimum similarity score (0.0-1.0).
                              None = return all top-k without score filtering.
             filter_user_id: When set, returns only that user's documents.
-                            None = search entire collection.
+                            None = search across all users.
+            filter_collection: When set, scopes results to a logical
+                            collection within the user's corpus.
+                            None = search the entire corpus.
 
         Returns:
             List of matching Documents with metadata.

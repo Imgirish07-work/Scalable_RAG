@@ -13,7 +13,14 @@ class QueryRequest(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     query: str = Field(..., min_length=1, max_length=10000)
-    collection: str = Field(..., min_length=1, max_length=256)
+    collection: Optional[str] = Field(
+        default=None,
+        max_length=256,
+        description=(
+            "Logical collection ('folder') filter. Omit to search the "
+            "caller's entire corpus."
+        ),
+    )
     variant: Optional[str] = None
     conversation_history: Optional[list[ConversationTurn]] = None
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)

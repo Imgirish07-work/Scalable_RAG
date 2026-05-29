@@ -356,6 +356,8 @@ class QdrantStore(BaseVectorStore):
                 self._validate_collection_config()
                 # Apply SQ to existing collection if not yet configured.
                 self._ensure_quantization()
+                # Self-healing: backfill any payload indexes added in newer versions.
+                self._ensure_payload_indexes()
                 return
 
             vectors_config = {}
@@ -389,22 +391,45 @@ class QdrantStore(BaseVectorStore):
                 self.search_mode,
             )
 
-            # Keyword indexes on filtered fields — required on Qdrant Cloud/server.
-            # In-memory mode skips enforcement but creating them is harmless.
-            for field in ("metadata.chunk_id", "metadata.user_id"):
+            self._ensure_payload_indexes()
+
+        except Exception as e:
+            logger.exception("Error creating collection: %s", e)
+            raise
+
+    # Required keyword indexes on every chunk's payload.
+    # These power the tenant + logical-collection filter at search time.
+    _REQUIRED_PAYLOAD_INDEXES: tuple[str, ...] = (
+        "metadata.chunk_id",
+        "metadata.user_id",
+        "metadata.collection",
+    )
+
+    def _ensure_payload_indexes(self) -> None:
+        """Create required keyword payload indexes; idempotent and self-healing.
+
+        Safe to call on both fresh and existing collections — Qdrant raises
+        when an index already exists, which we treat as success. Any other
+        failure is logged but never aborts the caller, because missing an
+        index degrades search performance but does not break correctness.
+        """
+        for field in self._REQUIRED_PAYLOAD_INDEXES:
+            try:
                 self._client.create_payload_index(
                     collection_name=self.collection_name,
                     field_name=field,
                     field_schema=PayloadSchemaType.KEYWORD,
                 )
-            logger.info(
-                "Created payload indexes: collection=%s, fields=[metadata.chunk_id, metadata.user_id]",
-                self.collection_name,
-            )
-
-        except Exception as e:
-            logger.exception("Error creating collection: %s", e)
-            raise
+                logger.info(
+                    "Payload index created | collection=%s | field=%s",
+                    self.collection_name, field,
+                )
+            except Exception as exc:
+                # Most common: index already exists. Logged at debug to avoid noise.
+                logger.debug(
+                    "Payload index skipped | collection=%s | field=%s | reason=%s",
+                    self.collection_name, field, type(exc).__name__,
+                )
 
     def _validate_collection_config(self) -> None:
         """Warn if the existing collection config does not match the current search mode.
@@ -836,6 +861,10 @@ class QdrantStore(BaseVectorStore):
             metadata.setdefault("doc_id", "")
             metadata.setdefault("user_id", "")
 
+            # Logical-collection grouping within the user's own corpus.
+            # Always populated so that filter_collection queries find every chunk.
+            metadata.setdefault("collection", "default")
+
             metadata.setdefault("source", "unknown")
             metadata.setdefault("page", 0)
 
@@ -860,6 +889,7 @@ class QdrantStore(BaseVectorStore):
         k: int = 3,
         score_threshold: Optional[float] = None,
         filter_user_id: Optional[str] = None,
+        filter_collection: Optional[str] = None,
     ) -> List[Document]:
         """Search for semantically similar documents.
 
@@ -879,7 +909,10 @@ class QdrantStore(BaseVectorStore):
             score_threshold: Minimum similarity score (0.0-1.0).
                              None = return all top-k unfiltered.
             filter_user_id: Filter to a specific user's documents.
-                            None = search entire collection.
+                            None = search across all users (no tenant scope).
+            filter_collection: Filter to a specific logical collection within
+                            the user's corpus. None = search all of the user's
+                            logical collections.
 
         Returns:
             List of matching Documents with clean page_content.
@@ -895,7 +928,7 @@ class QdrantStore(BaseVectorStore):
             return []
 
         try:
-            qdrant_filter = self._build_filter(filter_user_id)
+            qdrant_filter = self._build_filter(filter_user_id, filter_collection)
 
             if score_threshold is not None:
                 results = await self._search_with_scores(
@@ -1016,32 +1049,56 @@ class QdrantStore(BaseVectorStore):
 
         return restored
 
-    def _build_filter(self, user_id: Optional[str]) -> Optional[Filter]:
-        """Build a Qdrant payload filter for per-user document isolation.
+    def _build_filter(
+        self,
+        user_id: Optional[str],
+        collection: Optional[str] = None,
+    ) -> Optional[Filter]:
+        """Build a Qdrant payload filter for tenant + logical-collection scoping.
+
+        `user_id` enforces multi-tenant isolation: all chunks of every user live
+        in the same physical Qdrant collection and are separated by this filter.
+
+        `collection` is an optional logical grouping (a "folder" within the
+        user's own corpus). When provided, results are narrowed to that group.
 
         Args:
-            user_id: User ID to filter by. None returns no filter.
+            user_id: User ID to filter by. None means no per-user scoping.
+            collection: Logical collection name to filter by. None means search
+                across all of the user's logical collections.
 
         Returns:
-            Qdrant Filter object, or None for unfiltered search.
+            Qdrant Filter object, or None when neither argument is provided.
         """
-        if user_id is None:
-            return None
+        conditions: list[FieldCondition] = []
 
-        return Filter(
-            must=[
+        if user_id:
+            conditions.append(
                 FieldCondition(
                     key="metadata.user_id",
                     match=MatchValue(value=user_id),
                 )
-            ]
-        )
+            )
+
+        if collection:
+            conditions.append(
+                FieldCondition(
+                    key="metadata.collection",
+                    match=MatchValue(value=collection),
+                )
+            )
+
+        if not conditions:
+            return None
+
+        return Filter(must=conditions)
 
     async def similarity_search_with_vectors(
         self,
         query: str,
         k: int,
         filter_user_id: Optional[str] = None,
+        filter_collection: Optional[str] = None,
     ) -> List[Document]:
         """Search for top-k results and return stored dense embedding vectors alongside them.
 
@@ -1060,7 +1117,9 @@ class QdrantStore(BaseVectorStore):
             query: Search query text.
             k: Number of results to return.
             filter_user_id: Filter to a specific user's documents.
-                            None = search entire collection.
+                            None = search across all users.
+            filter_collection: Filter to a logical collection within the user's
+                            corpus. None = search the user's entire corpus.
 
         Returns:
             List of Documents with clean page_content, relevance_score in metadata,
@@ -1081,7 +1140,7 @@ class QdrantStore(BaseVectorStore):
                 embeddings_model.embed_query, query
             )
 
-            qdrant_filter = self._build_filter(filter_user_id)
+            qdrant_filter = self._build_filter(filter_user_id, filter_collection)
 
             # query_points replaces the deprecated client.search() (Qdrant client v1.7+).
             # rescore=True: re-ranks int8 ANN results with float32 vectors — recovers SQ recall loss.
@@ -1135,6 +1194,7 @@ class QdrantStore(BaseVectorStore):
         query: str,
         k: int,
         filter_user_id: Optional[str] = None,
+        filter_collection: Optional[str] = None,
     ) -> List[Document]:
         """Hybrid RRF search returning top-k results with dense embedding vectors.
 
@@ -1151,7 +1211,9 @@ class QdrantStore(BaseVectorStore):
             query: Search query text.
             k: Number of results to return.
             filter_user_id: Filter to a specific user's documents.
-                            None = search entire collection.
+                            None = search across all users.
+            filter_collection: Filter to a logical collection within the user's
+                            corpus. None = search the user's entire corpus.
 
         Returns:
             List of Documents with clean page_content, relevance_score in metadata,
@@ -1176,7 +1238,7 @@ class QdrantStore(BaseVectorStore):
                 asyncio.to_thread(sparse_model.embed_query, query),
             )
 
-            qdrant_filter = self._build_filter(filter_user_id)
+            qdrant_filter = self._build_filter(filter_user_id, filter_collection)
 
             # Fetch more candidates per leg so RRF has a large enough pool to fuse.
             coarse_k = max(k * 3, 20)

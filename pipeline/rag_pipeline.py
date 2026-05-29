@@ -432,21 +432,28 @@ class RAGPipeline:
 
     # Document ingestion
 
+    # Default logical-collection name when the caller does not supply one.
+    # Every chunk is stamped with this value so filter_collection queries work.
+    _DEFAULT_LOGICAL_COLLECTION = "default"
+
     async def ingest(
         self,
         file_path: str,
-        collection: str,
+        collection: Optional[str] = None,
         user_id: str = "",
         doc_id: str = "",
     ) -> IngestionResult:
         """Ingest a document into the vector store.
 
-        Runs the full ingestion pipeline: load → clean → preserve
-        structure → chunk → embed → store.
+        Runs the full ingestion pipeline: load → clean → preserve structure
+        → chunk → embed → store. The physical Qdrant collection is always
+        settings.qdrant_collection_name; `collection` is a logical "folder"
+        stamped into every chunk's payload for later filtering.
 
         Args:
             file_path: Path to the document file.
-            collection: Target Qdrant collection name.
+            collection: Logical collection ("folder") name within the user's
+                corpus. None defaults to 'default'.
             user_id: Owning user ID written to every chunk's payload.
                 Empty string means no per-user scoping.
             doc_id: Stable identifier for the source document (e.g. a UUID
@@ -462,9 +469,15 @@ class RAGPipeline:
         """
         self._ensure_initialized()
 
+        logical_collection = (collection or self._DEFAULT_LOGICAL_COLLECTION).strip() \
+            or self._DEFAULT_LOGICAL_COLLECTION
+        physical_collection = settings.qdrant_collection_name
+
         logger.info(
-            "Pipeline ingesting file='%s' into collection='%s' | user_id=%s | doc_id=%s",
-            file_path, collection, user_id or "<none>", doc_id or "<none>",
+            "Pipeline ingesting file='%s' | physical='%s' | logical='%s' | "
+            "user_id=%s | doc_id=%s",
+            file_path, physical_collection, logical_collection,
+            user_id or "<none>", doc_id or "<none>",
         )
         ingest_start = time.perf_counter()
 
@@ -484,21 +497,22 @@ class RAGPipeline:
             total_chunks = len(chunks)
             logger.info("Produced %d chunks", total_chunks)
 
-            # Stamp tenancy metadata on every chunk so QdrantStore's setdefault
-            # preserves these (instead of writing "" placeholders).
-            if user_id or doc_id:
-                for chunk in chunks:
-                    if user_id:
-                        chunk.metadata["user_id"] = user_id
-                    if doc_id:
-                        chunk.metadata["doc_id"] = doc_id
+            # Stamp tenancy + logical-collection metadata on every chunk so
+            # QdrantStore's setdefault preserves these instead of writing
+            # placeholder defaults.
+            for chunk in chunks:
+                if user_id:
+                    chunk.metadata["user_id"] = user_id
+                if doc_id:
+                    chunk.metadata["doc_id"] = doc_id
+                chunk.metadata["collection"] = logical_collection
 
             # Reuse the pipeline's existing Qdrant client so the ingested
             # collection is visible to all subsequent queries. Creating a new
             # QdrantStore without sharing the client would produce an isolated
             # in-memory database unreachable by queries.
             ingest_store = QdrantStore(
-                collection_name=collection,
+                collection_name=physical_collection,
                 client=self._store._client,
                 search_mode=settings.RAG_RETRIEVAL_MODE,
             )
@@ -514,7 +528,8 @@ class RAGPipeline:
                 try:
                     await ingest_store.similarity_search_with_vectors("warmup", k=1)
                     logger.debug(
-                        "Post-ingest HNSW warmup complete for collection='%s'", collection,
+                        "Post-ingest HNSW warmup complete | physical='%s' | logical='%s'",
+                        physical_collection, logical_collection,
                     )
                 except Exception:
                     pass  # non-fatal — first query pays cold-start instead
@@ -523,9 +538,11 @@ class RAGPipeline:
             stored = len(point_ids)
             duplicates = total_chunks - stored
 
+            # `collection` in the result is the logical folder name the caller
+            # sees; the physical Qdrant target is implementation detail.
             result = IngestionResult(
                 file_path=file_path,
-                collection=collection,
+                collection=logical_collection,
                 chunks_stored=stored,
                 total_chunks=total_chunks,
                 duplicates_skipped=max(0, duplicates),
@@ -543,7 +560,8 @@ class RAGPipeline:
                 message=f"Ingestion failed for '{file_path}': {exc}",
                 details={
                     "file_path": file_path,
-                    "collection": collection,
+                    "physical_collection": physical_collection,
+                    "logical_collection": logical_collection,
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                 },
@@ -885,12 +903,16 @@ class RAGPipeline:
             confidence_method=original_config.confidence_method,
         )
 
+        # Tenancy + logical-collection filters MUST carry over to the fallback;
+        # dropping them on retry would leak across users or widen the scope.
         return RAGRequest(
             query=request.query,
             collection_name=request.collection_name,
             config=downgraded_config,
             conversation_history=request.conversation_history,
             request_id=request.request_id,
+            user_id=request.user_id,
+            logical_collection=request.logical_collection,
         )
 
     def _describe_fallbacks(self, original_variant: str) -> list[str]:

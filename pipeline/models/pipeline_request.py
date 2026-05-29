@@ -23,6 +23,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # internal
+from config.settings import settings
 from rag.models.rag_request import ConversationTurn, RAGConfig, RAGRequest
 
 
@@ -35,7 +36,9 @@ class PipelineQuery(BaseModel):
 
     Attributes:
         query: The user's natural language question.
-        collection: Target Qdrant collection name.
+        collection: Optional logical collection ("folder") within the user's
+            corpus. None means search across all of the user's documents.
+            The physical Qdrant collection is fixed by settings.
         variant: RAG variant override ('simple'). None uses settings default.
         conversation_history: Optional prior turns for multi-turn queries.
         temperature: LLM temperature override. None uses settings default.
@@ -52,11 +55,13 @@ class PipelineQuery(BaseModel):
         max_length=10000,
         description="The user's natural language question.",
     )
-    collection: str = Field(
-        ...,
-        min_length=1,
+    collection: Optional[str] = Field(
+        default=None,
         max_length=256,
-        description="Target Qdrant collection name.",
+        description=(
+            "Logical collection ('folder') filter. None searches the user's "
+            "entire corpus."
+        ),
     )
     variant: Optional[str] = Field(
         default=None,
@@ -121,8 +126,9 @@ class PipelineQuery(BaseModel):
     def to_rag_request(self) -> RAGRequest:
         """Convert to internal RAGRequest + RAGConfig.
 
-        Maps only the fields that were explicitly set by the caller.
-        None values are left as None so RAGConfig uses settings defaults.
+        The physical Qdrant collection is pinned to settings.qdrant_collection_name
+        — every user's chunks live there and are separated by user_id. The
+        caller-supplied `collection` (if any) is forwarded as a logical filter.
 
         Returns:
             RAGRequest ready for BaseRAG.query().
@@ -149,11 +155,12 @@ class PipelineQuery(BaseModel):
 
         return RAGRequest(
             query=self.query,
-            collection_name=self.collection,
+            collection_name=settings.qdrant_collection_name,
             config=config,
             conversation_history=self.conversation_history,
             request_id=self.request_id or str(uuid4()),
             user_id=self.user_id,
+            logical_collection=self.collection or "",
         )
 
 

@@ -49,15 +49,20 @@ async def lifespan(app: FastAPI):
     pipeline = RAGPipeline(llm=llm, store=store, cache=cache)
     await pipeline.initialize()
 
-    collections = backend_settings.collections_dict
-    if collections:
-        pipeline.configure_agents(
-            collections=collections,
-            max_concurrent=backend_settings.max_concurrent_subqueries,
-        )
-        logger.info("Agent layer configured | collections=%d", len(collections))
-    else:
-        logger.info("Agent layer disabled (no collections registered)")
+    # Every user's chunks share a single physical Qdrant collection; tenancy
+    # is enforced via the user_id payload filter. The agent planner therefore
+    # routes every sub-query to this one collection.
+    agent_collections = {
+        settings.qdrant_collection_name: "All user documents",
+    }
+    pipeline.configure_agents(
+        collections=agent_collections,
+        max_concurrent=backend_settings.max_concurrent_subqueries,
+    )
+    logger.info(
+        "Agent layer configured | physical_collection=%s",
+        settings.qdrant_collection_name,
+    )
 
     app.state.pipeline = pipeline
     app.state.ready = True

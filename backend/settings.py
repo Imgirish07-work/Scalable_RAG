@@ -13,9 +13,6 @@ class BackendSettings(BaseSettings):
     # repository never contains a connection string with embedded credentials.
     database_url: str = Field(default="", env="BACKEND_DATABASE_URL")
 
-    # Pipe-separated "name:description" pairs for the agent planner.
-    collections_registry: str = Field(default="", env="BACKEND_COLLECTIONS_REGISTRY")
-
     cors_origins: str = Field(default="*", env="BACKEND_CORS_ORIGINS")
     max_upload_size_mb: int = Field(default=50, env="BACKEND_MAX_UPLOAD_SIZE_MB")
     ingest_temp_dir: str = Field(default="./data/uploads", env="BACKEND_INGEST_TEMP_DIR")
@@ -28,16 +25,6 @@ class BackendSettings(BaseSettings):
         "case_sensitive": False,
         "extra": "ignore",
     }
-
-    @property
-    def collections_dict(self) -> dict[str, str]:
-        """Parse `collections_registry` into a name->description dict."""
-        result: dict[str, str] = {}
-        for pair in self.collections_registry.split("|"):
-            name, sep, desc = pair.partition(":")
-            if sep and name.strip() and desc.strip():
-                result[name.strip()] = desc.strip()
-        return result
 
     @property
     def cors_origin_list(self) -> list[str]:

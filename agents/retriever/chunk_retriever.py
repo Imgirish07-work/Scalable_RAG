@@ -74,6 +74,7 @@ class ChunkRetriever:
         sub_queries: list[SubQuery],
         parent_request_id: str,
         user_id: str = "",
+        logical_collection: str = "",
     ) -> list[SubQueryResult]:
         """Execute all sub-query retrievals concurrently.
 
@@ -83,12 +84,17 @@ class ChunkRetriever:
         Args:
             sub_queries: Sub-queries from the decomposition plan.
             parent_request_id: Parent request ID for log tracing.
+            user_id: Tenant filter forwarded to every retriever call.
+            logical_collection: Logical collection ("folder") filter forwarded
+                to every retriever call. Empty string = no logical scope.
 
         Returns:
             SubQueryResult per sub-query in the same order as input.
         """
         tasks = [
-            self._retrieve_with_semaphore(sq, parent_request_id, user_id)
+            self._retrieve_with_semaphore(
+                sq, parent_request_id, user_id, logical_collection,
+            )
             for sq in sub_queries
         ]
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
@@ -118,12 +124,15 @@ class ChunkRetriever:
         sub_query: SubQuery,
         parent_request_id: str,
         user_id: str = "",
+        logical_collection: str = "",
     ) -> SubQueryResult:
         """Execute a single sub-query retrieval: fetch → rerank → return chunks.
 
         Args:
             sub_query: The sub-query to execute.
             parent_request_id: Parent request ID for log tracing.
+            user_id: Tenant filter applied at the retriever.
+            logical_collection: Logical-collection filter applied at the retriever.
 
         Returns:
             SubQueryResult with retrieved chunks or failure metadata.
@@ -141,7 +150,10 @@ class ChunkRetriever:
             )
 
             raw_chunks = await retriever.retrieve(
-                sub_query.query, top_k=coarse_top_k, user_id=user_id
+                sub_query.query,
+                top_k=coarse_top_k,
+                user_id=user_id,
+                collection=logical_collection,
             )
             ranked_chunks = await self._ranker.rank(raw_chunks, sub_query.query)
 
@@ -184,7 +196,10 @@ class ChunkRetriever:
         sub_query: SubQuery,
         parent_request_id: str,
         user_id: str = "",
+        logical_collection: str = "",
     ) -> SubQueryResult:
         """Wrap retrieve_one with semaphore for concurrency control."""
         async with self._semaphore:
-            return await self.retrieve_one(sub_query, parent_request_id, user_id)
+            return await self.retrieve_one(
+                sub_query, parent_request_id, user_id, logical_collection,
+            )

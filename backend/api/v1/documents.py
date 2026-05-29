@@ -44,7 +44,13 @@ DEV_USER_ID = "dev-user"
 async def ingest(
     request: Request,
     file: UploadFile = File(..., description="PDF, DOCX, TXT, MD, or HTML"),
-    collection: str = Form(..., description="Target Qdrant collection"),
+    collection: str = Form(
+        default="default",
+        description=(
+            "Logical collection ('folder') the document belongs to. "
+            "Defaults to 'default' when omitted."
+        ),
+    ),
     pipeline: RAGPipeline = Depends(get_pipeline),
 ) -> DocumentCreatedView:
     """Stream the upload to a temp file, run pipeline.ingest, then delete the temp."""

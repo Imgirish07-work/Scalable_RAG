@@ -110,6 +110,7 @@ class HybridRetriever(BaseRetriever):
         top_k: int,
         filters: list[MetadataFilter] | None = None,
         user_id: str = "",
+        collection: str = "",
     ) -> list[RetrievedChunk]:
         """Retrieve chunks using dense + SPLADE hybrid search.
 
@@ -122,6 +123,8 @@ class HybridRetriever(BaseRetriever):
             query: Search query string.
             top_k: Maximum number of chunks to return (1–50).
             filters: Optional metadata filters for scoped retrieval.
+            user_id: Tenant filter — empty string disables per-user scoping.
+            collection: Logical-collection filter — empty string disables it.
 
         Returns:
             List of RetrievedChunk ordered by relevance (highest first).
@@ -135,15 +138,20 @@ class HybridRetriever(BaseRetriever):
             return []
 
         qdrant_filter = self.build_qdrant_filter(filters)
-        filter_user_id = user_id if user_id else None
+        filter_user_id = user_id or None
+        filter_collection = collection or None
 
         start = time.perf_counter()
 
-        docs = await self._try_hybrid_search(query, top_k, qdrant_filter, filter_user_id)
+        docs = await self._try_hybrid_search(
+            query, top_k, qdrant_filter, filter_user_id, filter_collection,
+        )
 
         if docs is None:
             # Hybrid unavailable or failed — fall back to dense-only
-            docs = await self._fallback_dense_search(query, top_k, qdrant_filter, filter_user_id)
+            docs = await self._fallback_dense_search(
+                query, top_k, qdrant_filter, filter_user_id, filter_collection,
+            )
 
         elapsed_ms = (time.perf_counter() - start) * 1000
 
@@ -166,6 +174,7 @@ class HybridRetriever(BaseRetriever):
         top_k: int,
         qdrant_filter: dict | None,
         filter_user_id: str | None = None,
+        filter_collection: str | None = None,
     ) -> list | None:
         """Attempt hybrid search via QdrantStore.
 
@@ -173,6 +182,8 @@ class HybridRetriever(BaseRetriever):
             query: Search query string.
             top_k: Maximum results to return.
             qdrant_filter: Qdrant payload filter dict or None.
+            filter_user_id: Tenant filter for the store call.
+            filter_collection: Logical-collection filter for the store call.
 
         Returns:
             List of LangChain Documents, or None if hybrid is unavailable
@@ -198,6 +209,7 @@ class HybridRetriever(BaseRetriever):
                 query=query,
                 k=top_k,
                 filter_user_id=filter_user_id,
+                filter_collection=filter_collection,
             )
             return docs
         except Exception as e:
@@ -213,6 +225,7 @@ class HybridRetriever(BaseRetriever):
         top_k: int,
         qdrant_filter: dict | None,
         filter_user_id: str | None = None,
+        filter_collection: str | None = None,
     ) -> list:
         """Fall back to dense-only search when hybrid is unavailable.
 
@@ -220,6 +233,8 @@ class HybridRetriever(BaseRetriever):
             query: Search query string.
             top_k: Maximum results to return.
             qdrant_filter: Qdrant payload filter dict or None.
+            filter_user_id: Tenant filter for the store call.
+            filter_collection: Logical-collection filter for the store call.
 
         Returns:
             List of LangChain Documents from dense search.
@@ -232,6 +247,7 @@ class HybridRetriever(BaseRetriever):
                 query=query,
                 k=top_k,
                 filter_user_id=filter_user_id,
+                filter_collection=filter_collection,
             )
             logger.info(
                 "Dense fallback succeeded | results=%d",

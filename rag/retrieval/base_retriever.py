@@ -75,6 +75,7 @@ class BaseRetriever(ABC):
         top_k: int,
         filters: list[MetadataFilter] | None = None,
         user_id: str = "",
+        collection: str = "",
     ) -> list[RetrievedChunk]:
         """Retrieve relevant chunks from the vector store.
 
@@ -84,6 +85,8 @@ class BaseRetriever(ABC):
             filters: Optional metadata filters for scoped retrieval.
             user_id: Authenticated user ID for per-user document filtering.
                 Empty string disables user scoping (returns all docs).
+            collection: Logical collection ("folder") within the user's corpus.
+                Empty string searches all of the user's logical collections.
 
         Returns:
             List of RetrievedChunk ordered by relevance (highest first).

@@ -439,6 +439,13 @@ class RAGRequest(BaseModel):
         default="",
         description="Authenticated user ID. Empty string = no per-user scoping.",
     )
+    logical_collection: str = Field(
+        default="",
+        description=(
+            "Logical collection ('folder') within the user's corpus. "
+            "Empty string searches all of the user's logical collections."
+        ),
+    )
 
     # Field validators
 

@@ -72,6 +72,7 @@ class DenseRetriever(BaseRetriever):
         top_k: int,
         filters: list[MetadataFilter] | None = None,
         user_id: str = "",
+        collection: str = "",
     ) -> list[RetrievedChunk]:
         """Retrieve relevant chunks using dense vector similarity.
 
@@ -88,6 +89,8 @@ class DenseRetriever(BaseRetriever):
             query: Search query string.
             top_k: Maximum number of chunks to return (1–50).
             filters: Optional metadata filters for scoped retrieval.
+            user_id: Tenant filter — empty string disables per-user scoping.
+            collection: Logical-collection filter — empty string disables it.
 
         Returns:
             List of RetrievedChunk ordered by relevance (highest first).
@@ -104,8 +107,9 @@ class DenseRetriever(BaseRetriever):
 
         start = time.perf_counter()
 
-        # Empty user_id means no per-user filter; pass None to QdrantStore.
-        filter_user_id = user_id if user_id else None
+        # Empty strings mean "no filter"; translate to None at the store boundary.
+        filter_user_id = user_id or None
+        filter_collection = collection or None
 
         try:
             # Prefer the with-vectors variant so MMR can skip re-embedding.
@@ -115,6 +119,7 @@ class DenseRetriever(BaseRetriever):
                     query=query,
                     k=top_k,
                     filter_user_id=filter_user_id,
+                    filter_collection=filter_collection,
                 )
             else:
                 docs = await self._store.similarity_search(
@@ -122,6 +127,7 @@ class DenseRetriever(BaseRetriever):
                     k=top_k,
                     score_threshold=0.0,
                     filter_user_id=filter_user_id,
+                    filter_collection=filter_collection,
                 )
             elapsed_ms = (time.perf_counter() - start) * 1000
 
