@@ -60,6 +60,22 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
             raise
 
 
+async def get_db_session() -> AsyncIterator[AsyncSession]:
+    """Per-request DB session for FastAPI; commits on success, rolls back on error.
+
+    Use via `Depends(get_db_session)` in controllers, or via repositories that
+    accept the session as a constructor argument.
+    """
+    factory = get_session_factory()
+    async with factory() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+
 async def dispose_engine() -> None:
     """Close all pooled connections; safe to call even if the engine never started."""
     global _engine, _session_factory
