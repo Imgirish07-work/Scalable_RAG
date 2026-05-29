@@ -1,1 +1,1 @@
-"""Pydantic API request/response models."""
+"""SQLAlchemy ORM entities. The `Base` class lives in `models.base`."""

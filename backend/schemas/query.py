@@ -1,4 +1,4 @@
-"""Query endpoint request model. `user_id` is set server-side from auth."""
+"""Request DTO for POST /v1/query."""
 
 from typing import Optional
 
@@ -7,7 +7,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from rag.models.rag_request import ConversationTurn
 
 
-class ApiQueryRequest(BaseModel):
+class QueryRequest(BaseModel):
+    """Body shape accepted by the /v1/query endpoint."""
+
     model_config = ConfigDict(frozen=True)
 
     query: str = Field(..., min_length=1, max_length=10000)

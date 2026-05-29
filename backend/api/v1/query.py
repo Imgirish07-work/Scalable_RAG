@@ -2,9 +2,9 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from backend.deps import get_pipeline
-from backend.models.query import ApiQueryRequest
-from backend.observability.metrics import queries_total
+from backend.dependencies import get_pipeline
+from backend.metrics import queries_total
+from backend.schemas.query import QueryRequest
 from pipeline.exceptions.pipeline_exceptions import PipelineValidationError
 from pipeline.models.pipeline_request import PipelineQuery
 from pipeline.rag_pipeline import RAGPipeline
@@ -21,11 +21,11 @@ DEV_USER_ID = "dev-user"
 
 @router.post("/query", response_model=RAGResponse)
 async def query(
-    body: ApiQueryRequest,
+    body: QueryRequest,
     request: Request,
     pipeline: RAGPipeline = Depends(get_pipeline),
 ) -> RAGResponse:
-    """Execute a RAG query."""
+    """Execute a RAG query and return the answer with optional source chunks."""
     request_id = getattr(request.state, "request_id", None)
 
     try:
@@ -43,15 +43,12 @@ async def query(
         )
         response = await pipeline.query(pipeline_query)
     except PipelineValidationError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     except HTTPException:
         raise
     except Exception as exc:
         logger.exception(
-            "Query failed | request_id=%s | error=%s",
-            request_id, exc,
+            "Query failed | request_id=%s | error=%s", request_id, exc,
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

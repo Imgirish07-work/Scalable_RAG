@@ -1,4 +1,4 @@
-"""Prometheus metrics."""
+"""Prometheus counters and histograms exported by the backend."""
 
 from prometheus_client import Counter, Histogram
 
@@ -23,7 +23,7 @@ queries_total = Counter(
 
 ingest_total = Counter(
     "rag_ingest_total",
-    "Total /v1/ingest calls, by outcome.",
+    "Total ingest calls, by outcome.",
     labelnames=("outcome",),
 )
 

@@ -12,15 +12,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.config import backend_settings
-from backend.middleware.request_id import RequestIDMiddleware
-from backend.repos.base import dispose_engine
-from backend.routers import (
+from backend.api.v1 import (
     collections as collections_router,
+    documents as documents_router,
     health as health_router,
-    ingest as ingest_router,
     query as query_router,
 )
+from backend.middleware import RequestIDMiddleware
+from backend.repositories.database import dispose_engine
+from backend.settings import backend_settings
 from cache.cache_manager import CacheManager
 from config.settings import settings
 from llm.llm_factory import LLMFactory
@@ -96,7 +96,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health_router.router)
     app.include_router(query_router.router)
-    app.include_router(ingest_router.router)
+    app.include_router(documents_router.router)
     app.include_router(collections_router.router)
     return app
 

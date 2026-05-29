@@ -2,8 +2,8 @@
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from backend.deps import get_pipeline
-from backend.models.collection import CollectionInfo, CollectionListResponse
+from backend.dependencies import get_pipeline
+from backend.schemas.collection import CollectionListView, CollectionView
 from pipeline.rag_pipeline import RAGPipeline
 from utils.logger import get_logger
 
@@ -12,10 +12,10 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/v1", tags=["collections"])
 
 
-@router.get("/collections", response_model=CollectionListResponse)
+@router.get("/collections", response_model=CollectionListView)
 async def list_collections(
     pipeline: RAGPipeline = Depends(get_pipeline),
-) -> CollectionListResponse:
+) -> CollectionListView:
     """Return collections that exist in Qdrant, enriched with registry descriptions."""
     try:
         raw = await pipeline.list_collections()
@@ -28,6 +28,6 @@ async def list_collections(
             detail=f"Failed to list collections: {type(exc).__name__}",
         )
 
-    return CollectionListResponse(
-        collections=[CollectionInfo(**item) for item in raw]
+    return CollectionListView(
+        collections=[CollectionView(**item) for item in raw]
     )

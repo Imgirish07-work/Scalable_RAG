@@ -1,4 +1,9 @@
-"""POST /v1/ingest — synchronous multipart file upload."""
+"""POST /v1/ingest — synchronous multipart file upload.
+
+Filename is `documents.py` because in Phase 2 this resource becomes
+POST /v1/documents (REST: POSTing to a resource creates an instance).
+The route path stays `/v1/ingest` until Phase 2 lands.
+"""
 
 import uuid
 from pathlib import Path
@@ -14,16 +19,16 @@ from fastapi import (
     status,
 )
 
-from backend.config import backend_settings
-from backend.deps import get_pipeline
-from backend.models.ingest import ApiIngestResponse
-from backend.observability.metrics import ingest_chunks_total, ingest_total
+from backend.dependencies import get_pipeline
+from backend.metrics import ingest_chunks_total, ingest_total
+from backend.schemas.document import DocumentCreatedView
+from backend.settings import backend_settings
 from pipeline.rag_pipeline import RAGPipeline
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-router = APIRouter(prefix="/v1", tags=["ingest"])
+router = APIRouter(prefix="/v1", tags=["documents"])
 
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 
@@ -31,13 +36,17 @@ _UPLOAD_CHUNK_BYTES = 1024 * 1024
 DEV_USER_ID = "dev-user"
 
 
-@router.post("/ingest", response_model=ApiIngestResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/ingest",
+    response_model=DocumentCreatedView,
+    status_code=status.HTTP_201_CREATED,
+)
 async def ingest(
     request: Request,
     file: UploadFile = File(..., description="PDF, DOCX, TXT, MD, or HTML"),
     collection: str = Form(..., description="Target Qdrant collection"),
     pipeline: RAGPipeline = Depends(get_pipeline),
-) -> ApiIngestResponse:
+) -> DocumentCreatedView:
     """Stream the upload to a temp file, run pipeline.ingest, then delete the temp."""
     request_id = getattr(request.state, "request_id", None)
     max_bytes = backend_settings.max_upload_size_mb * 1024 * 1024
@@ -96,7 +105,7 @@ async def ingest(
             logger.warning("Failed to clean up temp file: %s", temp_path)
 
     _record_metric("ok", chunks=result.chunks_stored)
-    return ApiIngestResponse(doc_id=doc_id, result=result)
+    return DocumentCreatedView(doc_id=doc_id, result=result)
 
 
 def _record_metric(outcome: str, chunks: int = 0) -> None:

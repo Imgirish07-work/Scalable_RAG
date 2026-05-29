@@ -31,7 +31,7 @@ class BackendSettings(BaseSettings):
 
     @property
     def collections_dict(self) -> dict[str, str]:
-        """Parse `collections_registry` into a name→description dict."""
+        """Parse `collections_registry` into a name->description dict."""
         result: dict[str, str] = {}
         for pair in self.collections_registry.split("|"):
             name, sep, desc = pair.partition(":")
