@@ -34,8 +34,10 @@ _BOOKKEEPING_TABLE = "_schema_migrations"
 
 
 def _split_statements(sql: str) -> list[str]:
-    """Split SQL on top-level `;` boundaries."""
-    return [stmt.strip() for stmt in sql.split(";") if stmt.strip()]
+    """Split SQL on `;` boundaries, ignoring `--` line comments."""
+    stripped_lines = [line.split("--", 1)[0] for line in sql.splitlines()]
+    cleaned = "\n".join(stripped_lines)
+    return [stmt.strip() for stmt in cleaned.split(";") if stmt.strip()]
 
 
 async def _ensure_bookkeeping_table(conn: AsyncConnection) -> None:
