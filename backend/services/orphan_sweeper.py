@@ -53,19 +53,30 @@ class OrphanSweeper:
             self._interval, self._orphan_age, self._dlq_age,
         )
         try:
+            # Wait one interval before the first tick so boot-time pipeline
+            # init (Qdrant Cloud probe, LLM warm, model load) finishes before
+            # we contend for DB connections. Sweeper is not latency-sensitive.
+            if await self._sleep_or_stop():
+                return
             while not self._stop_event.is_set():
                 try:
                     await self._sweep_once()
                 except Exception:
                     logger.exception("Sweeper tick failed; continuing")
-                try:
-                    await asyncio.wait_for(
-                        self._stop_event.wait(), timeout=self._interval,
-                    )
-                except asyncio.TimeoutError:
-                    pass
+                if await self._sleep_or_stop():
+                    return
         finally:
             logger.info("Orphan sweeper stopped")
+
+    async def _sleep_or_stop(self) -> bool:
+        """Wait `interval_seconds` or until stop is requested. Returns True if stopped."""
+        try:
+            await asyncio.wait_for(
+                self._stop_event.wait(), timeout=self._interval,
+            )
+        except asyncio.TimeoutError:
+            return False
+        return True
 
     def request_stop(self) -> None:
         self._stop_event.set()
