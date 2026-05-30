@@ -1064,13 +1064,26 @@ class QdrantStore(BaseVectorStore):
         user's own corpus). When provided, results are narrowed to that group.
 
         Args:
-            user_id: User ID to filter by. None means no per-user scoping.
+            user_id: User ID to filter by. None means no per-user scoping
+                (reserved for admin operations like the post-ingest HNSW warmup).
+                Empty string is rejected — it almost always indicates a caller
+                that forgot to propagate identity, which would silently leak
+                across tenants.
             collection: Logical collection name to filter by. None means search
                 across all of the user's logical collections.
 
         Returns:
             Qdrant Filter object, or None when neither argument is provided.
+
+        Raises:
+            ValueError: If `user_id` is an empty string.
         """
+        if user_id is not None and not user_id:
+            raise ValueError(
+                "user_id was passed as empty string; pass None for explicit admin "
+                "queries or a real user_id for tenant-scoped queries"
+            )
+
         conditions: list[FieldCondition] = []
 
         if user_id:

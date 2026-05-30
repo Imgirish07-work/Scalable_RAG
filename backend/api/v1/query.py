@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from backend.dependencies import get_pipeline
+from backend.dependencies import get_current_user_id, get_pipeline
 from backend.metrics import queries_total
 from backend.schemas.query import QueryRequest
 from pipeline.exceptions.pipeline_exceptions import PipelineValidationError
@@ -15,14 +15,12 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["query"])
 
-# Hardcoded while auth is removed. Replaced by real identity in Phase 8.
-DEV_USER_ID = "dev-user"
-
 
 @router.post("/query", response_model=RAGResponse)
 async def query(
     body: QueryRequest,
     request: Request,
+    user_id: str = Depends(get_current_user_id),
     pipeline: RAGPipeline = Depends(get_pipeline),
 ) -> RAGResponse:
     """Execute a RAG query and return the answer with optional source chunks."""
@@ -39,7 +37,7 @@ async def query(
             include_sources=body.include_sources,
             domain=body.domain,
             request_id=request_id,
-            user_id=DEV_USER_ID,
+            user_id=user_id,
         )
         response = await pipeline.query(pipeline_query)
     except PipelineValidationError as exc:
