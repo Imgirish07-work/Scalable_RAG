@@ -22,6 +22,7 @@ from backend.api.v1 import (
 from backend.middleware import RequestIDMiddleware
 from backend.repositories.database import dispose_engine
 from backend.settings import backend_settings
+from backend.storage.object_store import get_object_store
 from cache.cache_manager import CacheManager
 from config.settings import settings
 from llm.llm_factory import LLMFactory
@@ -43,6 +44,11 @@ async def _initialize_pipeline(app: FastAPI) -> None:
     """
     start = time.perf_counter()
     try:
+        # Object store first — cheap, but downstream document upload paths depend
+        # on the bucket existing with CORS applied, so we fail fast if MinIO is
+        # mis-configured rather than discovering it on the first upload.
+        await get_object_store().ensure_bucket()
+
         llm = LLMFactory.create_from_settings()
         logger.info("LLM ready | %s/%s", llm.provider_name, llm.model_name)
 
