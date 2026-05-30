@@ -5,8 +5,6 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from pipeline.models.pipeline_request import IngestionResult
-
 
 class UploadSessionRequest(BaseModel):
     """Client metadata for `POST /v1/documents` — returns a presigned PUT URL."""
@@ -64,11 +62,3 @@ class DocumentListView(BaseModel):
 
     documents: list[DocumentDetailView]
     count: int
-
-
-# Retained for the legacy `POST /v1/ingest` endpoint until step 3 removes it.
-class DocumentCreatedView(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    doc_id: str
-    result: IngestionResult

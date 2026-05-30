@@ -62,6 +62,12 @@ class StorageSettings(BaseSettings):
     presigned_url_ttl_seconds: int = Field(default=900)
     orphan_sweep_after_seconds: int = Field(default=900)
 
+    # How often the background sweeper runs.
+    sweeper_interval_seconds: int = Field(default=300)
+
+    # How long a status='failed' DLQ row is retained before being reaped.
+    failed_dlq_ttl_seconds: int = Field(default=7 * 24 * 60 * 60)
+
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",

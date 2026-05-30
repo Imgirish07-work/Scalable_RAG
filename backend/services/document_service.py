@@ -71,6 +71,14 @@ _RETRY_MAX_DELAY_S = 8.0
 _RETRY_JITTER_RATIO = 0.25
 
 
+class DataLevelIngestionError(Exception):
+    """Raised when the input itself is bad (MIME mismatch, corrupt file).
+
+    Differentiates user-content failures (no retry helps — bytes are deleted)
+    from infrastructure failures (preserved in DLQ for retry).
+    """
+
+
 class DocumentService:
     """Coordinates upload sessions, ingestion, listing, and deletion."""
 
@@ -188,6 +196,50 @@ class DocumentService:
         # Best-effort cleanup — outcome does not affect the API response.
         await self._cascade_delete(doc_id, document.s3_key)
 
+    async def retry(
+        self, doc_id: str, user_id: str, request_id: Optional[str] = None,
+    ) -> FinalizeAck:
+        """Re-ingest a DLQ row using its preserved MinIO blob — no re-upload."""
+        document = await self._fetch_owned(doc_id, user_id)
+        if document.status != "failed":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Cannot retry a document in status '{document.status}'",
+            )
+        asyncio.create_task(
+            self._ingest_background(doc_id, user_id, request_id),
+            name=f"retry-{doc_id}",
+        )
+        logger.info("Retry kicked off | doc_id=%s | user_id=%s", doc_id, user_id)
+        return FinalizeAck(doc_id=doc_id, status="processing")
+
+    async def subscribe_to_events(
+        self, doc_id: str, user_id: str,
+    ):
+        """Async generator of ingestion events for SSE clients.
+
+        Yields a snapshot first so late subscribers see current state without
+        hanging. If the doc is already terminal, the snapshot is the only
+        event and the generator ends.
+        """
+        document = await self._fetch_owned(doc_id, user_id)
+        snapshot = {
+            "doc_id": doc_id,
+            "phase": self._phase_from_status(document.status),
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "status": document.status,
+            "chunks_count": document.chunks_count,
+            "error_message": document.error_message,
+            "snapshot": True,
+        }
+        yield snapshot
+
+        if document.status in ("ready", "failed"):
+            return
+
+        async for event in self._bus.subscribe(doc_id):
+            yield event
+
     async def _ingest_background(
         self, doc_id: str, user_id: str, request_id: Optional[str],
     ) -> None:
@@ -273,8 +325,21 @@ class DocumentService:
 
         except Exception as exc:
             logger.exception("Ingestion failed | doc_id=%s", doc_id)
-            await self._rollback(doc_id, reason=str(exc))
-            await publish("failed", reason=type(exc).__name__, message=str(exc))
+            try:
+                if isinstance(exc, DataLevelIngestionError):
+                    # Bad input — preserving the blob serves no purpose. Hard-delete.
+                    await self._rollback(doc_id, reason=str(exc))
+                else:
+                    # Infrastructure failure — preserve in DLQ for retry.
+                    await self._mark_failed_in_dlq(doc_id, exc)
+            except Exception:
+                # Even cleanup failed (e.g. DB down). Row stays in 'processing';
+                # a future stuck-processing sweep can recover it.
+                logger.exception("Failure handler itself failed | doc_id=%s", doc_id)
+            try:
+                await publish("failed", reason=type(exc).__name__, message=str(exc))
+            except Exception:
+                logger.exception("Failed event publish failed | doc_id=%s", doc_id)
 
         finally:
             self._unlink_quietly(temp_path)
@@ -358,7 +423,7 @@ class DocumentService:
     def _verify_mime_from_disk(self, path: Path, expected: str) -> None:
         sniffed = magic.from_file(str(path), mime=True)
         if sniffed != expected:
-            raise RuntimeError(
+            raise DataLevelIngestionError(
                 f"MIME mismatch — declared='{expected}' sniffed='{sniffed}'"
             )
 
@@ -378,7 +443,7 @@ class DocumentService:
         )
 
     async def _rollback(self, doc_id: str, reason: str) -> None:
-        """Terminal failure path — clear MinIO + Qdrant + DB."""
+        """Terminal failure path for data-level errors — clear all state."""
         async with self._with_repo() as repo:
             document = await repo.find_by_id(doc_id)
         if document is None:
@@ -387,6 +452,35 @@ class DocumentService:
         async with self._with_repo() as repo:
             await repo.hard_delete(doc_id)
         logger.info("Rollback complete | doc_id=%s | reason=%s", doc_id, reason)
+
+    async def _mark_failed_in_dlq(self, doc_id: str, exc: Exception) -> None:
+        """Infrastructure-failure path — preserve row + MinIO blob for retry.
+
+        Best-effort Qdrant cleanup runs regardless so partial chunks from the
+        failed attempt do not leak into queries before a retry overwrites them.
+        """
+        try:
+            await self._delete_qdrant_chunks(doc_id)
+        except Exception:
+            logger.exception("Qdrant cleanup failed during DLQ mark | doc_id=%s", doc_id)
+        error_message = f"{type(exc).__name__}: {exc}"[:500]
+        try:
+            async with self._with_repo() as repo:
+                await repo.mark_failed(doc_id, error_message=error_message)
+        except Exception:
+            logger.exception("Failed to mark DLQ status | doc_id=%s", doc_id)
+
+    @staticmethod
+    def _phase_from_status(status_value: str) -> str:
+        """Synthesize an SSE phase name from a stored status (snapshot path)."""
+        if status_value == "ready":
+            return "ready"
+        if status_value == "failed":
+            return "failed"
+        if status_value == "processing":
+            return "processing"
+        return "pending"
+
 
     async def _cascade_delete(self, doc_id: str, s3_key: str) -> None:
         """Best-effort Qdrant + MinIO cleanup; failures are logged, not raised."""

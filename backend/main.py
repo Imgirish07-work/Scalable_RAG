@@ -21,7 +21,8 @@ from backend.api.v1 import (
 )
 from backend.middleware import RequestIDMiddleware
 from backend.repositories.database import dispose_engine
-from backend.settings import backend_settings
+from backend.services.orphan_sweeper import OrphanSweeper
+from backend.settings import backend_settings, storage_settings
 from backend.storage.object_store import get_object_store
 from cache.cache_manager import CacheManager
 from config.settings import settings
@@ -106,18 +107,29 @@ async def lifespan(app: FastAPI):
         _initialize_pipeline(app), name="pipeline-init",
     )
 
+    sweeper = OrphanSweeper(
+        get_pipeline=lambda: getattr(app.state, "pipeline", None),
+        interval_seconds=storage_settings.sweeper_interval_seconds,
+        orphan_max_age_seconds=storage_settings.orphan_sweep_after_seconds,
+        dlq_max_age_seconds=storage_settings.failed_dlq_ttl_seconds,
+    )
+    sweeper_task = asyncio.create_task(sweeper.run(), name="orphan-sweeper")
+
     yield
 
     logger.info("Backend shutting down")
     app.state.ready = False
 
+    sweeper.request_stop()
+
     # Cancel any in-flight init before tearing down dependencies it might own.
     if not init_task.done():
         init_task.cancel()
-    try:
-        await init_task
-    except (asyncio.CancelledError, Exception):
-        pass
+    for task in (init_task, sweeper_task):
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     pipeline = getattr(app.state, "pipeline", None)
     if pipeline is not None:

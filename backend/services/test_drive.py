@@ -8,6 +8,7 @@ Usage (backend must be running and healthy):
 """
 
 import asyncio
+import json
 import sys
 import time
 
@@ -55,6 +56,23 @@ async def _upload_directly_to_minio(s3_key: str) -> None:
         )
 
 
+async def _read_one_sse_event(client: httpx.AsyncClient, doc_id: str) -> dict:
+    """Open the SSE stream and return the first non-keepalive event payload."""
+    async with client.stream("GET", f"/v1/documents/{doc_id}/events") as resp:
+        if resp.status_code != 200:
+            raise RuntimeError(f"SSE open failed | status={resp.status_code}")
+        data_lines: list[str] = []
+        async for line in resp.aiter_lines():
+            if line.startswith(":"):
+                continue  # keepalive comment
+            if line.startswith("data:"):
+                data_lines.append(line[len("data:"):].lstrip())
+                continue
+            if line == "" and data_lines:
+                payload = "\n".join(data_lines)
+                return json.loads(payload)
+
+
 async def _poll_until_terminal(client: httpx.AsyncClient, doc_id: str) -> dict:
     deadline = time.monotonic() + _POLL_TIMEOUT_S
     last_status = None
@@ -74,7 +92,7 @@ async def _poll_until_terminal(client: httpx.AsyncClient, doc_id: str) -> dict:
 
 async def _run() -> int:
     async with httpx.AsyncClient(base_url=_BACKEND_URL, timeout=120.0) as client:
-        logger.info("Step 1/7 | POST /v1/documents — create upload session")
+        logger.info("Step 1/8 | POST /v1/documents — create upload session")
         create_resp = await client.post(
             "/v1/documents",
             json={
@@ -95,10 +113,10 @@ async def _run() -> int:
         s3_key = session["s3_key"]
         logger.info("Session created | doc_id=%s | key=%s", doc_id, s3_key)
 
-        logger.info("Step 2/7 | PUT bytes to MinIO directly (simulates browser)")
+        logger.info("Step 2/8 | PUT bytes to MinIO directly (simulates browser)")
         await _upload_directly_to_minio(s3_key)
 
-        logger.info("Step 3/7 | POST /v1/documents/{id}/finalize")
+        logger.info("Step 3/8 | POST /v1/documents/{id}/finalize")
         fin_resp = await client.post(f"/v1/documents/{doc_id}/finalize")
         if fin_resp.status_code != 202:
             logger.error(
@@ -108,7 +126,7 @@ async def _run() -> int:
             return 1
         logger.info("Finalize acknowledged | ack=%s", fin_resp.json())
 
-        logger.info("Step 4/7 | Poll GET /v1/documents/{id} until ready")
+        logger.info("Step 4/8 | Poll GET /v1/documents/{id} until ready")
         final = await _poll_until_terminal(client, doc_id)
         if final["status"] != "ready":
             logger.error("Doc reached non-ready terminal | final=%s", final)
@@ -117,7 +135,15 @@ async def _run() -> int:
             "Document ready | doc_id=%s | chunks=%d", doc_id, final["chunks_count"],
         )
 
-        logger.info("Step 5/7 | GET /v1/documents — verify in list")
+        logger.info("Step 5/8 | GET /v1/documents/{id}/events — late-subscriber snapshot")
+        snapshot = await _read_one_sse_event(client, doc_id)
+        if snapshot.get("phase") != "ready" or not snapshot.get("snapshot"):
+            logger.error("SSE snapshot wrong | got=%s", snapshot)
+            return 1
+        logger.info("SSE snapshot ok | phase=%s | chunks=%s",
+                    snapshot.get("phase"), snapshot.get("chunks_count"))
+
+        logger.info("Step 6/8 | GET /v1/documents — verify in list")
         list_resp = await client.get(
             "/v1/documents", params={"collection": _TEST_COLLECTION},
         )
@@ -130,7 +156,7 @@ async def _run() -> int:
             return 1
         logger.info("Doc present in list | count=%d", len(ids))
 
-        logger.info("Step 6/7 | GET /v1/collections — verify collection appears")
+        logger.info("Step 7/8 | GET /v1/collections — verify collection appears")
         coll_resp = await client.get("/v1/collections")
         if coll_resp.status_code != 200:
             logger.error("Collections failed | status=%d", coll_resp.status_code)
@@ -143,7 +169,7 @@ async def _run() -> int:
             return 1
         logger.info("Collection visible | name=%s", _TEST_COLLECTION)
 
-        logger.info("Step 7/7 | DELETE /v1/documents/{id} + verify 404")
+        logger.info("Step 8/8 | DELETE /v1/documents/{id} + verify 404")
         del_resp = await client.delete(f"/v1/documents/{doc_id}")
         if del_resp.status_code not in (200, 204):
             logger.error(

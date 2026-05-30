@@ -7,7 +7,7 @@ The session is injected per request (via `get_db_session`), so one instance of
 this class lives for exactly one HTTP request and shares its transaction.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import Depends
@@ -65,12 +65,19 @@ class DocumentRepository:
         chunks_count: Optional[int] = None,
         error_message: Optional[str] = None,
     ) -> None:
-        """Atomic status transition; updates `updated_at` in the same statement."""
+        """Atomic status transition; updates `updated_at` in the same statement.
+
+        Successful transitions (status='ready') auto-clear any stale
+        `error_message` from a prior failure, so retried-and-now-ready rows
+        don't display the old failure reason.
+        """
         values: dict = {"status": status, "updated_at": datetime.now(timezone.utc)}
         if chunks_count is not None:
             values["chunks_count"] = chunks_count
         if error_message is not None:
             values["error_message"] = error_message
+        elif status == "ready":
+            values["error_message"] = None
         stmt = update(Document).where(Document.id == doc_id).values(**values)
         await self._session.execute(stmt)
         logger.info(
@@ -132,6 +139,40 @@ class DocumentRepository:
             stmt = stmt.where(Document.status == status)
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
+
+    async def list_stale_by_status(
+        self, status: str, older_than_seconds: int, limit: int = 500,
+    ) -> list[tuple[str, str]]:
+        """Sweeper-only: rows of `status` older than the cutoff, all tenants.
+
+        Uses `updated_at` (not `created_at`) so DLQ TTL is measured from the
+        moment of the failure, not from the original upload-session creation.
+        For pending rows, `updated_at == created_at` since they never
+        transition, so the orphan TTL stays correct.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)
+        stmt = (
+            select(Document.id, Document.s3_key)
+            .where(Document.status == status)
+            .where(Document.updated_at < cutoff)
+            .order_by(Document.updated_at.asc())
+            .limit(limit)
+        )
+        result = await self._session.execute(stmt)
+        return [(row[0], row[1]) for row in result.all()]
+
+    async def mark_failed(
+        self, doc_id: str, error_message: str,
+    ) -> None:
+        """Set `status='failed'` + `error_message` for DLQ inspection/retry."""
+        now = datetime.now(timezone.utc)
+        stmt = (
+            update(Document)
+            .where(Document.id == doc_id)
+            .values(status="failed", error_message=error_message, updated_at=now)
+        )
+        await self._session.execute(stmt)
+        logger.info("Document marked failed (DLQ) | doc_id=%s", doc_id)
 
     async def list_collections_for_user(
         self, user_id: str,
