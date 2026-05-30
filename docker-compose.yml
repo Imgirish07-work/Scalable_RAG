@@ -1,11 +1,13 @@
 # Scalable RAG — local dev stack (Phase 1).
 #
 # Services:
-#   qdrant    — Vector DB
 #   postgres  — Documents metadata (also visible in pgAdmin on localhost:5432)
 #   redis     — Cache
 #   minio     — S3-compatible object store for document blobs (console on :9001)
 #   backend   — FastAPI app
+#
+# Qdrant runs in the cloud (set QDRANT_URL + QDRANT_API_KEY in .env).
+# No local qdrant container — saves RAM for ONNX/CUDA workloads.
 #
 # Both docker and bare-metal modes use the same Postgres container.
 #   docker mode  → backend container talks to compose service `postgres:5432`
@@ -18,23 +20,6 @@
 #   3. docker compose exec backend alembic -c backend/migrations/alembic.ini upgrade head
 
 services:
-  qdrant:
-    image: qdrant/qdrant:v1.12.4
-    profiles: ["dev", "full"]
-    ports:
-      - "6333:6333"
-      - "6334:6334"
-    volumes:
-      - qdrant_data:/qdrant/storage
-    environment:
-      QDRANT__LOG_LEVEL: INFO
-    healthcheck:
-      test: ["CMD-SHELL", "exit 0"]
-      interval: 5s
-      timeout: 2s
-      retries: 5
-    restart: unless-stopped
-
   postgres:
     image: postgres:16-alpine
     profiles: ["dev", "full"]
@@ -96,8 +81,10 @@ services:
       - "8000:8000"
     env_file: .env
     environment:
-      QDRANT_URL: "http://qdrant:6333"
-      QDRANT_PREFER_GRPC: "false"
+      # Qdrant Cloud — credentials come from .env; startup fails fast if missing.
+      QDRANT_URL: "${QDRANT_URL:?Set QDRANT_URL in .env to your Qdrant Cloud URL}"
+      QDRANT_API_KEY: "${QDRANT_API_KEY:?Set QDRANT_API_KEY in .env}"
+      QDRANT_PREFER_GRPC: "${QDRANT_PREFER_GRPC:-true}"
       REDIS_URL: "redis://redis:6379/0"
       # In container, backend uses the compose service hostname.
       BACKEND_DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}"
@@ -126,8 +113,6 @@ services:
       - ./models:/app/models:ro
       - backend_data:/app/data
     depends_on:
-      qdrant:
-        condition: service_started
       postgres:
         condition: service_healthy
       redis:
@@ -144,7 +129,6 @@ services:
     restart: unless-stopped
 
 volumes:
-  qdrant_data:
   postgres_data:
   backend_data:
   minio_data:
