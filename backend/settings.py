@@ -49,6 +49,7 @@ class StorageSettings(BaseSettings):
     """
 
     s3_endpoint: str = Field(default="http://minio:9000")
+    s3_public_endpoint: str = Field(default="")
     s3_bucket: str = Field(default="scalable-rag-documents")
     s3_region: str = Field(default="us-east-1")
     s3_use_ssl: bool = Field(default=False)
@@ -71,6 +72,11 @@ class StorageSettings(BaseSettings):
     @property
     def s3_cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.s3_cors_origins.split(",") if o.strip()]
+
+    @property
+    def effective_public_endpoint(self) -> str:
+        """Endpoint to embed in presigned URLs; falls back to internal endpoint."""
+        return self.s3_public_endpoint or self.s3_endpoint
 
 
 @lru_cache

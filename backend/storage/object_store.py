@@ -46,10 +46,27 @@ class ObjectStore:
 
     @asynccontextmanager
     async def _client(self) -> AsyncIterator:
-        """Yield a configured aioboto3 S3 client for a single operation."""
+        """Yield a configured aioboto3 S3 client for internal (backend-side) ops."""
         async with self._session.client(
             "s3",
             endpoint_url=self._settings.s3_endpoint,
+            region_name=self._settings.s3_region,
+            use_ssl=self._settings.s3_use_ssl,
+        ) as s3:
+            yield s3
+
+    @asynccontextmanager
+    async def _signing_client(self) -> AsyncIterator:
+        """Client configured with the public endpoint, used only for presigned URLs.
+
+        Keeps internal ops pointed at the docker-network address while URLs
+        handed to the browser carry the host-reachable address. The signature
+        is computed against the configured endpoint, so it stays valid when
+        the browser PUTs to it.
+        """
+        async with self._session.client(
+            "s3",
+            endpoint_url=self._settings.effective_public_endpoint,
             region_name=self._settings.s3_region,
             use_ssl=self._settings.s3_use_ssl,
         ) as s3:
@@ -110,7 +127,7 @@ class ObjectStore:
         re-validate after the fact.
         """
         ttl = ttl_seconds or self._settings.presigned_url_ttl_seconds
-        async with self._client() as s3:
+        async with self._signing_client() as s3:
             url = await s3.generate_presigned_url(
                 "put_object",
                 Params={

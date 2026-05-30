@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import Depends
-from sqlalchemy import select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.document import Document
@@ -89,6 +89,67 @@ class DocumentRepository:
         )
         await self._session.execute(stmt)
         logger.info("Document soft-deleted | doc_id=%s", doc_id)
+
+    async def hard_delete(self, doc_id: str) -> None:
+        """Permanently remove the row. Used on terminal ingestion failure
+        and on the rollback path of a duplicate-detected upload."""
+        stmt = delete(Document).where(Document.id == doc_id)
+        await self._session.execute(stmt)
+        logger.info("Document hard-deleted | doc_id=%s", doc_id)
+
+    async def set_content_hash(self, doc_id: str, content_hash: str) -> None:
+        """Persist the SHA-256 computed during finalize's stream-download."""
+        stmt = (
+            update(Document)
+            .where(Document.id == doc_id)
+            .values(
+                content_hash=content_hash,
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        await self._session.execute(stmt)
+
+    async def list_by_user(
+        self,
+        user_id: str,
+        collection: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[Document]:
+        """Tenant-scoped list with optional filters, newest first."""
+        stmt = (
+            select(Document)
+            .where(Document.user_id == user_id)
+            .where(Document.deleted_at.is_(None))
+            .order_by(Document.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        if collection is not None:
+            stmt = stmt.where(Document.collection == collection)
+        if status is not None:
+            stmt = stmt.where(Document.status == status)
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def list_collections_for_user(
+        self, user_id: str,
+    ) -> list[tuple[str, int, datetime]]:
+        """Distinct logical collections for a user with doc counts + last update."""
+        stmt = (
+            select(
+                Document.collection,
+                func.count().label("doc_count"),
+                func.max(Document.updated_at).label("last_updated"),
+            )
+            .where(Document.user_id == user_id)
+            .where(Document.deleted_at.is_(None))
+            .group_by(Document.collection)
+            .order_by(func.max(Document.updated_at).desc())
+        )
+        result = await self._session.execute(stmt)
+        return [(row[0], row[1], row[2]) for row in result.all()]
 
 
 def get_document_repository(

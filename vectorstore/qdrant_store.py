@@ -403,6 +403,7 @@ class QdrantStore(BaseVectorStore):
         "metadata.chunk_id",
         "metadata.user_id",
         "metadata.collection",
+        "metadata.doc_id",
     )
 
     def _ensure_payload_indexes(self) -> None:
@@ -1303,6 +1304,36 @@ class QdrantStore(BaseVectorStore):
             raise
 
     # Admin operations
+
+    async def delete_by_doc_id(self, doc_id: str) -> None:
+        """Delete every point whose payload.metadata.doc_id matches.
+
+        Used on user-initiated soft-delete and on terminal ingestion failure.
+        Idempotent — Qdrant succeeds with zero matches.
+        """
+        match_filter = Filter(
+            must=[FieldCondition(
+                key="metadata.doc_id",
+                match=MatchValue(value=doc_id),
+            )]
+        )
+        try:
+            await asyncio.to_thread(
+                self._client.delete,
+                collection_name=self.collection_name,
+                points_selector=match_filter,
+                wait=True,
+            )
+            logger.info(
+                "Qdrant points deleted | collection=%s | doc_id=%s",
+                self.collection_name, doc_id,
+            )
+        except Exception:
+            logger.exception(
+                "delete_by_doc_id failed | collection=%s | doc_id=%s",
+                self.collection_name, doc_id,
+            )
+            raise
 
     async def delete_collection(self) -> None:
         """Permanently delete the entire Qdrant collection.

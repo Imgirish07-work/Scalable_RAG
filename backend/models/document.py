@@ -23,7 +23,8 @@ class Document(Base):
 
     id:             Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True)
     user_id:        Mapped[str] = mapped_column(Text, nullable=False)
-    content_hash:   Mapped[str] = mapped_column(String(64), nullable=False)
+    # NULL while the row is 'pending' — computed during finalize's stream-download.
+    content_hash:   Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     file_name:      Mapped[str] = mapped_column(Text, nullable=False)
     mime_type:      Mapped[str] = mapped_column(Text, nullable=False)
     size_bytes:     Mapped[int] = mapped_column(BigInteger, nullable=False)

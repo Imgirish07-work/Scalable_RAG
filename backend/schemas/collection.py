@@ -1,20 +1,22 @@
-"""Response DTOs for the collections resource."""
+"""Response DTOs for the collections resource (derived from the documents table)."""
+
+from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
 class CollectionView(BaseModel):
-    """Single collection entry as returned to the client."""
+    """One logical collection (folder) the user has documents in."""
 
     model_config = ConfigDict(frozen=True)
 
     name: str
-    description: str = ""
-    document_count: int = Field(default=0, ge=0)
+    document_count: int = Field(ge=0)
+    last_updated: datetime
 
 
 class CollectionListView(BaseModel):
-    """Envelope around a list of collections."""
+    """Envelope for `GET /v1/collections`."""
 
     model_config = ConfigDict(frozen=True)
 

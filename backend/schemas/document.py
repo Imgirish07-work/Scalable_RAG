@@ -1,13 +1,73 @@
-"""Request and response DTOs for the documents/ingest resource."""
+"""Request and response DTOs for the documents resource."""
 
-from pydantic import BaseModel, ConfigDict
+from datetime import datetime
+from typing import Optional
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from pipeline.models.pipeline_request import IngestionResult
 
 
-class DocumentCreatedView(BaseModel):
-    """Response returned when a document has been ingested successfully."""
+class UploadSessionRequest(BaseModel):
+    """Client metadata for `POST /v1/documents` — returns a presigned PUT URL."""
 
+    file_name: str = Field(min_length=1, max_length=255)
+    mime_type: str = Field(min_length=1, max_length=255)
+    size_bytes: int = Field(gt=0)
+    collection: str = Field(default="default", max_length=64)
+
+
+class UploadSessionView(BaseModel):
+    """Presigned URL the client must PUT the file against."""
+
+    model_config = ConfigDict(frozen=True)
+
+    doc_id: str
+    s3_key: str
+    presigned_url: str
+    expires_at: datetime
+
+
+class FinalizeAck(BaseModel):
+    """202 response from `POST /v1/documents/{id}/finalize`."""
+
+    model_config = ConfigDict(frozen=True)
+
+    doc_id: str
+    status: str
+    duplicate_of: Optional[str] = None
+
+
+class DocumentDetailView(BaseModel):
+    """Single document as returned by list/get."""
+
+    model_config = ConfigDict(frozen=True)
+
+    doc_id: str
+    user_id: str
+    file_name: str
+    mime_type: str
+    size_bytes: int
+    collection: str
+    status: str
+    chunks_count: Optional[int] = None
+    error_message: Optional[str] = None
+    content_hash: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class DocumentListView(BaseModel):
+    """List envelope for `GET /v1/documents`."""
+
+    model_config = ConfigDict(frozen=True)
+
+    documents: list[DocumentDetailView]
+    count: int
+
+
+# Retained for the legacy `POST /v1/ingest` endpoint until step 3 removes it.
+class DocumentCreatedView(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     doc_id: str

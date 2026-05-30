@@ -103,6 +103,8 @@ services:
       BACKEND_DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}"
       # Object store — boto3 auto-discovers credentials from the standard AWS_* env names.
       S3_ENDPOINT: "http://minio:9000"
+      # Endpoint embedded in presigned URLs handed to the browser (host-reachable).
+      S3_PUBLIC_ENDPOINT: "${S3_PUBLIC_ENDPOINT:-http://localhost:9000}"
       S3_BUCKET: "${S3_BUCKET:-scalable-rag-documents}"
       S3_REGION: "${S3_REGION:-us-east-1}"
       S3_USE_SSL: "false"
