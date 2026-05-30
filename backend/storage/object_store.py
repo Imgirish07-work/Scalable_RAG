@@ -95,24 +95,38 @@ class ObjectStore:
                     else:
                         raise
 
-            await s3.put_bucket_cors(
-                Bucket=bucket,
-                CORSConfiguration={
-                    "CORSRules": [
-                        {
-                            "AllowedMethods": ["PUT", "GET", "HEAD"],
-                            "AllowedOrigins": self._settings.s3_cors_origin_list,
-                            "AllowedHeaders": ["*"],
-                            "ExposeHeaders": ["ETag"],
-                            "MaxAgeSeconds": 3600,
-                        }
-                    ]
-                },
-            )
-            logger.info(
-                "Bucket CORS applied | bucket=%s | origins=%s",
-                bucket, self._settings.s3_cors_origin_list,
-            )
+            # MinIO does not implement PutBucketCors (returns NotImplemented) —
+            # it handles CORS globally via MINIO_API_CORS_ALLOW_ORIGIN, defaulting
+            # to permissive. Real AWS S3 accepts this call normally.
+            try:
+                await s3.put_bucket_cors(
+                    Bucket=bucket,
+                    CORSConfiguration={
+                        "CORSRules": [
+                            {
+                                "AllowedMethods": ["PUT", "GET", "HEAD"],
+                                "AllowedOrigins": self._settings.s3_cors_origin_list,
+                                "AllowedHeaders": ["*"],
+                                "ExposeHeaders": ["ETag"],
+                                "MaxAgeSeconds": 3600,
+                            }
+                        ]
+                    },
+                )
+                logger.info(
+                    "Bucket CORS applied | bucket=%s | origins=%s",
+                    bucket, self._settings.s3_cors_origin_list,
+                )
+            except ClientError as cors_exc:
+                cors_code = cors_exc.response.get("Error", {}).get("Code", "")
+                if cors_code == "NotImplemented":
+                    logger.info(
+                        "Bucket CORS skipped — backend does not implement PutBucketCors "
+                        "(MinIO uses MINIO_API_CORS_ALLOW_ORIGIN globally) | bucket=%s",
+                        bucket,
+                    )
+                else:
+                    raise
 
     async def generate_presigned_put_url(
         self,
