@@ -92,9 +92,9 @@ async def _poll_until_terminal(client: httpx.AsyncClient, doc_id: str) -> dict:
 
 async def _run() -> int:
     async with httpx.AsyncClient(base_url=_BACKEND_URL, timeout=120.0) as client:
-        logger.info("Step 1/8 | POST /v1/documents — create upload session")
+        logger.info("Step 1/8 | POST /v1/ingest — start upload session")
         create_resp = await client.post(
-            "/v1/documents",
+            "/v1/ingest",
             json={
                 "file_name": _TEST_FILE_NAME,
                 "mime_type": _TEST_MIME,

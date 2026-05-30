@@ -1,7 +1,7 @@
 """HTTP endpoints for the documents resource.
 
 Architecture-A flow:
-  POST   /v1/documents                       create upload session → presigned URL
+  POST   /v1/ingest                          start ingestion → presigned URL
   POST   /v1/documents/{doc_id}/finalize     trigger background ingestion
   GET    /v1/documents/{doc_id}/events       SSE stream of ingestion progress
   POST   /v1/documents/{doc_id}/retry        re-run a failed ingestion (DLQ)
@@ -38,7 +38,7 @@ _SSE_KEEPALIVE_INTERVAL_S = 15.0
 
 
 @router.post(
-    "/documents",
+    "/ingest",
     response_model=UploadSessionView,
     status_code=status.HTTP_201_CREATED,
 )

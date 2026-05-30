@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class UploadSessionRequest(BaseModel):
-    """Client metadata for `POST /v1/documents` — returns a presigned PUT URL."""
+    """Client metadata for `POST /v1/ingest` — returns a presigned PUT URL."""
 
     file_name: str = Field(min_length=1, max_length=255)
     mime_type: str = Field(min_length=1, max_length=255)
