@@ -31,8 +31,10 @@ export const ATTACH_ACCEPT =
   ".py,.java,.js,.ts,.jsx,.tsx,.cpp,.c,.cs,.go,.rs,.php,.rb,.swift,.kt," +
   ".html,.css,.xml,.yaml,.yml,.sh";
 
-export const ATTACH_MAX_MB    = 10;
-export const ATTACH_MAX_BYTES = ATTACH_MAX_MB * 1024 * 1024;
+import { MAX_UPLOAD_SIZE_BYTES, MAX_UPLOAD_SIZE_MB } from "../config";
+
+export const ATTACH_MAX_MB    = MAX_UPLOAD_SIZE_MB;
+export const ATTACH_MAX_BYTES = MAX_UPLOAD_SIZE_BYTES;
 
 const ATTACH_ICONS = {
   csv: fileCsvIcon, xlsx: fileCsvIcon, xls: fileCsvIcon,
