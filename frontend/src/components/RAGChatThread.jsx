@@ -159,7 +159,7 @@ export function UserBubble({ msg, copiedId, onCopy, onEdit, disabled }) {
       {!editMode && (
         <div
           className="flex items-center gap-0.5 justify-end mt-1 transition-opacity duration-150"
-          style={{ opacity: hovered && !disabled ? 1 : 0, pointerEvents: hovered && !disabled ? "auto" : "none" }}
+          style={{ opacity: disabled ? 0.3 : 1, pointerEvents: disabled ? "none" : "auto" }}
         >
           <MsgActionBtn title="Copy" onClick={() => onCopy(msg.id, msg.content)}>
             <IconCopy active={copiedId === msg.id} />

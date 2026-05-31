@@ -4,25 +4,26 @@ import IconButton from "../atoms/IconButton";
 import { getAttachIcon } from "../../utils/attachIcons";
 import { C } from "../../theme";
 
-/**
- * AttachmentPill — shows a staged file with name, size, and a remove button.
- *
- * Props:
- *   file     — required; a File object (or { name, size } shape)
- *   onClear  — required; called when the user removes the attachment
- *   error    — optional; error string shown below the pill
- */
-export default memo(function AttachmentPill({ file, onClear, error }) {
+export default memo(function AttachmentPill({ file, onClear, error, onClick }) {
   if (!file) return null;
   const sizeKB = (file.size / 1024).toFixed(0);
+  const isClickable = typeof onClick === "function";
+
+  const handleClear = (e) => {
+    e?.stopPropagation?.();
+    onClear?.();
+  };
+
   return (
     <div>
       <div
+        onClick={onClick}
         className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs max-w-xs"
         style={{
           background: C.accentBg,
           border: `1px solid ${C.accentBorder}`,
           color: C.accent,
+          cursor: isClickable ? "pointer" : "default",
         }}
       >
         <Icon
@@ -34,7 +35,7 @@ export default memo(function AttachmentPill({ file, onClear, error }) {
           ({sizeKB} KB)
         </span>
         <IconButton
-          onClick={onClear}
+          onClick={handleClear}
           title="Remove attachment"
           size={16}
           style={{ color: C.danger, marginLeft: 4 }}

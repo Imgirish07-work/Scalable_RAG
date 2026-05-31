@@ -29,6 +29,7 @@ from backend.repositories.document_repository import (
 from backend.schemas.document import (
     DocumentDetailView,
     DocumentListView,
+    DownloadView,
     FinalizeAck,
     UploadSessionRequest,
     UploadSessionView,
@@ -188,6 +189,25 @@ class DocumentService:
     async def get(self, doc_id: str, user_id: str) -> DocumentDetailView:
         document = await self._fetch_owned(doc_id, user_id)
         return self._to_view(document)
+
+    async def get_download_url(self, doc_id: str, user_id: str) -> DownloadView:
+        """Return a presigned GET URL the browser can use to fetch the raw file.
+
+        Lets the in-app viewer pull bytes directly from MinIO without
+        round-tripping the backend.
+        """
+        document = await self._fetch_owned(doc_id, user_id)
+        url = await self._store.generate_presigned_get_url(document.s3_key)
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            seconds=storage_settings.presigned_url_ttl_seconds,
+        )
+        return DownloadView(
+            doc_id=doc_id,
+            file_name=document.file_name,
+            mime_type=document.mime_type,
+            presigned_url=url,
+            expires_at=expires_at,
+        )
 
     async def soft_delete(self, doc_id: str, user_id: str) -> None:
         """Soft-delete row first (user-facing ack), then cascade best-effort."""

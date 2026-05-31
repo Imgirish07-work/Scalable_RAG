@@ -1,20 +1,18 @@
 import { createContext, useContext, useLayoutEffect, useState } from "react";
-import darkSlate  from "../themes/dark-slate";
-import darkNavy   from "../themes/dark-navy";
-import lightWarm  from "../themes/light-warm";
+import claudeDark  from "../themes/claude-dark";
+import claudeLight from "../themes/claude-light";
 
 /**
  * Theme registry — add new themes here.
  * Each theme is a plain object: { id, label, vars: { "--c-*": value } }
  */
 export const THEMES = {
-  "light-warm": lightWarm,
-  "dark-slate": darkSlate,
-  "dark-navy":  darkNavy,
+  "claude-dark":  claudeDark,
+  "claude-light": claudeLight,
 };
 
-const DEFAULT_ID  = "dark-slate";
-const STORAGE_KEY = "ailab-theme";
+const DEFAULT_ID  = "claude-dark";
+const STORAGE_KEY = "scalable-rag-theme";
 
 const ThemeCtx = createContext(null);
 

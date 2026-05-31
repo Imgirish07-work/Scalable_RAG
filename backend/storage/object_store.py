@@ -156,6 +156,30 @@ class ObjectStore:
         )
         return url
 
+    async def generate_presigned_get_url(
+        self,
+        key: str,
+        ttl_seconds: int | None = None,
+    ) -> str:
+        """Sign a GET URL the browser can use to fetch the object directly.
+
+        Mirror of generate_presigned_put_url for downloads — used by the
+        in-app document viewer so the browser pulls bytes from MinIO without
+        round-tripping the backend.
+        """
+        ttl = ttl_seconds or self._settings.presigned_url_ttl_seconds
+        async with self._signing_client() as s3:
+            url = await s3.generate_presigned_url(
+                "get_object",
+                Params={
+                    "Bucket": self._settings.s3_bucket,
+                    "Key": key,
+                },
+                ExpiresIn=ttl,
+            )
+        logger.info("Presigned GET issued | key=%s | ttl=%ds", key, ttl)
+        return url
+
     async def head_object(self, key: str) -> dict:
         """Return MinIO metadata for a key (size, etag, content-type)."""
         async with self._client() as s3:

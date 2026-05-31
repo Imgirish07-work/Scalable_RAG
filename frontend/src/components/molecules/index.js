@@ -4,6 +4,7 @@
 export { default as AttachmentPill }    from "./AttachmentPill";
 export { default as ChunkCard }         from "./ChunkCard";
 export { default as ConfigRow }         from "./ConfigRow";
+export { default as DocPreviewCard }    from "./DocPreviewCard";
 export { default as EmptyState }        from "./EmptyState";
 export { default as FileCard }          from "./FileCard";
 export { default as MarkdownRenderer }  from "./MarkdownRenderer";

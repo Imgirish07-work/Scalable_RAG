@@ -21,6 +21,7 @@ from backend.dependencies import get_current_user_id
 from backend.schemas.document import (
     DocumentDetailView,
     DocumentListView,
+    DownloadView,
     FinalizeAck,
     UploadSessionRequest,
     UploadSessionView,
@@ -137,6 +138,16 @@ async def get_document(
     service: DocumentService = Depends(get_document_service),
 ) -> DocumentDetailView:
     return await service.get(doc_id=doc_id, user_id=user_id)
+
+
+@router.get("/documents/{doc_id}/download", response_model=DownloadView)
+async def get_document_download_url(
+    doc_id: str,
+    user_id: str = Depends(get_current_user_id),
+    service: DocumentService = Depends(get_document_service),
+) -> DownloadView:
+    """Return a short-lived presigned GET URL the browser can fetch from MinIO."""
+    return await service.get_download_url(doc_id=doc_id, user_id=user_id)
 
 
 @router.delete("/documents/{doc_id}", status_code=status.HTTP_204_NO_CONTENT)

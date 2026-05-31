@@ -50,3 +50,8 @@ export async function getDocument(docId) {
 export async function deleteDocument(docId) {
   await api.delete(`/v1/documents/${docId}`)
 }
+
+export async function getDocumentDownloadUrl(docId) {
+  const { data } = await api.get(`/v1/documents/${docId}/download`)
+  return data
+}

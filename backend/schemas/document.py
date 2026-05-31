@@ -26,6 +26,18 @@ class UploadSessionView(BaseModel):
     expires_at: datetime
 
 
+class DownloadView(BaseModel):
+    """Presigned URL the browser can GET to fetch the raw file for in-app viewing."""
+
+    model_config = ConfigDict(frozen=True)
+
+    doc_id: str
+    file_name: str
+    mime_type: str
+    presigned_url: str
+    expires_at: datetime
+
+
 class FinalizeAck(BaseModel):
     """202 response from `POST /v1/documents/{id}/finalize`."""
 

@@ -8,13 +8,14 @@ import { apiBaseUrl } from '../api/client.js'
 import { openDocumentEventStream } from '../api/sse.js'
 
 // Job lifecycle: queued → uploading → processing → ready|failed
-const newJob = (file, collection) => ({
+const newJob = (file, collection, conversationId) => ({
   id: crypto.randomUUID(),
   file,
   filename: file.name,
   size: file.size,
   mimeType: file.type || 'application/octet-stream',
   collection,
+  conversationId: conversationId || null,
   docId: null,
   status: 'queued',
   progress: 0,
@@ -25,8 +26,8 @@ export const useUploadStore = create((set, get) => ({
   jobs: [],
   _running: false,
 
-  addFiles(files, collection) {
-    const additions = Array.from(files).map((f) => newJob(f, collection))
+  addFiles(files, collection, conversationId = null) {
+    const additions = Array.from(files).map((f) => newJob(f, collection, conversationId))
     set((s) => ({ jobs: [...s.jobs, ...additions] }))
   },
 
