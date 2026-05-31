@@ -1322,7 +1322,9 @@ class QdrantStore(BaseVectorStore):
         """Delete every point whose payload.metadata.doc_id matches.
 
         Used on user-initiated soft-delete and on terminal ingestion failure.
-        Idempotent — Qdrant succeeds with zero matches.
+        Idempotent — succeeds with zero matches, AND silently no-ops if the
+        collection itself does not exist yet (e.g. failure during the very
+        first ingest, before any successful upsert created the collection).
         """
         match_filter = Filter(
             must=[FieldCondition(
@@ -1341,7 +1343,14 @@ class QdrantStore(BaseVectorStore):
                 "Qdrant points deleted | collection=%s | doc_id=%s",
                 self.collection_name, doc_id,
             )
-        except Exception:
+        except Exception as exc:
+            if "doesn't exist" in str(exc).lower() or "not found" in str(exc).lower():
+                logger.info(
+                    "Qdrant delete skipped — collection does not exist yet "
+                    "| collection=%s | doc_id=%s",
+                    self.collection_name, doc_id,
+                )
+                return
             logger.exception(
                 "delete_by_doc_id failed | collection=%s | doc_id=%s",
                 self.collection_name, doc_id,
