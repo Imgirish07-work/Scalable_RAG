@@ -74,7 +74,21 @@ def _resolve_providers() -> list:
     import onnxruntime as ort
 
     if "CUDAExecutionProvider" not in ort.get_available_providers():
-        logger.info("ONNX Runtime: CPUExecutionProvider (no CUDA GPU detected)")
+        logger.info("ONNX Runtime: CPUExecutionProvider (CUDAExecutionProvider not compiled in)")
+        return ["CPUExecutionProvider"]
+
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            logger.info(
+                "ONNX Runtime: CPUExecutionProvider "
+                "(no CUDA device — onnxruntime-gpu installed but no GPU passthrough)",
+            )
+            return ["CPUExecutionProvider"]
+    except Exception as exc:
+        logger.warning(
+            "CUDA availability probe failed (%s); falling back to CPU", exc,
+        )
         return ["CPUExecutionProvider"]
 
     logger.info("ONNX Runtime: CUDAExecutionProvider selected — GPU inference enabled")
