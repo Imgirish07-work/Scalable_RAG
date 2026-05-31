@@ -242,7 +242,7 @@ class ContextRanker:
                 # Fallback: embed chunk texts when pre-fetched vectors are absent.
                 # Triggered when chunks come from a non-Qdrant source or from
                 # code paths that don't carry pre-fetched vectors.
-                embeddings_model = self._embeddings_fn()
+                embeddings_model = await asyncio.to_thread(self._embeddings_fn)
                 chunk_texts = [chunk.content for chunk in chunks]
                 chunk_embeddings_raw = await asyncio.to_thread(
                     embeddings_model.embed_documents, chunk_texts

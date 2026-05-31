@@ -19,6 +19,8 @@ Dependencies:
 
 from typing import Optional
 
+import tiktoken
+
 from llm.providers.openai_provider import OpenAIProvider
 from llm.exceptions.llm_exceptions import LLMAuthError
 from config.settings import settings
@@ -85,6 +87,8 @@ class GroqProvider(OpenAIProvider):
             max_retries=0,  # disable SDK retries — GroqModelPool._dispatch handles 429 by switching models immediately
         )
 
+        self._encoder = tiktoken.get_encoding("cl100k_base")
+
         logger.info(
             "GroqProvider initialized | model=%s",
             self._model,
@@ -113,6 +117,4 @@ class GroqProvider(OpenAIProvider):
         """
         if not text:
             return 0
-        import tiktoken
-        encoder = tiktoken.get_encoding("cl100k_base")
-        return len(encoder.encode(text))
+        return len(self._encoder.encode(text))

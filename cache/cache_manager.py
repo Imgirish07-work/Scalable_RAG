@@ -222,7 +222,8 @@ class CacheManager:
             # QDRANT_URL is the RAG document corpus (cloud, ~200ms RTT) — it must
             # NOT be reused here. The semantic cache stores query→key mappings only
             # (small, ephemeral, ~KB each). In-memory is faster and correct.
-            self._semantic_strategy = SemanticCacheStrategy(
+            self._semantic_strategy = await asyncio.to_thread(
+                SemanticCacheStrategy,
                 collection_name=collection,
                 threshold_direct=threshold_direct,
                 threshold_high=threshold_high,
