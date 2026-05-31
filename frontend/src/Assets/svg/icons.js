@@ -1,0 +1,78 @@
+/**
+ * Centralized SVG icon imports for the application.
+ * Usage: import { IconClose, IconSearch, ... } from "@/Assets/svg/icons";
+ * All SVGs use currentColor so they inherit the parent text color.
+ */
+
+// ─── General UI Icons ─────────────────────────────────────────────
+export { default as IconClose } from "./close.svg";
+export { default as IconWarning } from "./warning.svg";
+export { default as IconCheck } from "./checkmark.svg";
+export { default as IconStarFilled } from "./star-filled.svg";
+export { default as IconStarOutline } from "./star-outline.svg";
+export { default as IconSparkle } from "./sparkle.svg";
+export { default as IconSearch } from "./search.svg";
+export { default as IconCopy } from "./copy.svg";
+export { default as IconSave } from "./save.svg";
+export { default as IconDownload } from "./download.svg";
+export { default as IconChevronDown } from "./chevron-down.svg";
+export { default as IconPlus } from "./plus.svg";
+export { default as IconFolder } from "./folder.svg";
+export { default as IconEye } from "./eye.svg";
+export { default as IconRobot } from "./robot.svg";
+export { default as IconChat } from "./chat.svg";
+export { default as IconPencil } from "./pencil.svg";
+export { default as IconClock } from "./clock.svg";
+export { default as IconRefresh } from "./refresh.svg";
+export { default as IconNotepad } from "./notepad.svg";
+export { default as IconCode } from "./code.svg";
+export { default as IconTarget } from "./target.svg";
+export { default as IconBolt } from "./bolt.svg";
+export { default as IconBook } from "./book.svg";
+export { default as IconPlay } from "./play.svg";
+export { default as IconStop } from "./stop.svg";
+export { default as IconAlert } from "./alert.svg";
+export { default as IconBan } from "./ban.svg";
+export { default as IconLightbulb } from "./lightbulb.svg";
+
+// ─── Domain / Category Icons ──────────────────────────────────────
+export { default as IconHealthcare } from "./hospital.svg";
+export { default as IconChart } from "./chart.svg";
+export { default as IconGlobe } from "./globe.svg";
+export { default as IconRocket } from "./rocket.svg";
+export { default as IconBriefcase } from "./briefcase.svg";
+export { default as IconArchive } from "./archive.svg";
+export { default as IconUser } from "./user.svg";
+export { default as IconMail } from "./mail.svg";
+export { default as IconDatabase } from "./database.svg";
+export { default as IconGear } from "./gear.svg";
+export { default as IconWrench } from "./wrench.svg";
+export { default as IconBrain } from "./brain.svg";
+export { default as IconBuilding } from "./building.svg";
+export { default as IconPackage } from "./package.svg";
+export { default as IconDocument } from "./document.svg";
+export { default as IconDocLines } from "./doc-lines.svg";
+export { default as IconJsonBracket } from "./json-bracket.svg";
+
+// ─── File Type Icons ──────────────────────────────────────────────
+export { default as IconFilePython } from "./file-python.svg";
+export { default as IconFileJs } from "./file-js.svg";
+export { default as IconFileReact } from "./file-react.svg";
+export { default as IconFileTs } from "./file-ts.svg";
+export { default as IconFileHtml } from "./file-html.svg";
+export { default as IconFileCss } from "./file-css.svg";
+export { default as IconFileJson } from "./file-json.svg";
+export { default as IconFileConfig } from "./file-config.svg";
+export { default as IconFileTerminal } from "./file-terminal.svg";
+export { default as IconFileSql } from "./file-sql.svg";
+export { default as IconFileMarkdown } from "./file-markdown.svg";
+export { default as IconFileText } from "./file-text.svg";
+export { default as IconFileJava } from "./file-java.svg";
+export { default as IconFileGo } from "./file-go.svg";
+export { default as IconFileRust } from "./file-rust.svg";
+export { default as IconFileRuby } from "./file-ruby.svg";
+export { default as IconFilePhp } from "./file-php.svg";
+export { default as IconFileCsharp } from "./file-csharp.svg";
+export { default as IconFileDocker } from "./file-docker.svg";
+export { default as IconFileEnv } from "./file-env.svg";
+export { default as IconFileGitignore } from "./file-gitignore.svg";
