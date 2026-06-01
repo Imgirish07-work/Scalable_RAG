@@ -1,11 +1,4 @@
-"""Data-access layer for the `documents` table.
-
-The repository is the only place that writes SQLAlchemy queries against this
-table. Controllers and services depend on it; nobody else issues SQL.
-
-The session is injected per request (via `get_db_session`), so one instance of
-this class lives for exactly one HTTP request and shares its transaction.
-"""
+"""Data-access layer for the `documents` table — sole writer of SQL on this table."""
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -65,25 +58,56 @@ class DocumentRepository:
         chunks_count: Optional[int] = None,
         error_message: Optional[str] = None,
     ) -> None:
-        """Atomic status transition; updates `updated_at` in the same statement.
-
-        Successful transitions (status='ready') auto-clear any stale
-        `error_message` from a prior failure, so retried-and-now-ready rows
-        don't display the old failure reason.
-        """
-        values: dict = {"status": status, "updated_at": datetime.now(timezone.utc)}
+        """Atomic status transition; manages `processing_started_at` lease."""
+        now = datetime.now(timezone.utc)
+        values: dict = {"status": status, "updated_at": now}
         if chunks_count is not None:
             values["chunks_count"] = chunks_count
         if error_message is not None:
             values["error_message"] = error_message
         elif status == "ready":
             values["error_message"] = None
+        if status == "processing":
+            values["processing_started_at"] = now
+        elif status in ("ready", "failed"):
+            values["processing_started_at"] = None
         stmt = update(Document).where(Document.id == doc_id).values(**values)
         await self._session.execute(stmt)
         logger.info(
             "Document status updated | doc_id=%s | status=%s | chunks_count=%s",
             doc_id, status, chunks_count if chunks_count is not None else "<unchanged>",
         )
+
+    async def mark_ready_if_processing(
+        self, doc_id: str, chunks_count: int,
+    ) -> bool:
+        """Conditional processing→ready. False if row was already moved by sweeper."""
+        now = datetime.now(timezone.utc)
+        stmt = (
+            update(Document)
+            .where(Document.id == doc_id)
+            .where(Document.status == "processing")
+            .values(
+                status="ready",
+                chunks_count=chunks_count,
+                error_message=None,
+                processing_started_at=None,
+                updated_at=now,
+            )
+        )
+        result = await self._session.execute(stmt)
+        committed = (result.rowcount or 0) > 0
+        if committed:
+            logger.info(
+                "Document marked ready | doc_id=%s | chunks=%d",
+                doc_id, chunks_count,
+            )
+        else:
+            logger.warning(
+                "Ready transition rejected (no longer 'processing') | doc_id=%s",
+                doc_id,
+            )
+        return committed
 
     async def soft_delete(self, doc_id: str) -> None:
         """Mark the document deleted without removing the row."""
@@ -143,13 +167,7 @@ class DocumentRepository:
     async def list_stale_by_status(
         self, status: str, older_than_seconds: int, limit: int = 500,
     ) -> list[tuple[str, str]]:
-        """Sweeper-only: rows of `status` older than the cutoff, all tenants.
-
-        Uses `updated_at` (not `created_at`) so DLQ TTL is measured from the
-        moment of the failure, not from the original upload-session creation.
-        For pending rows, `updated_at == created_at` since they never
-        transition, so the orphan TTL stays correct.
-        """
+        """Sweeper-only: rows of `status` older than the cutoff (by updated_at)."""
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)
         stmt = (
             select(Document.id, Document.s3_key)
@@ -169,10 +187,56 @@ class DocumentRepository:
         stmt = (
             update(Document)
             .where(Document.id == doc_id)
-            .values(status="failed", error_message=error_message, updated_at=now)
+            .values(
+                status="failed",
+                error_message=error_message,
+                processing_started_at=None,
+                updated_at=now,
+            )
         )
         await self._session.execute(stmt)
         logger.info("Document marked failed (DLQ) | doc_id=%s", doc_id)
+
+    async def list_stuck_processing(
+        self, lease_ttl_seconds: int, limit: int = 500,
+    ) -> list[str]:
+        """Sweeper-only: doc IDs stuck in 'processing' past the lease window."""
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=lease_ttl_seconds)
+        stmt = (
+            select(Document.id)
+            .where(Document.status == "processing")
+            .where(Document.processing_started_at < cutoff)
+            .order_by(Document.processing_started_at.asc())
+            .limit(limit)
+        )
+        result = await self._session.execute(stmt)
+        return [row[0] for row in result.all()]
+
+    async def mark_stuck_failed(
+        self, doc_id: str, lease_ttl_seconds: int, error_message: str,
+    ) -> bool:
+        """Atomic processing→failed for stuck rows; re-checks lease in WHERE."""
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=lease_ttl_seconds)
+        now = datetime.now(timezone.utc)
+        stmt = (
+            update(Document)
+            .where(Document.id == doc_id)
+            .where(Document.status == "processing")
+            .where(Document.processing_started_at < cutoff)
+            .values(
+                status="failed",
+                error_message=error_message,
+                processing_started_at=None,
+                updated_at=now,
+            )
+        )
+        result = await self._session.execute(stmt)
+        marked = (result.rowcount or 0) > 0
+        if marked:
+            logger.warning(
+                "Stuck-processing row moved to DLQ | doc_id=%s", doc_id,
+            )
+        return marked
 
     async def list_collections_for_user(
         self, user_id: str,

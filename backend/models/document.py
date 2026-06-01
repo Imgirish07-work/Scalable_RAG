@@ -44,6 +44,10 @@ class Document(Base):
     updated_at:     Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=text("NOW()"),
     )
+    # Worker lease — set on 'processing', cleared on terminal.
+    processing_started_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True,
+    )
     deleted_at:     Mapped[Optional[datetime]] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True,
     )

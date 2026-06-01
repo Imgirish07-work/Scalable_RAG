@@ -41,7 +41,7 @@ Dependencies:
 import asyncio
 import time
 from datetime import datetime, timezone
-from typing import List, Literal, Optional
+from typing import Awaitable, Callable, List, Literal, Optional
 
 from langchain_core.documents import Document
 from langchain_qdrant import FastEmbedSparse, QdrantVectorStore, RetrievalMode
@@ -613,7 +613,11 @@ class QdrantStore(BaseVectorStore):
 
     # Write — add documents
 
-    async def add_documents(self, documents: List[Document]) -> List[str]:
+    async def add_documents(
+        self,
+        documents: List[Document],
+        on_batch_progress: Optional[Callable[[int, int], Awaitable[None]]] = None,
+    ) -> List[str]:
         """Embed and store documents in Qdrant with deduplication and outer batch processing.
 
         Embedding strategy:
@@ -678,6 +682,9 @@ class QdrantStore(BaseVectorStore):
                 skipped,
             )
 
+            if on_batch_progress is not None:
+                await on_batch_progress(0, total)
+
             for batch_start in range(0, total, batch_size):
                 batch      = embed_docs[batch_start : batch_start + batch_size]
                 batch_num  = batch_start // batch_size + 1
@@ -706,6 +713,8 @@ class QdrantStore(BaseVectorStore):
                         total - batch_end,
                         _t1 - _t0,
                     )
+                    if on_batch_progress is not None:
+                        await on_batch_progress(batch_end, total)
                 except Exception as batch_err:
                     failed_batches += 1
                     logger.error(

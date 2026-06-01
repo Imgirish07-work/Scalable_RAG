@@ -1,27 +1,12 @@
-"""Document orchestration service — the brain of the upload + ingest flow.
+"""HTTP-layer orchestration for /v1/documents — upload, list, delete, SSE."""
 
-Owns the full lifecycle from upload-session creation through ingestion to
-soft-delete. Touches three external systems (Postgres, MinIO, Qdrant) plus
-the in-process RAG pipeline. Cross-system writes use compensating actions
-on failure (saga); intra-system writes are atomic via SQLAlchemy sessions.
-"""
-
-import asyncio
-import hashlib
-import os
-import random
-import tempfile
-import time
-from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Optional
 
-import magic
 from fastapi import Depends, HTTPException, Request, status
 
 from backend.models.document import Document
-from backend.repositories.database import session_scope
 from backend.repositories.document_repository import (
     DocumentRepository,
     get_document_repository,
@@ -42,6 +27,7 @@ from backend.settings import (
     storage_settings,
 )
 from backend.storage.object_store import ObjectStore, get_object_store
+from backend.workers.queue_client import QueueClient, QueueUnavailableError
 from pipeline.rag_pipeline import RAGPipeline
 from utils.helpers import generate_unique_id
 from utils.logger import get_logger
@@ -49,9 +35,8 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-# Allowed file types — extension → set of acceptable MIME values.
-# Enforced at upload-session creation AND re-verified via python-magic
-# during finalize, in case the client lied about Content-Type.
+# Allowed extension → acceptable MIME values. IngestionService re-verifies
+# the downloaded bytes via python-magic, in case the client lied.
 _ALLOWED_TYPES: dict[str, set[str]] = {
     ".pdf":  {"application/pdf"},
     ".docx": {
@@ -65,23 +50,9 @@ _ALLOWED_TYPES: dict[str, set[str]] = {
     ".txt":  {"text/plain"},
 }
 
-# Retry policy for transient failures during ingestion (MinIO, Qdrant).
-_RETRY_ATTEMPTS = 3
-_RETRY_BASE_DELAY_S = 1.0
-_RETRY_MAX_DELAY_S = 8.0
-_RETRY_JITTER_RATIO = 0.25
-
-
-class DataLevelIngestionError(Exception):
-    """Raised when the input itself is bad (MIME mismatch, corrupt file).
-
-    Differentiates user-content failures (no retry helps — bytes are deleted)
-    from infrastructure failures (preserved in DLQ for retry).
-    """
-
 
 class DocumentService:
-    """Coordinates upload sessions, ingestion, listing, and deletion."""
+    """Coordinates upload sessions, listing, deletion, and SSE subscriptions."""
 
     def __init__(
         self,
@@ -89,6 +60,7 @@ class DocumentService:
         object_store: ObjectStore,
         pipeline: RAGPipeline,
         event_bus: EventBus,
+        queue_client: QueueClient,
         storage: StorageSettings,
         backend: BackendSettings,
     ) -> None:
@@ -96,13 +68,13 @@ class DocumentService:
         self._store = object_store
         self._pipeline = pipeline
         self._bus = event_bus
+        self._queue = queue_client
         self._storage = storage
         self._backend = backend
 
     async def create_upload_session(
         self, user_id: str, request: UploadSessionRequest,
     ) -> UploadSessionView:
-        """Validate metadata, create a pending row, return a presigned PUT URL."""
         self._validate_file_metadata(
             file_name=request.file_name,
             mime_type=request.mime_type,
@@ -150,9 +122,7 @@ class DocumentService:
     async def finalize(
         self, doc_id: str, user_id: str, request_id: Optional[str] = None,
     ) -> FinalizeAck:
-        """Kick off background ingestion; return 202-style ack immediately."""
         document = await self._fetch_owned(doc_id, user_id)
-
         if document.status != "pending":
             logger.info(
                 "Finalize ignored (non-pending) | doc_id=%s | status=%s",
@@ -160,10 +130,20 @@ class DocumentService:
             )
             return FinalizeAck(doc_id=doc_id, status=document.status)
 
-        asyncio.create_task(
-            self._ingest_background(doc_id, user_id, request_id),
-            name=f"ingest-{doc_id}",
-        )
+        await self._enqueue_ingest(doc_id, user_id, request_id)
+        return FinalizeAck(doc_id=doc_id, status="processing")
+
+    async def retry(
+        self, doc_id: str, user_id: str, request_id: Optional[str] = None,
+    ) -> FinalizeAck:
+        document = await self._fetch_owned(doc_id, user_id)
+        if document.status != "failed":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Cannot retry a document in status '{document.status}'",
+            )
+        await self._enqueue_ingest(doc_id, user_id, request_id)
+        logger.info("Retry kicked off | doc_id=%s | user_id=%s", doc_id, user_id)
         return FinalizeAck(doc_id=doc_id, status="processing")
 
     async def list(
@@ -191,11 +171,6 @@ class DocumentService:
         return self._to_view(document)
 
     async def get_download_url(self, doc_id: str, user_id: str) -> DownloadView:
-        """Return a presigned GET URL the browser can use to fetch the raw file.
-
-        Lets the in-app viewer pull bytes directly from MinIO without
-        round-tripping the backend.
-        """
         document = await self._fetch_owned(doc_id, user_id)
         url = await self._store.generate_presigned_get_url(document.s3_key)
         expires_at = datetime.now(timezone.utc) + timedelta(
@@ -210,40 +185,14 @@ class DocumentService:
         )
 
     async def soft_delete(self, doc_id: str, user_id: str) -> None:
-        """Soft-delete row first (user-facing ack), then cascade best-effort."""
         document = await self._fetch_owned(doc_id, user_id)
         await self._repo.soft_delete(doc_id)
-        # Best-effort cleanup — outcome does not affect the API response.
-        await self._cascade_delete(doc_id, document.s3_key)
+        await self._cleanup_blob_and_vectors(doc_id, document.s3_key)
 
-    async def retry(
-        self, doc_id: str, user_id: str, request_id: Optional[str] = None,
-    ) -> FinalizeAck:
-        """Re-ingest a DLQ row using its preserved MinIO blob — no re-upload."""
+    async def subscribe_to_events(self, doc_id: str, user_id: str):
+        """Yield a DB snapshot first, then tail the event bus until terminal."""
         document = await self._fetch_owned(doc_id, user_id)
-        if document.status != "failed":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Cannot retry a document in status '{document.status}'",
-            )
-        asyncio.create_task(
-            self._ingest_background(doc_id, user_id, request_id),
-            name=f"retry-{doc_id}",
-        )
-        logger.info("Retry kicked off | doc_id=%s | user_id=%s", doc_id, user_id)
-        return FinalizeAck(doc_id=doc_id, status="processing")
-
-    async def subscribe_to_events(
-        self, doc_id: str, user_id: str,
-    ):
-        """Async generator of ingestion events for SSE clients.
-
-        Yields a snapshot first so late subscribers see current state without
-        hanging. If the doc is already terminal, the snapshot is the only
-        event and the generator ends.
-        """
-        document = await self._fetch_owned(doc_id, user_id)
-        snapshot = {
+        yield {
             "doc_id": doc_id,
             "phase": self._phase_from_status(document.status),
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -252,7 +201,6 @@ class DocumentService:
             "error_message": document.error_message,
             "snapshot": True,
         }
-        yield snapshot
 
         if document.status in ("ready", "failed"):
             return
@@ -260,109 +208,19 @@ class DocumentService:
         async for event in self._bus.subscribe(doc_id):
             yield event
 
-    async def _ingest_background(
+    async def _enqueue_ingest(
         self, doc_id: str, user_id: str, request_id: Optional[str],
     ) -> None:
-        """Fire-and-forget ingestion task spawned by finalize."""
-        publish = self._make_publisher(doc_id, request_id)
-        start = time.perf_counter()
-        temp_path: Optional[Path] = None
-
         try:
-            # Reload row in a fresh session (the request session is dead here).
-            # Capture every field we need INSIDE the block — detached attribute
-            # access depends on session-factory config we should not silently rely on.
-            async with self._with_repo() as repo:
-                document = await repo.find_by_id(doc_id)
-                if document is None:
-                    raise RuntimeError(f"Document vanished: {doc_id}")
-                s3_key = document.s3_key
-                expected_mime = document.mime_type
-                file_ext = Path(document.file_name).suffix
-                logical_collection = document.collection
-                await repo.update_status(doc_id, "processing")
-
-            await publish("processing")
-
-            # Verify MinIO has the bytes (defense against client never PUTting).
-            metadata = await self._retry(self._store.head_object, s3_key)
-            await publish("downloading", size_bytes=int(metadata.get("ContentLength", 0)))
-
-            # Stream MinIO → tempfile + SHA-256.
-            temp_path, content_hash = await self._download_and_hash(
-                s3_key=s3_key, file_ext=file_ext, doc_id=doc_id,
+            await self._queue.enqueue_ingest(
+                doc_id=doc_id, user_id=user_id, request_id=request_id,
             )
-            await publish("hashed", content_hash=content_hash)
-
-            self._verify_mime_from_disk(temp_path, expected=expected_mime)
-
-            # Dedup probe in its own short session — release the connection
-            # before any I/O-heavy follow-up (duplicate cascade or chunking).
-            async with self._with_repo() as repo:
-                existing = await repo.find_active_by_content_hash(user_id, content_hash)
-            duplicate_id = (
-                existing.id if existing is not None and existing.id != doc_id else None
-            )
-
-            if duplicate_id is not None:
-                await self._handle_duplicate(
-                    doc_id=doc_id,
-                    s3_key=s3_key,
-                    existing_id=duplicate_id,
-                    publish=publish,
-                )
-                return
-
-            # Persist hash in its own session so the connection is free during
-            # the slow chunking/embedding work that follows.
-            async with self._with_repo() as repo:
-                await repo.set_content_hash(doc_id, content_hash)
-
-            await publish("chunking")
-            # pipeline.ingest positional args: file_path, collection, user_id, doc_id.
-            # Pass `logical_collection` so Qdrant payload.metadata.collection
-            # matches the documents row — collection-scoped queries depend on it.
-            ingestion = await self._retry(
-                self._pipeline.ingest,
-                str(temp_path), logical_collection, user_id, doc_id,
-            )
-
-            async with self._with_repo() as repo:
-                await repo.update_status(
-                    doc_id, "ready", chunks_count=ingestion.chunks_stored,
-                )
-
-            elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
-            await publish(
-                "ready",
-                chunks_count=ingestion.chunks_stored,
-                elapsed_ms=elapsed_ms,
-            )
-            logger.info(
-                "Ingestion complete | doc_id=%s | chunks=%d | elapsed_ms=%.1f",
-                doc_id, ingestion.chunks_stored, elapsed_ms,
-            )
-
-        except Exception as exc:
-            logger.exception("Ingestion failed | doc_id=%s", doc_id)
-            try:
-                if isinstance(exc, DataLevelIngestionError):
-                    # Bad input — preserving the blob serves no purpose. Hard-delete.
-                    await self._rollback(doc_id, reason=str(exc))
-                else:
-                    # Infrastructure failure — preserve in DLQ for retry.
-                    await self._mark_failed_in_dlq(doc_id, exc)
-            except Exception:
-                # Even cleanup failed (e.g. DB down). Row stays in 'processing';
-                # a future stuck-processing sweep can recover it.
-                logger.exception("Failure handler itself failed | doc_id=%s", doc_id)
-            try:
-                await publish("failed", reason=type(exc).__name__, message=str(exc))
-            except Exception:
-                logger.exception("Failed event publish failed | doc_id=%s", doc_id)
-
-        finally:
-            self._unlink_quietly(temp_path)
+        except QueueUnavailableError as exc:
+            logger.error("Queue unavailable | doc_id=%s | error=%s", doc_id, exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Ingestion queue unavailable",
+            ) from exc
 
     def _validate_file_metadata(
         self, file_name: str, mime_type: str, size_bytes: int,
@@ -387,7 +245,7 @@ class DocumentService:
             )
 
     def _build_s3_key(self, user_id: str, doc_id: str, file_name: str) -> str:
-        safe_name = Path(file_name).name  # strip any path components
+        safe_name = Path(file_name).name
         return f"{user_id}/{doc_id}/{safe_name}"
 
     async def _fetch_owned(self, doc_id: str, user_id: str) -> Document:
@@ -397,102 +255,31 @@ class DocumentService:
             or document.user_id != user_id
             or document.deleted_at is not None
         ):
-            # 404 (not 403) so we do not leak existence of other users' docs.
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Document not found",
             )
         return document
 
-    @asynccontextmanager
-    async def _with_repo(self):
-        """Yield a repo bound to a fresh, self-committing session.
-
-        Used by background ingestion paths, where the request-scoped session
-        from FastAPI's `get_db_session` is already closed.
-        """
-        async with session_scope() as session:
-            yield DocumentRepository(session)
-
-    async def _download_and_hash(
-        self, s3_key: str, file_ext: str, doc_id: str,
-    ) -> tuple[Path, str]:
-        """Stream MinIO → on-disk temp file; return path + SHA-256.
-
-        The temp file is the caller's to delete; we use `mkstemp` (not
-        `NamedTemporaryFile`) because the file must outlive this function
-        so the pipeline can read it from disk.
-        """
-        hasher = hashlib.sha256()
-        fd, temp_path_str = tempfile.mkstemp(
-            suffix=file_ext, prefix=f"{doc_id}_",
-        )
-        os.close(fd)
-        temp_path = Path(temp_path_str)
-
-        try:
-            with temp_path.open("wb") as out:
-                async for chunk in self._store.get_object_stream(s3_key):
-                    hasher.update(chunk)
-                    out.write(chunk)
-            return temp_path, hasher.hexdigest()
-        except Exception:
-            self._unlink_quietly(temp_path)
-            raise
-
-    def _verify_mime_from_disk(self, path: Path, expected: str) -> None:
-        sniffed = magic.from_file(str(path), mime=True)
-        if sniffed != expected:
-            raise DataLevelIngestionError(
-                f"MIME mismatch — declared='{expected}' sniffed='{sniffed}'"
-            )
-
-    async def _handle_duplicate(
-        self,
-        doc_id: str,
-        s3_key: str,
-        existing_id: str,
-        publish: Callable[..., Awaitable[None]],
+    async def _cleanup_blob_and_vectors(
+        self, doc_id: str, s3_key: str,
     ) -> None:
-        await self._cascade_delete(doc_id, s3_key)
-        async with self._with_repo() as repo:
-            await repo.hard_delete(doc_id)
-        await publish("duplicate", duplicate_of=existing_id)
-        logger.info(
-            "Duplicate suppressed | doc_id=%s | existing=%s", doc_id, existing_id,
-        )
-
-    async def _rollback(self, doc_id: str, reason: str) -> None:
-        """Terminal failure path for data-level errors — clear all state."""
-        async with self._with_repo() as repo:
-            document = await repo.find_by_id(doc_id)
-        if document is None:
-            return
-        await self._cascade_delete(doc_id, document.s3_key)
-        async with self._with_repo() as repo:
-            await repo.hard_delete(doc_id)
-        logger.info("Rollback complete | doc_id=%s | reason=%s", doc_id, reason)
-
-    async def _mark_failed_in_dlq(self, doc_id: str, exc: Exception) -> None:
-        """Infrastructure-failure path — preserve row + MinIO blob for retry.
-
-        Best-effort Qdrant cleanup runs regardless so partial chunks from the
-        failed attempt do not leak into queries before a retry overwrites them.
-        """
+        """Best-effort vector + blob delete; failures logged, never raised."""
         try:
-            await self._delete_qdrant_chunks(doc_id)
+            store = getattr(self._pipeline, "_store", None)
+            if store is not None:
+                await store.delete_by_doc_id(doc_id)
         except Exception:
-            logger.exception("Qdrant cleanup failed during DLQ mark | doc_id=%s", doc_id)
-        error_message = f"{type(exc).__name__}: {exc}"[:500]
+            logger.exception("Qdrant cleanup failed | doc_id=%s", doc_id)
         try:
-            async with self._with_repo() as repo:
-                await repo.mark_failed(doc_id, error_message=error_message)
+            await self._store.delete_object(s3_key)
         except Exception:
-            logger.exception("Failed to mark DLQ status | doc_id=%s", doc_id)
+            logger.exception(
+                "MinIO cleanup failed | doc_id=%s | key=%s", doc_id, s3_key,
+            )
 
     @staticmethod
     def _phase_from_status(status_value: str) -> str:
-        """Synthesize an SSE phase name from a stored status (snapshot path)."""
         if status_value == "ready":
             return "ready"
         if status_value == "failed":
@@ -500,80 +287,6 @@ class DocumentService:
         if status_value == "processing":
             return "processing"
         return "pending"
-
-
-    async def _cascade_delete(self, doc_id: str, s3_key: str) -> None:
-        """Best-effort Qdrant + MinIO cleanup; failures are logged, not raised."""
-        try:
-            await self._delete_qdrant_chunks(doc_id)
-        except Exception:
-            logger.exception("Qdrant cleanup failed | doc_id=%s", doc_id)
-        try:
-            await self._retry(
-                self._store.delete_object, s3_key, attempts=2,
-            )
-        except Exception:
-            logger.exception(
-                "MinIO cleanup failed | doc_id=%s | key=%s", doc_id, s3_key,
-            )
-
-    async def _delete_qdrant_chunks(self, doc_id: str) -> None:
-        store = getattr(self._pipeline, "_store", None)
-        if store is None:
-            return
-        await store.delete_by_doc_id(doc_id)
-
-    def _make_publisher(
-        self, doc_id: str, request_id: Optional[str],
-    ) -> Callable[..., Awaitable[None]]:
-        """Return a closure that publishes events tagged with doc_id + request_id."""
-        async def publish(phase: str, **payload) -> None:
-            event = {
-                "doc_id": doc_id,
-                "phase": phase,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "request_id": request_id,
-                **payload,
-            }
-            await self._bus.publish(doc_id, event)
-        return publish
-
-    async def _retry(self, fn, *args, attempts: int = _RETRY_ATTEMPTS):
-        """Exponential backoff with ±25% jitter. Retries on any Exception.
-
-        Reasonable for our use case (Qdrant/MinIO transient errors); finer-
-        grained per-call filtering can come later if needed.
-        """
-        last_exc: Optional[BaseException] = None
-        for attempt in range(1, attempts + 1):
-            try:
-                return await fn(*args)
-            except Exception as exc:
-                last_exc = exc
-                if attempt == attempts:
-                    raise
-                base = min(
-                    _RETRY_BASE_DELAY_S * (2 ** (attempt - 1)),
-                    _RETRY_MAX_DELAY_S,
-                )
-                jitter = base * _RETRY_JITTER_RATIO * (2 * random.random() - 1)
-                wait = max(0.0, base + jitter)
-                logger.warning(
-                    "Retrying | fn=%s | attempt=%d/%d | wait=%.2fs | error=%s",
-                    getattr(fn, "__name__", repr(fn)),
-                    attempt, attempts, wait, exc,
-                )
-                await asyncio.sleep(wait)
-        raise last_exc  # unreachable; satisfies type checker
-
-    def _unlink_quietly(self, path: Optional[Path]) -> None:
-        if path is None:
-            return
-        try:
-            if path.exists():
-                path.unlink()
-        except Exception:
-            logger.warning("Failed to delete temp file | path=%s", path)
 
     def _to_view(self, document: Document) -> DocumentDetailView:
         return DocumentDetailView(
@@ -596,18 +309,27 @@ def get_document_service(
     request: Request,
     repo: DocumentRepository = Depends(get_document_repository),
 ) -> DocumentService:
-    """FastAPI dependency. Pulls the pipeline from app.state (set by lifespan)."""
+    """FastAPI dependency. Pulls pipeline + queue client from app.state."""
     pipeline: Optional[RAGPipeline] = getattr(request.app.state, "pipeline", None)
     if pipeline is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Pipeline not initialized",
         )
+    queue_client: Optional[QueueClient] = getattr(
+        request.app.state, "queue_client", None,
+    )
+    if queue_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Queue client not initialized",
+        )
     return DocumentService(
         repo=repo,
         object_store=get_object_store(),
         pipeline=pipeline,
         event_bus=get_event_bus(),
+        queue_client=queue_client,
         storage=storage_settings,
         backend=backend_settings,
     )

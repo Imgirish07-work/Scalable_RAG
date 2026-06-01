@@ -21,7 +21,7 @@ Dependencies:
 # stdlib
 import asyncio
 import time
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 # internal
 from agents.agent_orchestrator import AgentOrchestrator
@@ -442,6 +442,7 @@ class RAGPipeline:
         collection: Optional[str] = None,
         user_id: str = "",
         doc_id: str = "",
+        on_batch_progress: Optional[Callable[[int, int], Awaitable[None]]] = None,
     ) -> IngestionResult:
         """Ingest a document into the vector store.
 
@@ -517,7 +518,9 @@ class RAGPipeline:
                 search_mode=settings.RAG_RETRIEVAL_MODE,
             )
             await ingest_store.initialize()
-            point_ids = await ingest_store.add_documents(chunks)
+            point_ids = await ingest_store.add_documents(
+                chunks, on_batch_progress=on_batch_progress,
+            )
 
             # Post-ingest HNSW warmup — forces Qdrant to load the freshly
             # built HNSW graph segments into RAM right now, so the first

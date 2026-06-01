@@ -1,6 +1,6 @@
-"""Prometheus counters and histograms exported by the backend."""
+"""Prometheus counters, gauges, and histograms exported by the backend."""
 
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
 http_requests_total = Counter(
     "rag_http_requests_total",
@@ -30,4 +30,21 @@ ingest_total = Counter(
 ingest_chunks_total = Counter(
     "rag_ingest_chunks_total",
     "Total chunks stored across all ingests.",
+)
+
+ingest_jobs_queued_total = Counter(
+    "rag_ingest_jobs_queued_total",
+    "Total ingest jobs accepted onto the Arq queue.",
+    labelnames=("origin",),
+)
+
+ingest_jobs_failed_total = Counter(
+    "rag_ingest_jobs_failed_total",
+    "Total ingest jobs that ended in DLQ, by failure reason.",
+    labelnames=("reason",),
+)
+
+ingest_jobs_inflight = Gauge(
+    "rag_ingest_jobs_inflight",
+    "Ingest jobs currently being processed by this worker.",
 )

@@ -1,4 +1,4 @@
-"""FastAPI app with lifespan-managed RAGPipeline singleton."""
+"""FastAPI app with lifespan-managed RAG pipeline and Arq queue client."""
 
 import asyncio
 import os
@@ -21,68 +21,34 @@ from backend.api.v1 import (
 )
 from backend.middleware import RequestIDMiddleware
 from backend.repositories.database import dispose_engine
+from backend.services.event_bus import get_event_bus
 from backend.services.orphan_sweeper import OrphanSweeper
-from backend.settings import backend_settings, storage_settings
+from backend.services.pipeline_factory import build_pipeline
+from backend.settings import backend_settings, storage_settings, worker_settings
 from backend.storage.object_store import get_object_store
-from cache.cache_manager import CacheManager
+from backend.workers.queue_client import QueueClient
 from config.settings import settings
-from llm.llm_factory import LLMFactory
-from pipeline.rag_pipeline import RAGPipeline
 from utils.logger import get_logger
-from vectorstore.qdrant_store import QdrantStore
 
 logger = get_logger(__name__)
 
 
 async def _initialize_pipeline(app: FastAPI) -> None:
-    """Build and warm up the RAG pipeline; flip `app.state.ready` on success.
-
-    Runs in the background after the lifespan yields, so uvicorn can serve
-    health checks and reject non-ready /v1/* calls with a clean 503 while
-    the heavy ONNX/SPLADE/Qdrant boot continues. Every blocking sync call
-    downstream is already routed through `asyncio.to_thread`, so this
-    coroutine never holds the event loop.
-    """
+    """Boot the RAG pipeline; flip `app.state.ready` on success."""
     start = time.perf_counter()
     try:
-        # Object store first — cheap, but downstream document upload paths depend
-        # on the bucket existing with CORS applied, so we fail fast if MinIO is
-        # mis-configured rather than discovering it on the first upload.
         await get_object_store().ensure_bucket()
-
-        llm = LLMFactory.create_from_settings()
-        logger.info("LLM ready | %s/%s", llm.provider_name, llm.model_name)
-
-        store = QdrantStore(in_memory=False, search_mode=settings.RAG_RETRIEVAL_MODE)
-        cache = CacheManager(settings) if settings.cache_enabled else None
-
-        pipeline = RAGPipeline(llm=llm, store=store, cache=cache)
-        await pipeline.initialize()
-
-        # Single physical Qdrant collection; tenancy enforced via user_id filter.
-        agent_collections = {
-            settings.qdrant_collection_name: "All user documents",
-        }
-        pipeline.configure_agents(
-            collections=agent_collections,
-            max_concurrent=backend_settings.max_concurrent_subqueries,
-        )
-        logger.info(
-            "Agent layer configured | physical_collection=%s",
-            settings.qdrant_collection_name,
-        )
-
+        pipeline = await build_pipeline()
         app.state.pipeline = pipeline
         app.state.ready = True
-        logger.info("Backend ready in %.0f ms", (time.perf_counter() - start) * 1000)
-
+        logger.info(
+            "Backend ready in %.0f ms", (time.perf_counter() - start) * 1000,
+        )
     except asyncio.CancelledError:
-        # Triggered when shutdown arrives mid-boot; cleanup runs in lifespan.
         logger.info("Pipeline initialization cancelled mid-boot")
         raise
     except Exception:
-        # Stay alive in not-ready state instead of crash-looping — operators
-        # can inspect logs and `/readyz` will keep reporting 503 cleanly.
+        # Stay alive in not-ready state so /readyz keeps returning a clean 503.
         logger.exception(
             "Pipeline initialization failed — backend will remain not-ready"
         )
@@ -90,18 +56,19 @@ async def _initialize_pipeline(app: FastAPI) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Boot quickly; defer heavy init to a background task.
-
-    Yielding right after spawning the init task lets uvicorn begin handling
-    requests immediately. Docker's healthcheck on `/healthz` therefore passes
-    from process start, eliminating the restart loop that occurs when an
-    aggressive healthcheck window is shorter than the model-load time.
-    """
     logger.info(
-        "Backend starting | app=%s v%s", settings.app_name, settings.app_version
+        "Backend starting | app=%s v%s", settings.app_name, settings.app_version,
     )
     app.state.ready = False
     app.state.pipeline = None
+    app.state.queue_client = None
+
+    queue_client = QueueClient()
+    try:
+        await queue_client.start()
+        app.state.queue_client = queue_client
+    except Exception:
+        logger.exception("Queue client failed to start — ingest endpoints will 503")
 
     init_task = asyncio.create_task(
         _initialize_pipeline(app), name="pipeline-init",
@@ -112,6 +79,7 @@ async def lifespan(app: FastAPI):
         interval_seconds=storage_settings.sweeper_interval_seconds,
         orphan_max_age_seconds=storage_settings.orphan_sweep_after_seconds,
         dlq_max_age_seconds=storage_settings.failed_dlq_ttl_seconds,
+        processing_lease_ttl_seconds=worker_settings.processing_lease_ttl_seconds,
     )
     sweeper_task = asyncio.create_task(sweeper.run(), name="orphan-sweeper")
 
@@ -122,7 +90,7 @@ async def lifespan(app: FastAPI):
 
     sweeper.request_stop()
 
-    # Cancel any in-flight init before tearing down dependencies it might own.
+    # Cancel in-flight init before tearing down its dependencies.
     if not init_task.done():
         init_task.cancel()
     for task in (init_task, sweeper_task):
@@ -138,9 +106,17 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Pipeline shutdown failed")
     try:
+        await queue_client.close()
+    except Exception:
+        logger.exception("Queue client close failed")
+    try:
         await dispose_engine()
     except Exception:
         logger.exception("DB engine dispose failed")
+    try:
+        await get_event_bus().close()
+    except Exception:
+        logger.exception("Event bus close failed")
     logger.info("Backend shutdown complete")
 
 

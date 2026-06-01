@@ -91,3 +91,43 @@ def get_storage_settings() -> StorageSettings:
 
 
 storage_settings = get_storage_settings()
+
+
+class WorkerSettings(BaseSettings):
+    """Arq worker + Redis pub/sub config for async ingestion."""
+
+    redis_url: str = Field(default="redis://redis:6379/0")
+    queue_name: str = Field(default="scalable_rag:ingest")
+    worker_max_jobs: int = Field(default=2)
+    worker_job_timeout_seconds: int = Field(default=900)
+
+    # Arq in-worker retries for transient blips; exhaustion → DLQ.
+    arq_max_tries: int = Field(default=3)
+
+    # Past this, the sweeper treats the row as a dead worker and moves it to DLQ.
+    processing_lease_ttl_seconds: int = Field(default=600)
+
+    # Per-chunk progress throttle — whichever fires first.
+    progress_publish_every_n_chunks: int = Field(default=5)
+    progress_publish_min_interval_ms: int = Field(default=200)
+
+    events_channel_prefix: str = Field(default="events:doc")
+
+    model_config = {
+        "env_prefix": "WORKER_",
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "case_sensitive": False,
+        "extra": "ignore",
+    }
+
+    def events_channel(self, doc_id: str) -> str:
+        return f"{self.events_channel_prefix}:{doc_id}"
+
+
+@lru_cache
+def get_worker_settings() -> WorkerSettings:
+    return WorkerSettings()
+
+
+worker_settings = get_worker_settings()

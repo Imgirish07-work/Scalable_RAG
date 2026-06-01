@@ -258,9 +258,7 @@ xxhash==3.6.0
 yarl==1.23.0
 zipp==3.23.0
 zstandard==0.25.0
-
-# Backend (Phase 1) — added for the FastAPI layer.
-# Pinned to known-good versions; bump after manual verification.
 alembic==1.13.3
 asyncpg==0.30.0
 prometheus-client==0.21.1
+arq==0.26.3
