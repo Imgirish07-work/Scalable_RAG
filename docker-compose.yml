@@ -1,24 +1,3 @@
-# Scalable RAG — local dev stack (Phase 1).
-#
-# Services:
-#   postgres  — Documents metadata (also visible in pgAdmin on localhost:5432)
-#   redis     — Cache
-#   minio     — S3-compatible object store for document blobs (console on :9001)
-#   backend   — FastAPI app
-#
-# Qdrant runs in the cloud (set QDRANT_URL + QDRANT_API_KEY in .env).
-# No local qdrant container — saves RAM for ONNX/CUDA workloads.
-#
-# Both docker and bare-metal modes use the same Postgres container.
-#   docker mode  → backend container talks to compose service `postgres:5432`
-#   native mode  → uvicorn on host talks to `localhost:5432` (compose exposes it)
-#   pgAdmin      → connect to localhost:5432 to inspect data
-#
-# Usage:
-#   1. Copy .env.example to .env and set POSTGRES_* + LLM keys + bootstrap token.
-#   2. docker compose --profile dev up --build
-
-# Shared env + code mounts so backend (API pod) and worker (Arq pod) stay in sync.
 x-backend-env: &backend-env
   QDRANT_URL: "${QDRANT_URL:?Set QDRANT_URL in .env to your Qdrant Cloud URL}"
   QDRANT_API_KEY: "${QDRANT_API_KEY:?Set QDRANT_API_KEY in .env}"
@@ -83,7 +62,6 @@ services:
     restart: unless-stopped
 
   minio:
-    # S3-compatible object store for document blobs. Console on :9001 for dev.
     image: minio/minio:RELEASE.2024-12-18T13-15-44Z
     profiles: ["dev", "full"]
     command: server /data --console-address ":9001"
@@ -131,8 +109,6 @@ services:
     restart: unless-stopped
 
   worker:
-    # Arq ingest worker — consumes jobs enqueued by the API pod, runs the full
-    # ingestion pipeline, publishes progress to Redis pub/sub.
     build:
       context: .
       dockerfile: Dockerfile.backend
@@ -141,7 +117,6 @@ services:
     environment: *backend-env
     volumes: *backend-volumes
     command: ["arq", "backend.workers.arq_settings.WorkerSettings"]
-    # worker doesn't serve HTTP — override the curl healthcheck inherited from Dockerfile.backend
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f arq > /dev/null || exit 1"]
       interval: 30s
@@ -158,10 +133,18 @@ services:
     stop_grace_period: 30s
     restart: unless-stopped
 
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    profiles: ["dev", "full"]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - backend
+    restart: unless-stopped
+
   frontend:
-    # Production-style nginx bundle. Day-to-day dev runs `npm run dev` on the
-    # host instead — this profile is only for smoke-testing the prod image
-    # locally before deploy.
     build:
       context: ./frontend
       dockerfile: Dockerfile
