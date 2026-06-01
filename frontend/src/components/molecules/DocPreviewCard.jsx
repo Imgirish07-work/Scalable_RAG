@@ -6,10 +6,6 @@ import { C } from "../../theme";
 
 const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"]);
 
-const ACTIVE_STATUSES = new Set([
-  "queued", "uploading", "finalizing", "processing",
-]);
-
 function extOf(name = "") {
   return (name.split(".").pop() || "").toLowerCase();
 }
@@ -28,44 +24,6 @@ function inferLabel(filename, kind) {
   return (ext || "FILE").toUpperCase().slice(0, 4);
 }
 
-function statusOverlayStyle(status) {
-  if (status === "failed") {
-    return {
-      background: "rgba(184, 61, 44, 0.12)",
-      borderColor: "var(--c-textError)",
-    };
-  }
-  if (status === "duplicate") {
-    return {
-      background: "rgba(120, 120, 120, 0.10)",
-      borderColor: C.lineCard,
-    };
-  }
-  if (ACTIVE_STATUSES.has(status)) {
-    return {
-      background: "rgba(208, 138, 106, 0.08)",
-      borderColor: C.accentBorder,
-    };
-  }
-  return null;
-}
-
-// Resolves the top-bar fill percent for the current phase.
-// Returns a number for determinate bars, "indet" for indeterminate, or null to hide.
-function resolveBarMode(status, phase, progress, chunksProcessed, chunksTotal) {
-  if (status === "uploading") return clampPct(progress);
-  if (phase === "embedding" && chunksTotal > 0) {
-    return clampPct(Math.round((chunksProcessed / chunksTotal) * 100));
-  }
-  if (ACTIVE_STATUSES.has(status)) return "indet";
-  return null;
-}
-
-function clampPct(n) {
-  if (typeof n !== "number" || Number.isNaN(n)) return 0;
-  return Math.min(100, Math.max(0, n));
-}
-
 export default memo(function DocPreviewCard({
   file,
   fetchUrl,
@@ -75,11 +33,6 @@ export default memo(function DocPreviewCard({
   width = 190,
   height = 234,
   status,
-  phase,
-  progress,
-  chunksProcessed = 0,
-  chunksTotal = 0,
-  message,
   onClick,
   onRemove,
   onRetry,
@@ -91,14 +44,13 @@ export default memo(function DocPreviewCard({
   const rootRef = useRef(null);
   const canvasRef = useRef(null);
   const [resolvedUrl, setResolvedUrl] = useState(url || null);
-  const [thumbState, setThumbState] = useState("idle"); // idle | loading | ready | error
-  const [visible, setVisible] = useState(!fetchUrl); // immediate render unless we need to lazy-fetch
+  const [thumbState, setThumbState] = useState("idle");
+  const [visible, setVisible] = useState(!fetchUrl);
   const [hovered, setHovered] = useState(false);
   const isClickable = typeof onClick === "function";
-  const overlay = statusOverlayStyle(status);
+  const isFailed = status === "failed";
 
-  // Lazy: only fetch the presigned URL when card enters viewport. Avoids
-  // hammering MinIO with 50 GETs on first render of a large indexed library.
+  // Lazy-fetch presigned URL when card enters viewport; avoids 50 GETs on first render.
   useEffect(() => {
     if (!fetchUrl || resolvedUrl) return undefined;
     if (!rootRef.current) return undefined;
@@ -115,11 +67,9 @@ export default memo(function DocPreviewCard({
     return () => io.disconnect();
   }, [fetchUrl, resolvedUrl]);
 
-  // Resolve URL once card is visible (or immediately for File / direct URL).
   useEffect(() => {
     if (!visible) return undefined;
     if (file) {
-      // For local File: only need an object URL if we render the image branch.
       if (kind === "image") {
         const blobUrl = URL.createObjectURL(file);
         setResolvedUrl(blobUrl);
@@ -141,7 +91,6 @@ export default memo(function DocPreviewCard({
     return undefined;
   }, [visible, file, url, fetchUrl, kind, resolvedUrl]);
 
-  // Render PDF first page into the canvas once we have data + URL.
   useEffect(() => {
     if (kind !== "pdf") return undefined;
     if (!file && !resolvedUrl) return undefined;
@@ -177,16 +126,12 @@ export default memo(function DocPreviewCard({
     return () => { cancelled = true; };
   }, [kind, file, resolvedUrl, width]);
 
-  // Cards are theme-aware now (match active theme bg/border/text) so they
-  // sit naturally on the surrounding pane in both light and dark modes.
-  // PDF thumbnails keep their own white paper inside, so the badge needs
-  // "dark" tone when over a PDF, otherwise "themed".
   const cardBadgeTone = kind === "pdf" || kind === "image" ? "dark" : "themed";
   return (
     <div
       ref={rootRef}
       onClick={isClickable ? onClick : undefined}
-      title={message || displayName}
+      title={displayName}
       style={{
         position: "relative",
         width,
@@ -195,8 +140,8 @@ export default memo(function DocPreviewCard({
         borderRadius: 12,
         overflow: "hidden",
         background: C.bgCard,
-        border: overlay
-          ? `1.5px solid ${overlay.borderColor}`
+        border: isFailed
+          ? `1.5px solid var(--c-textError)`
           : `1px solid ${C.lineSoft}`,
         boxShadow: "0 1px 2px rgba(0,0,0,0.10), 0 4px 12px rgba(0,0,0,0.10)",
         cursor: isClickable ? "pointer" : "default",
@@ -217,9 +162,6 @@ export default memo(function DocPreviewCard({
         }
       }}
     >
-      {/* Thumbnail layer — top-aligned so the page head shows, like Claude.
-          PDF/image keep their own white paper feel; the generic placeholder
-          adopts the card's themed surface so it doesn't flash white in dark mode. */}
       <div
         style={{
           position: "absolute",
@@ -258,38 +200,19 @@ export default memo(function DocPreviewCard({
 
         {thumbState === "error" && kind === "pdf" && <GenericPagePlaceholder />}
 
-        {/* Status tint over the white page when uploading/processing/failed */}
-        {overlay && (
+        {isFailed && (
           <div
             style={{
               position: "absolute",
               inset: 0,
-              background: overlay.background,
+              background: "rgba(184, 61, 44, 0.12)",
               pointerEvents: "none",
             }}
           />
         )}
       </div>
 
-      <TopProgressBar
-        mode={resolveBarMode(status, phase, progress, chunksProcessed, chunksTotal)}
-      />
-      {status === "failed" && (
-        <div
-          style={{
-            position: "absolute",
-            top: 0,
-            left: 0,
-            right: 0,
-            height: 3,
-            background: "var(--c-textError)",
-          }}
-        />
-      )}
-
-      {/* Corner buttons — hover-only, fade in. Retry is always-visible for
-          failed cards so users notice them; the × is hover-only. */}
-      {(onRemove || (onRetry && status === "failed")) && (
+      {(onRemove || (onRetry && isFailed)) && (
         <div
           style={{
             position: "absolute",
@@ -298,12 +221,12 @@ export default memo(function DocPreviewCard({
             display: "flex",
             gap: 3,
             zIndex: 2,
-            opacity: hovered || status === "failed" ? 1 : 0,
+            opacity: hovered || isFailed ? 1 : 0,
             transition: "opacity 0.15s",
-            pointerEvents: hovered || status === "failed" ? "auto" : "none",
+            pointerEvents: hovered || isFailed ? "auto" : "none",
           }}
         >
-          {onRetry && status === "failed" && (
+          {onRetry && isFailed && (
             <CornerButton
               title="Retry"
               onClick={(e) => { e.stopPropagation(); onRetry(); }}
@@ -323,84 +246,9 @@ export default memo(function DocPreviewCard({
       )}
 
       <DocPreviewBadge label={badgeLabel} tone={cardBadgeTone} />
-
-      {(ACTIVE_STATUSES.has(status) || status === "failed") && message && (
-        <div
-          style={{
-            position: "absolute",
-            left: 8,
-            right: 8,
-            bottom: 44,
-            padding: "3px 8px",
-            background: "var(--c-bgSoft)",
-            color:
-              status === "failed" ? "var(--c-textError)" : "var(--c-inkSoft)",
-            fontSize: 10,
-            fontWeight: 500,
-            borderRadius: 6,
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-            pointerEvents: "none",
-            fontFamily: "system-ui, sans-serif",
-          }}
-        >
-          {message}
-        </div>
-      )}
     </div>
   );
 });
-
-function TopProgressBar({ mode }) {
-  if (mode === null) return null;
-  if (mode === "indet") {
-    return (
-      <div
-        style={{
-          position: "absolute",
-          top: 0,
-          left: 0,
-          right: 0,
-          height: 3,
-          background: "rgba(0,0,0,0.08)",
-          overflow: "hidden",
-        }}
-      >
-        <div
-          style={{
-            height: "100%",
-            width: "40%",
-            background: C.accent,
-            animation: "doc-card-progress 1.2s ease-in-out infinite",
-          }}
-        />
-        <style>{`@keyframes doc-card-progress { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }`}</style>
-      </div>
-    );
-  }
-  return (
-    <div
-      style={{
-        position: "absolute",
-        top: 0,
-        left: 0,
-        right: 0,
-        height: 3,
-        background: "rgba(0,0,0,0.08)",
-      }}
-    >
-      <div
-        style={{
-          height: "100%",
-          width: `${mode}%`,
-          background: C.accent,
-          transition: "width 0.3s ease",
-        }}
-      />
-    </div>
-  );
-}
 
 function CornerButton({ children, title, onClick }) {
   return (
@@ -431,8 +279,6 @@ function CornerButton({ children, title, onClick }) {
 }
 
 function GenericPagePlaceholder({ filename }) {
-  // Clean fallback for files without a renderable thumbnail (DOCX, XLSX,
-  // TXT, PPT, etc.)
   return (
     <div
       style={{

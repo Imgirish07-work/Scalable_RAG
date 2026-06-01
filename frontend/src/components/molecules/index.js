@@ -10,4 +10,5 @@ export { default as PanelHeader }       from "./PanelHeader";
 export { default as ParamInfoPanel }    from "./ParamInfoPanel";
 export { default as QueryBox }          from "./QueryBox";
 export { default as SourceChip }        from "./SourceChip";
+export { default as UploadJobRow }      from "./UploadJobRow";
 export { default as UploadProgress }    from "./UploadProgress";
