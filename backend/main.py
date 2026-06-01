@@ -23,7 +23,7 @@ from backend.middleware import RequestIDMiddleware
 from backend.repositories.database import dispose_engine
 from backend.services.event_bus import get_event_bus
 from backend.services.orphan_sweeper import OrphanSweeper
-from backend.services.pipeline_factory import build_pipeline
+from backend.services.pipeline_factory import build_query_pipeline
 from backend.settings import backend_settings, storage_settings, worker_settings
 from backend.storage.object_store import get_object_store
 from backend.workers.queue_client import QueueClient
@@ -38,7 +38,7 @@ async def _initialize_pipeline(app: FastAPI) -> None:
     start = time.perf_counter()
     try:
         await get_object_store().ensure_bucket()
-        pipeline = await build_pipeline()
+        pipeline = await build_query_pipeline()
         app.state.pipeline = pipeline
         app.state.ready = True
         logger.info(

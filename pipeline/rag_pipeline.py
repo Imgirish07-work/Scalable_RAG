@@ -2,7 +2,9 @@
 
 import asyncio
 import time
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Literal, Optional
+
+PipelineMode = Literal["query", "ingest"]
 
 from agents.agent_orchestrator import AgentOrchestrator
 from agents.exceptions.agent_exceptions import AgentError
@@ -57,11 +59,13 @@ class RAGPipeline:
         fallback_llm: Optional[BaseLLM] = None,
         store: Optional[QdrantStore] = None,
         cache: Optional[CacheManager] = None,
+        mode: PipelineMode = "query",
     ) -> None:
         self._llm = llm
         self._fallback_llm = fallback_llm
         self._store = store
         self._cache = cache
+        self._mode: PipelineMode = mode
         self._initialized = False
         self._agent_orchestrator: Optional[AgentOrchestrator] = None
         self._collections: dict[str, str] = {}
@@ -74,19 +78,21 @@ class RAGPipeline:
             logger.info("Pipeline already initialized, skipping")
             return
 
-        logger.info("Pipeline initializing subsystems")
+        logger.info("Pipeline initializing subsystems | mode=%s", self._mode)
         init_start = time.perf_counter()
 
         try:
-            if self._llm is None:
-                self._llm = LLMFactory.create_from_settings()
-                logger.info(
-                    "Primary LLM created: %s/%s",
-                    self._llm.provider_name, self._llm.model_name,
-                )
+            # ingest pods skip LLM/cache/agents — they only embed + upsert
+            if self._mode == "query":
+                if self._llm is None:
+                    self._llm = LLMFactory.create_from_settings()
+                    logger.info(
+                        "Primary LLM created: %s/%s",
+                        self._llm.provider_name, self._llm.model_name,
+                    )
 
-            if self._fallback_llm is None:
-                self._fallback_llm = self._try_create_fallback_llm()
+                if self._fallback_llm is None:
+                    self._fallback_llm = self._try_create_fallback_llm()
 
             if self._store is None:
                 self._store = QdrantStore(
@@ -96,11 +102,12 @@ class RAGPipeline:
             await self._store.initialize()
             logger.info("Vector store initialized")
 
-            if self._cache is None and settings.cache_enabled:
-                self._cache = CacheManager(settings)
-            if self._cache:
-                await self._cache.initialize()
-                logger.info("Cache initialized")
+            if self._mode == "query":
+                if self._cache is None and settings.cache_enabled:
+                    self._cache = CacheManager(settings)
+                if self._cache:
+                    await self._cache.initialize()
+                    logger.info("Cache initialized")
 
         except PipelineInitError:
             raise
@@ -173,15 +180,13 @@ class RAGPipeline:
                 except Exception:
                     pass  # non-critical, connection opens on first real query
 
-        results = await asyncio.gather(
-            _warmup_embeddings(),
-            _warmup_splade(),
-            _warmup_qdrant(),
-            _warmup_llm(),
-            return_exceptions=True,
-        )
+        coros = [_warmup_embeddings(), _warmup_splade(), _warmup_qdrant()]
+        warmup_names = ["embedding", "splade", "qdrant"]
+        if self._mode == "query":
+            coros.append(_warmup_llm())
+            warmup_names.append("llm")
 
-        warmup_names = ["embedding", "splade", "qdrant", "llm"]
+        results = await asyncio.gather(*coros, return_exceptions=True)
         for name, result in zip(warmup_names, results):
             if isinstance(result, Exception):
                 logger.warning("Warm-up failed for %s: %s", name, result)

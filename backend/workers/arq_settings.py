@@ -7,7 +7,7 @@ from arq.connections import RedisSettings
 from backend.repositories.database import dispose_engine
 from backend.services.event_bus import get_event_bus
 from backend.services.ingestion_service import IngestionService
-from backend.services.pipeline_factory import build_pipeline
+from backend.services.pipeline_factory import build_ingest_pipeline
 from backend.settings import worker_settings
 from backend.storage.object_store import get_object_store
 from backend.workers.tasks import ingest_document
@@ -33,7 +33,7 @@ async def on_startup(ctx: dict) -> None:
     )
     await get_object_store().ensure_bucket()
 
-    pipeline = await build_pipeline()
+    pipeline = await build_ingest_pipeline()
     ctx["pipeline"] = pipeline
     ctx["ingestion"] = IngestionService(
         object_store=get_object_store(),
