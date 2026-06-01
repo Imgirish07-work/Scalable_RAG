@@ -64,7 +64,7 @@ def _load_sparse_embeddings() -> FastEmbedSparse:
         model_name=_SPARSE_MODEL_NAME,
         batch_size=settings.SPLADE_BATCH_SIZE,
         threads=settings.SPLADE_INTRA_OP_THREADS,
-        providers=_ONNX_PROVIDERS,
+        providers=["CPUExecutionProvider"],
     )
     try:
         active = sparse._model.model.model.get_providers()

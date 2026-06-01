@@ -151,7 +151,7 @@ class RAGPipeline:
 
         # batch warmup forces the GPU to compile kernels for the actual batch shape
         # used during ingestion — otherwise the first real batch pays a 30s+ cold-start tax.
-        _WARMUP_BATCH = [f"warmup chunk {i}" for i in range(32)]
+        _WARMUP_BATCH = [f"warmup chunk {i}" for i in range(100)]
 
         async def _warmup_embeddings() -> None:
             model = await asyncio.to_thread(get_embeddings)
