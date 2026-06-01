@@ -35,6 +35,12 @@ from utils.logger import get_logger
 from vectorstore.embeddings import get_embedding_dimension, get_embeddings, _ONNX_PROVIDERS
 from vectorstore.base_store import BaseVectorStore
 
+# import lazily-evaluated via try/except so vectorstore stays importable from non-backend contexts
+try:
+    from backend.metrics import ingest_batch_duration_seconds as _BATCH_DURATION
+except ImportError:
+    _BATCH_DURATION = None
+
 logger = get_logger(__name__)
 
 SearchMode = Literal["dense", "sparse", "hybrid"]
@@ -477,6 +483,8 @@ class QdrantStore(BaseVectorStore):
                         batch_size=settings.SPLADE_BATCH_SIZE,
                     )
                     _t1 = time.perf_counter()
+                    if _BATCH_DURATION is not None:
+                        _BATCH_DURATION.observe(_t1 - _t0)
                     all_ids.extend(batch_ids)
                     logger.info(
                         "Ingestion batch %d/%d complete: chunks=%d/%d "

@@ -1,9 +1,11 @@
 """POST /v1/query — synchronous RAG query."""
 
+import time
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from backend.dependencies import get_current_user_id, get_pipeline
-from backend.metrics import queries_total
+from backend.metrics import queries_total, query_duration_seconds
 from backend.schemas.query import QueryRequest
 from pipeline.exceptions.pipeline_exceptions import PipelineValidationError
 from pipeline.models.pipeline_request import PipelineQuery
@@ -25,6 +27,7 @@ async def query(
 ) -> RAGResponse:
     """Execute a RAG query and return the answer with optional source chunks."""
     request_id = getattr(request.state, "request_id", None)
+    start = time.perf_counter()
 
     try:
         pipeline_query = PipelineQuery(
@@ -54,10 +57,12 @@ async def query(
         )
 
     try:
-        queries_total.labels(
-            variant=response.rag_variant or "unknown",
-            cache_hit=str(response.cache_hit).lower(),
-        ).inc()
+        variant = response.rag_variant or "unknown"
+        cache_hit = str(response.cache_hit).lower()
+        queries_total.labels(variant=variant, cache_hit=cache_hit).inc()
+        query_duration_seconds.labels(
+            variant=variant, cache_hit=cache_hit,
+        ).observe(time.perf_counter() - start)
     except Exception:
         logger.warning("Failed to record query metric", exc_info=True)
 

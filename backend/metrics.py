@@ -48,3 +48,23 @@ ingest_jobs_inflight = Gauge(
     "rag_ingest_jobs_inflight",
     "Ingest jobs currently being processed by this worker.",
 )
+
+ingest_duration_seconds = Histogram(
+    "rag_ingest_duration_seconds",
+    "End-to-end ingest latency per document, by outcome.",
+    labelnames=("outcome",),
+    buckets=(0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1200),
+)
+
+ingest_batch_duration_seconds = Histogram(
+    "rag_ingest_batch_duration_seconds",
+    "Per-batch embed+upsert latency inside add_documents.",
+    buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120),
+)
+
+query_duration_seconds = Histogram(
+    "rag_query_duration_seconds",
+    "Query latency, by variant and cache outcome.",
+    labelnames=("variant", "cache_hit"),
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30),
+)

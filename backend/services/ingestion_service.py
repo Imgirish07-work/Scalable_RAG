@@ -15,6 +15,7 @@ import magic
 
 from backend.metrics import (
     ingest_chunks_total,
+    ingest_duration_seconds,
     ingest_jobs_failed_total,
     ingest_jobs_inflight,
     ingest_total,
@@ -108,6 +109,9 @@ class IngestionService:
                     existing_id=duplicate_id,
                     publish=publish,
                 )
+                ingest_duration_seconds.labels(outcome="duplicate").observe(
+                    time.perf_counter() - start,
+                )
                 return
 
             async with self._with_repo() as repo:
@@ -133,9 +137,11 @@ class IngestionService:
                 )
                 return
 
-            elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
+            elapsed_s = time.perf_counter() - start
+            elapsed_ms = round(elapsed_s * 1000, 1)
             ingest_total.labels(outcome="ready").inc()
             ingest_chunks_total.inc(ingestion.chunks_stored)
+            ingest_duration_seconds.labels(outcome="ready").observe(elapsed_s)
             await publish(
                 "ready",
                 chunks_count=ingestion.chunks_stored,
@@ -158,6 +164,9 @@ class IngestionService:
                     "Failure handler itself failed | doc_id=%s", doc_id,
                 )
             ingest_total.labels(outcome="failed").inc()
+            ingest_duration_seconds.labels(outcome="failed").observe(
+                time.perf_counter() - start,
+            )
             try:
                 await publish(
                     "failed", reason=type(exc).__name__, message=str(exc),
