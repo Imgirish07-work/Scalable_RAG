@@ -131,24 +131,33 @@ export default function ChatComposer({
               ))}
             </div>
 
-            {activeJobs.length > 0 && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                {activeJobs.map((j) => (
-                  <UploadJobRow
-                    key={j.id}
-                    filename={j.filename}
-                    status={j.status}
-                    phase={j.phase}
-                    progress={j.progress}
-                    chunksProcessed={j.chunksProcessed}
-                    chunksTotal={j.chunksTotal}
-                    message={j.message}
-                    onCancel={() => removeJob(j.id)}
-                    onRetry={j.status === 'failed' ? () => retryJob(j.id) : undefined}
-                  />
-                ))}
-              </div>
-            )}
+            {(() => {
+              const runningJob = activeJobs.find((j) => j.status !== 'queued' && j.status !== 'failed')
+              const queuedCount = jobs.filter((j) => j.status === 'queued').length
+              if (!runningJob && queuedCount === 0) return null
+              return (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  {runningJob && (
+                    <UploadJobRow
+                      key={runningJob.id}
+                      filename={runningJob.filename}
+                      status={runningJob.status}
+                      phase={runningJob.phase}
+                      progress={runningJob.progress}
+                      chunksProcessed={runningJob.chunksProcessed}
+                      chunksTotal={runningJob.chunksTotal}
+                      message={runningJob.message}
+                      onCancel={() => removeJob(runningJob.id)}
+                    />
+                  )}
+                  {queuedCount > 0 && (
+                    <span style={{ fontSize: 11, color: C.inkMuted, padding: '0 2px' }}>
+                      {queuedCount} file{queuedCount > 1 ? 's' : ''} queued
+                    </span>
+                  )}
+                </div>
+              )
+            })()}
 
             <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
               <CollectionPill

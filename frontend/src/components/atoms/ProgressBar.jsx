@@ -4,7 +4,7 @@ import { C } from "../../theme";
 export default memo(function ProgressBar({
   value,
   height        = 6,
-  gradient      = `linear-gradient(90deg, ${C.accent}, #14b8a6)`,
+  gradient      = C.accent,
   indeterminate = false,
   animated      = true,
   style,

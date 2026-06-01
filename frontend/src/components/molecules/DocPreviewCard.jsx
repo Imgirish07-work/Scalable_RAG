@@ -246,6 +246,32 @@ export default memo(function DocPreviewCard({
       )}
 
       <DocPreviewBadge label={badgeLabel} tone={cardBadgeTone} />
+
+      {status && status !== 'ready' && status !== 'failed' && status !== 'duplicate' && (
+        <div style={{
+          position: 'absolute',
+          bottom: 6,
+          left: 0,
+          right: 0,
+          display: 'flex',
+          justifyContent: 'center',
+          zIndex: 3,
+        }}>
+          <span style={{
+            fontSize: 9,
+            fontWeight: 700,
+            letterSpacing: '0.07em',
+            color: '#fff',
+            background: 'rgba(0,0,0,0.68)',
+            backdropFilter: 'blur(4px)',
+            WebkitBackdropFilter: 'blur(4px)',
+            borderRadius: 3,
+            padding: '2px 7px',
+          }}>
+            {status === 'queued' ? 'QUEUED' : 'INGESTING'}
+          </span>
+        </div>
+      )}
     </div>
   );
 });
