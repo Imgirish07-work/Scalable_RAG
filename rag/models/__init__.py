@@ -1,9 +1,4 @@
-"""
-RAG models subpackage — Pydantic request/response DTOs.
-
-Prefer importing from rag/__init__.py (the public API) rather than
-directly from this subpackage.
-"""
+"""RAG models subpackage — Pydantic request/response DTOs."""
 
 from rag.models.rag_request import RAGRequest, RAGConfig, ConversationTurn, MetadataFilter
 from rag.models.rag_response import RAGResponse, RetrievedChunk, ConfidenceScore, RAGTimings

@@ -1,18 +1,6 @@
 import { memo } from "react";
 import { C } from "../../theme";
 
-/**
- * ProgressBar — determinate or indeterminate progress bar atom.
- *
- * Props:
- *   value          — current progress (0–100); omit for indeterminate
- *   height         — bar height in px (default: 6)
- *   gradient       — CSS gradient or color for the fill (default: cyan gradient)
- *   indeterminate  — force indeterminate mode (default: false)
- *   animated       — smooth width transition (default: true)
- *   style          — extra inline styles on the outer track
- *   className      — extra Tailwind classes on the outer track
- */
 export default memo(function ProgressBar({
   value,
   height        = 6,

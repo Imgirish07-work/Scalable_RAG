@@ -48,7 +48,7 @@ async def _initialize_pipeline(app: FastAPI) -> None:
         logger.info("Pipeline initialization cancelled mid-boot")
         raise
     except Exception:
-        # Stay alive in not-ready state so /readyz keeps returning a clean 503.
+        # stay alive in not-ready state so /readyz keeps returning a clean 503
         logger.exception(
             "Pipeline initialization failed — backend will remain not-ready"
         )
@@ -90,7 +90,7 @@ async def lifespan(app: FastAPI):
 
     sweeper.request_stop()
 
-    # Cancel in-flight init before tearing down its dependencies.
+    # cancel in-flight init before tearing down its dependencies
     if not init_task.done():
         init_task.cancel()
     for task in (init_task, sweeper_task):

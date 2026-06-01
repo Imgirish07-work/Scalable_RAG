@@ -1,22 +1,4 @@
-"""
-Splits structure-tagged documents into embedding-ready chunks.
-
-Design:
-    Single-responsibility class (Chunker) that routes each document page to
-    the appropriate splitter based on the structure_type metadata written by
-    StructurePreserver. Post-split steps (filter, deduplicate, enrich, prepend
-    context) run in a fixed pipeline regardless of splitter used.
-
-Chain of Responsibility:
-    Receives List[Document] from StructurePreserver.preserve() →
-    produces chunked, enriched List[Document] → passed to
-    VectorStore.add_documents() for embedding and upsert.
-
-Dependencies:
-    tiktoken, langchain_text_splitters.RecursiveCharacterTextSplitter,
-    langchain_core.documents.Document, config.settings,
-    utils.helpers.hash_text, utils.logger.
-"""
+"""Routes structure-tagged document pages to splitters, then filters and enriches chunks."""
 
 import re
 from typing import Dict, List
@@ -31,24 +13,11 @@ from utils.helpers import hash_text
 
 logger = get_logger(__name__)
 
-# Module-level encoder — tiktoken caches internally; defining it here
-# makes the shared encoding name explicit and avoids repeated lookups.
 _ENCODER = tiktoken.get_encoding("cl100k_base")
 
 
 class Chunker:
-    """Splits cleaned, structure-tagged documents into chunks for embedding.
-
-    Attributes:
-        _chunk_size: Target chunk size in tokens (default 512).
-        _chunk_overlap: Overlap in tokens for standard splits (default 100).
-        _code_chunk_overlap: Higher overlap for code splits (default 150).
-        _min_chunk_tokens: Minimum tokens required to keep a chunk (default 20).
-        _splitter: Standard RecursiveCharacterTextSplitter for paragraphs/headings.
-        _code_splitter: Function-boundary-aware splitter for code pages.
-        _resplit_splitter: Zero-overlap splitter used only to break oversized chunks.
-        _rlm_splitter: Character-based splitter for RLM recursive processing.
-    """
+    """Splits cleaned, structure-tagged documents into chunks for embedding."""
 
     def __init__(self) -> None:
         self._chunk_size: int = settings.chunk_size
@@ -56,7 +25,6 @@ class Chunker:
         self._code_chunk_overlap: int = settings.code_chunk_overlap
         self._min_chunk_tokens: int = settings.min_chunk_tokens
 
-        # Standard splitter for paragraph and heading pages
         self._splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
             encoding_name="cl100k_base",
             chunk_size=self._chunk_size,
@@ -64,7 +32,6 @@ class Chunker:
             separators=["\n\n", "\n", ". ", " ", ""],
         )
 
-        # Code splitter splits at function and class definition boundaries
         self._code_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
             encoding_name="cl100k_base",
             chunk_size=self._chunk_size,
@@ -72,9 +39,7 @@ class Chunker:
             separators=["\nclass ", "\ndef ", "\nasync def ", "\n\n", "\n", " ", ""],
         )
 
-        # Zero-overlap splitter used ONLY to break oversized chunks in _filter_chunks.
-        # Must not use self._splitter here — its 100-token overlap would cause adjacent
-        # sub-chunks to share content, making the LLM see the same text twice.
+        # zero overlap prevents duplicate text across adjacent sub-chunks
         self._resplit_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
             encoding_name="cl100k_base",
             chunk_size=self._chunk_size,
@@ -82,8 +47,6 @@ class Chunker:
             separators=["\n\n", "\n", ". ", " ", ""],
         )
 
-        # RLM splitter for recursive processing (Strategy D) — character-based,
-        # smaller chunks with minimal overlap for recursive summarization
         self._rlm_splitter = RecursiveCharacterTextSplitter(
             chunk_size=settings.max_tokens_per_chunk,
             chunk_overlap=50,
@@ -99,21 +62,8 @@ class Chunker:
             self._min_chunk_tokens,
         )
 
-    # Main entry point
-
     def split_documents(self, documents: List[Document]) -> List[Document]:
-        """Split structure-tagged documents into chunks ready for embedding.
-
-        Processes each page through structure-aware splitting, then applies
-        filtering, deduplication, metadata enrichment, and context prepending
-        in a fixed pipeline order.
-
-        Args:
-            documents: List of Documents from StructurePreserver.preserve().
-
-        Returns:
-            List of chunked, filtered, enriched Documents.
-        """
+        """Split structure-tagged documents into chunks ready for embedding."""
         if not documents:
             logger.info("Chunker received empty document list")
             return []
@@ -143,24 +93,8 @@ class Chunker:
             logger.exception("split_documents failed: %s", e)
             return []
 
-    # Structure-aware routing
-
     def _split_by_structure(self, doc: Document) -> List[Document]:
-        """Route a document page to the correct splitter based on structure_type.
-
-        Routing table:
-            table     → _split_table()    (row-group split, header repeated)
-            code      → _split_code()     (function-boundary split, 150-token overlap)
-            list      → _split_list()     (item-group split, 1-item overlap)
-            heading   → _standard_split() (standard recursive split)
-            paragraph → _standard_split() (standard recursive split)
-
-        Args:
-            doc: Single Document with structure_type set in metadata.
-
-        Returns:
-            List of chunk Documents.
-        """
+        """Route a document page to the correct splitter based on structure_type."""
         structure_type = doc.metadata.get("structure_type", "paragraph")
 
         if structure_type == "table":
@@ -173,32 +107,11 @@ class Chunker:
         return self._standard_split(doc)
 
     def _standard_split(self, doc: Document) -> List[Document]:
-        """Standard recursive character split for paragraphs and headings.
-
-        Args:
-            doc: Document to split.
-
-        Returns:
-            List of chunk Documents.
-        """
+        """Standard recursive character split for paragraphs and headings."""
         return self._splitter.split_documents([doc])
 
-    # Table splitting
-
     def _split_table(self, doc: Document) -> List[Document]:
-        """Split a table page by row groups, repeating the header in each chunk.
-
-        Small table (fits within chunk_size) → kept as a single chunk.
-        Large table (exceeds chunk_size) → split by row groups with the
-        header row prepended to each chunk for context. No row overlap is
-        used — repeating the header is more useful than duplicating rows.
-
-        Args:
-            doc: Document tagged as structure_type='table'.
-
-        Returns:
-            List of chunk Documents.
-        """
+        """Split a table page by row groups, repeating the header in each chunk."""
         token_count = self._count_tokens(doc.page_content)
 
         if token_count <= self._chunk_size:
@@ -221,7 +134,6 @@ class Chunker:
         for row in rows:
             row_tokens = self._count_tokens(row)
 
-            # Current group is full — flush it and start a new group with the header
             if current_tokens + row_tokens > self._chunk_size and len(current_rows) > 1:
                 chunks.append(Document(
                     page_content="\n".join(current_rows),
@@ -233,7 +145,6 @@ class Chunker:
                 current_rows.append(row)
                 current_tokens += row_tokens
 
-        # Flush the final group
         if len(current_rows) > 1:
             chunks.append(Document(
                 page_content="\n".join(current_rows),
@@ -242,21 +153,8 @@ class Chunker:
 
         return chunks if chunks else [doc]
 
-    # Code splitting
-
     def _split_code(self, doc: Document) -> List[Document]:
-        """Split a code page at function and class boundaries.
-
-        Small code block (fits within chunk_size) → kept intact.
-        Large code block (exceeds chunk_size) → split at def/class boundaries
-        with 150-token overlap to preserve function context across chunks.
-
-        Args:
-            doc: Document tagged as structure_type='code'.
-
-        Returns:
-            List of chunk Documents.
-        """
+        """Split a code page at function and class boundaries."""
         if self._count_tokens(doc.page_content) <= self._chunk_size:
             return [doc]
 
@@ -266,21 +164,8 @@ class Chunker:
         )
         return self._code_splitter.split_documents([doc])
 
-    # List splitting
-
     def _split_list(self, doc: Document) -> List[Document]:
-        """Split a list page by item groups with 1-item overlap between groups.
-
-        Small list (fits within chunk_size) → kept as a single chunk.
-        Large list (exceeds chunk_size) → split into item groups where the
-        last item of each group is carried into the next for continuity.
-
-        Args:
-            doc: Document tagged as structure_type='list'.
-
-        Returns:
-            List of chunk Documents.
-        """
+        """Split a list page by item groups with 1-item overlap between groups."""
         token_count = self._count_tokens(doc.page_content)
 
         if token_count <= self._chunk_size:
@@ -292,7 +177,6 @@ class Chunker:
             doc.metadata.get("page", "?"),
         )
 
-        # Split on bullet or numbered list item markers
         items = re.split(
             r"(?=^[\-\•\*]\s|^\d+[\.\)]\s)",
             doc.page_content,
@@ -307,13 +191,11 @@ class Chunker:
         for item in items:
             item_tokens = self._count_tokens(item)
 
-            # Current group is full — flush it and carry the last item forward
             if current_tokens + item_tokens > self._chunk_size and current_items:
                 chunks.append(Document(
                     page_content="".join(current_items),
                     metadata=doc.metadata.copy(),
                 ))
-                # 1-item overlap provides continuity between adjacent chunks
                 last_item = current_items[-1]
                 current_items = [last_item, item]
                 current_tokens = self._count_tokens(last_item) + item_tokens
@@ -321,7 +203,6 @@ class Chunker:
                 current_items.append(item)
                 current_tokens += item_tokens
 
-        # Flush the final group
         if current_items:
             chunks.append(Document(
                 page_content="".join(current_items),
@@ -330,38 +211,12 @@ class Chunker:
 
         return chunks if chunks else [doc]
 
-    # Post-split processing
-
-    # Alpha ratio threshold for the TOC/index quality gate.
-    # Chunks below this fraction of alphabetic characters are likely
-    # index entries or page-number lists rather than prose content.
     _MIN_ALPHA_RATIO: float = 0.40
-    # Only apply the alpha gate to short chunks — long chunks with low alpha
-    # are more likely to be legitimate code or data tables.
+    # alpha gate only applied to short chunks; long low-alpha chunks are likely code/data tables
     _ALPHA_GATE_MAX_TOKENS: int = 60
 
     def _filter_chunks(self, chunks: List[Document]) -> List[Document]:
-        """Remove low-quality chunks and attempt to break oversized ones.
-
-        Filters applied in order:
-            empty       → blank content after strip
-            too short   → token_count < min_chunk_tokens
-            boilerplate → standalone page numbers, copyright lines
-            alpha gate  → alpha_ratio < 0.40 AND token_count < 60
-                          (catches TOC/index entries that pass the token minimum)
-
-        Oversized chunks (> chunk_size tokens) are re-split with the zero-overlap
-        splitter. If re-splitting produces more than one sub-chunk, those pass
-        through basic quality checks and replace the original. If re-splitting
-        cannot break the chunk (single indivisible block), it is kept with a
-        warning to avoid silent data loss.
-
-        Args:
-            chunks: List of raw chunks from splitting.
-
-        Returns:
-            Filtered list of chunks.
-        """
+        """Remove low-quality chunks and attempt to break oversized ones."""
         _BOILERPLATE = re.compile(
             r"^(\s*\d+\s*|page\s+\d+|all rights reserved|confidential)$",
             re.IGNORECASE,
@@ -383,9 +238,6 @@ class Chunker:
                 logger.debug("Filtered: boilerplate '%s'", content[:40])
                 continue
 
-            # Alpha ratio gate: drop short chunks dominated by non-alphabetic
-            # characters — these are TOC entries, index pages, or page-number lists
-            # that slipped past the token minimum but carry no semantic value.
             if token_count < self._ALPHA_GATE_MAX_TOKENS and content:
                 alpha_chars = sum(1 for c in content if c.isalpha())
                 alpha_ratio = alpha_chars / len(content)
@@ -399,8 +251,6 @@ class Chunker:
                     )
                     continue
 
-            # Oversized chunks are re-split with zero overlap to prevent the LLM
-            # seeing duplicate content that would appear in overlapping sub-chunks
             if token_count > self._chunk_size:
                 sub_chunks = self._resplit_splitter.split_documents([chunk])
                 if len(sub_chunks) > 1:
@@ -418,7 +268,6 @@ class Chunker:
                         chunk.metadata.get("source", "?"),
                     )
                     continue
-                # Re-split ineffective — keep the oversized chunk rather than lose it
                 logger.warning(
                     "Oversized chunk kept (%d > %d tokens) — re-split ineffective: source=%s",
                     token_count,
@@ -435,20 +284,7 @@ class Chunker:
         chunks: List[Document],
         seen_hashes: set,
     ) -> List[Document]:
-        """Remove duplicate chunks using SHA-256 content hashing.
-
-        Uses hash_text() from utils/helpers.py so fingerprints are consistent
-        with cache keys and other project identifiers. seen_hashes is shared
-        across all pages in a single split_documents() call, catching
-        cross-page duplicates as well as within-page ones.
-
-        Args:
-            chunks: List of chunks to deduplicate.
-            seen_hashes: Shared set of already-seen content hashes.
-
-        Returns:
-            List of unique chunks.
-        """
+        """Remove duplicate chunks using SHA-256 content hashing."""
         unique = []
         for chunk in chunks:
             content_hash = hash_text(chunk.page_content)
@@ -467,22 +303,7 @@ class Chunker:
         chunks: List[Document],
         source_doc: Document,
     ) -> List[Document]:
-        """Add computed metadata fields to each chunk.
-
-        Fields added:
-            chunk_index  → position within the source page (0-based).
-            word_count   → word count of the chunk content.
-            token_count  → exact tiktoken token count.
-            doc_type     → file extension derived from the source path.
-            chunk_id     → SHA-256 hash of the content for deduplication.
-
-        Args:
-            chunks: List of chunks to enrich.
-            source_doc: Original source document (used to derive doc_type).
-
-        Returns:
-            Same chunks with enriched metadata in-place.
-        """
+        """Add computed metadata fields to each chunk."""
         source = source_doc.metadata.get("source", "")
         doc_type = source.split(".")[-1].lower() if "." in source else "unknown"
 
@@ -499,26 +320,10 @@ class Chunker:
         return chunks
 
     def _prepend_context(self, chunks: List[Document]) -> List[Document]:
-        """Prepend title and section context for richer embedding vectors.
-
-        Writes to metadata['embed_content'] — used by VectorStore for
-        embedding. The original page_content is kept unchanged for LLM
-        answer generation, preventing context bleed into the answer text.
-
-        Result format:
-            embed_content = "Title: report.pdf | Section: Introduction\\n{content}"
-            page_content  = original clean text (unchanged)
-
-        Args:
-            chunks: List of chunks to add context to.
-
-        Returns:
-            Same chunks with embed_content added to metadata.
-        """
+        """Prepend title and section context to embed_content for richer embedding vectors."""
         for chunk in chunks:
             source = chunk.metadata.get("source", "unknown")
             section = chunk.metadata.get("section", "unknown")
-            # Extract filename only — handles both forward-slash and backslash paths
             title = source.split("/")[-1].split("\\")[-1]
 
             chunk.metadata["embed_content"] = (
@@ -529,18 +334,7 @@ class Chunker:
         return chunks
 
     def _add_total_chunks(self, all_chunks: List[Document]) -> List[Document]:
-        """Add a total_chunks count per source document to every chunk's metadata.
-
-        Runs after all pages are processed so the full per-source count is
-        available. Groups chunks by source path, counts them, then writes
-        total_chunks back to each chunk.
-
-        Args:
-            all_chunks: Complete list of all chunks from all pages.
-
-        Returns:
-            Same chunks with total_chunks added to metadata.
-        """
+        """Add a total_chunks count per source document to every chunk's metadata."""
         source_counts: Dict[str, int] = {}
         for chunk in all_chunks:
             source = chunk.metadata.get("source", "unknown")
@@ -552,32 +346,12 @@ class Chunker:
 
         return all_chunks
 
-    # Token counting
-
     def _count_tokens(self, text: str) -> int:
-        """Count tokens using the cl100k_base tiktoken encoder.
-
-        Args:
-            text: Text to tokenize.
-
-        Returns:
-            Token count as an integer.
-        """
+        """Count tokens using the cl100k_base tiktoken encoder."""
         return len(_ENCODER.encode(text))
 
-    # Public utility methods
-
     def split_by_character(self, text: str) -> List[str]:
-        """Split raw text using the standard recursive splitter (Strategy B).
-
-        Suitable for general RAG ingestion of PDFs, DOCX, and plain text.
-
-        Args:
-            text: Raw text to split.
-
-        Returns:
-            List of chunk strings.
-        """
+        """Split raw text using the standard recursive splitter."""
         if not text or not text.strip():
             logger.warning("split_by_character received empty text")
             return []
@@ -591,17 +365,7 @@ class Chunker:
             return []
 
     def split_for_rlm(self, text: str) -> List[str]:
-        """Split raw text for RLM recursive processing (Strategy D).
-
-        Uses smaller chunks with minimal overlap to support recursive
-        summarization without accumulating duplicate context.
-
-        Args:
-            text: Raw text to split.
-
-        Returns:
-            List of chunk strings.
-        """
+        """Split raw text for RLM recursive processing."""
         if not text or not text.strip():
             logger.warning("split_for_rlm received empty text")
             return []
@@ -615,18 +379,7 @@ class Chunker:
             return []
 
     def chunk_stats(self, chunks: list) -> dict:
-        """Return summary statistics for a list of chunks.
-
-        Accepts both List[Document] and List[str]. Useful for debugging
-        and pipeline validation after splitting.
-
-        Args:
-            chunks: List of Document objects or raw strings.
-
-        Returns:
-            Dict with count, min/max/avg chars, min/max/avg tokens,
-            and a list of unique structure_type values (Documents only).
-        """
+        """Return summary statistics for a list of chunks (accepts Documents or strings)."""
         if not chunks:
             return {
                 "count": 0,
@@ -640,7 +393,6 @@ class Chunker:
                 "structure_types": [],
             }
 
-        # Support both Document objects and plain strings
         is_documents = hasattr(chunks[0], "metadata")
 
         if is_documents:

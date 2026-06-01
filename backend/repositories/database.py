@@ -1,8 +1,4 @@
-"""Async SQLAlchemy engine, session factory, and transactional helpers.
-
-The engine is created lazily on first use so the process can boot without a
-database when the auth/persistence layer is not yet wired up.
-"""
+"""Async SQLAlchemy engine, session factory, and transactional helpers; engine is created lazily so the process can boot without a database."""
 
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -61,11 +57,7 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 
 
 async def get_db_session() -> AsyncIterator[AsyncSession]:
-    """Per-request DB session for FastAPI; commits on success, rolls back on error.
-
-    Use via `Depends(get_db_session)` in controllers, or via repositories that
-    accept the session as a constructor argument.
-    """
+    """Per-request DB session for FastAPI; commits on success, rolls back on error."""
     factory = get_session_factory()
     async with factory() as session:
         try:

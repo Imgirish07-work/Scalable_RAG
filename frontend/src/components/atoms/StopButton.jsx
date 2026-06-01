@@ -1,12 +1,6 @@
 import { memo } from "react";
 import { C } from "../../theme";
 
-/**
- * StopButton — red square button to abort a streaming response.
- *
- * Props:
- *   onClick  — handler
- */
 export default memo(function StopButton({ onClick, style }) {
   return (
     <button

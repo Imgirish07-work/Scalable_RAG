@@ -1,28 +1,4 @@
-"""
-Factory for creating RAG variant instances with injected dependencies.
-
-Design:
-    Registry-based factory pattern. A class-level dict maps variant name
-    strings to their implementation classes. Adding a new variant is one
-    line in the registry — nothing else changes. All public methods are
-    classmethods; the factory is never instantiated. The factory handles
-    two separate concerns: which RAG variant to use and which retriever to
-    inject, both resolved from settings or per-request config.
-
-Chain of Responsibility:
-    Called by the pipeline layer → creates BaseRAG variant → injects
-    BaseRetriever, BaseLLM, CacheManager, ContextRanker, ContextAssembler.
-    create_from_settings() uses global settings; create_from_request()
-    resolves variant and retriever from RAGConfig.
-
-Dependencies:
-    rag.variants (SimpleRAG)
-    rag.retrieval (DenseRetriever, HybridRetriever)
-    rag.context (ContextRanker, ContextAssembler)
-    llm.contracts.base_llm (BaseLLM)
-    vectorstore.reranker (get_reranker)
-    config.settings (settings)
-"""
+"""Registry-based factory for RAG variant instances with all dependencies injected."""
 
 from typing import Optional
 
@@ -44,29 +20,16 @@ logger = get_logger(__name__)
 
 
 class RAGFactory:
-    """Factory for creating RAG variant instances with all dependencies injected.
+    """Factory for creating RAG variant instances with all dependencies injected."""
 
-    Class-level registries map variant names and retrieval modes to their
-    implementation classes. All public methods are classmethods — no
-    instantiation of RAGFactory itself.
-
-    Attributes:
-        _variant_registry: Dict mapping variant name string to BaseRAG subclass.
-        _retriever_registry: Dict mapping mode name string to BaseRetriever subclass.
-    """
-
-    # Variant registry — maps name → class
     _variant_registry: dict[str, type[BaseRAG]] = {
         "simple": SimpleRAG,
     }
 
-    # Retriever registry — maps mode → class
     _retriever_registry: dict[str, type[BaseRetriever]] = {
         "dense": DenseRetriever,
         "hybrid": HybridRetriever,
     }
-
-    # Public creation methods
 
     @classmethod
     def create(
@@ -79,26 +42,7 @@ class RAGFactory:
         assembler: ContextAssembler | None = None,
         **kwargs,
     ) -> BaseRAG:
-        """Create a RAG variant with pre-built dependencies.
-
-        Use this when the retriever, LLM, and other dependencies have
-        already been constructed by the caller.
-
-        Args:
-            variant_name: Variant to create ('simple').
-            retriever: Pre-built BaseRetriever instance.
-            llm: Pre-built BaseLLM instance.
-            cache: Optional CacheManager instance.
-            ranker: Optional ContextRanker. Default MMR ranker created if None.
-            assembler: Optional ContextAssembler. Default created if None.
-            **kwargs: Extra kwargs forwarded to the variant constructor.
-
-        Returns:
-            BaseRAG instance — always the abstract contract, never concrete.
-
-        Raises:
-            RAGConfigError: If variant_name is not in the registry.
-        """
+        """Create a RAG variant with pre-built dependencies."""
         cleaned = cls._validate_variant(variant_name)
         variant_class = cls._variant_registry[cleaned]
 
@@ -125,22 +69,7 @@ class RAGFactory:
         mode: str = "dense",
         **kwargs,
     ) -> BaseRetriever:
-        """Create a retriever from a QdrantStore and mode string.
-
-        Convenience method so callers do not need to import retriever classes.
-
-        Args:
-            store: QdrantStore instance from vectorstore/qdrant_store.py.
-            mode: Retrieval mode ('dense' or 'hybrid').
-            **kwargs: Extra kwargs forwarded to the retriever constructor.
-                For HybridRetriever: dense_weight, sparse_weight.
-
-        Returns:
-            BaseRetriever instance.
-
-        Raises:
-            RAGConfigError: If mode is not in the retriever registry.
-        """
+        """Create a retriever from a QdrantStore and mode string."""
         cleaned = mode.strip().lower()
 
         if cleaned not in cls._retriever_registry:
@@ -164,28 +93,7 @@ class RAGFactory:
         cache: object | None = None,
         embeddings_fn: object | None = None,
     ) -> BaseRAG:
-        """Create a fully wired RAG instance from global settings.
-
-        Reads RAG_DEFAULT_VARIANT, RAG_RETRIEVAL_MODE, RAG_RERANK_STRATEGY,
-        and RAG_MAX_CONTEXT_TOKENS from settings. Constructs retriever,
-        ranker, assembler, and variant in one call.
-
-        Use this during pipeline startup for zero-config RAG initialization.
-
-        Args:
-            store: QdrantStore instance.
-            llm: BaseLLM instance.
-            cache: Optional CacheManager instance.
-            embeddings_fn: Optional callable returning the embedding model.
-                Required for MMR reranking. Pass get_embeddings from
-                vectorstore/embeddings.py.
-
-        Returns:
-            Fully configured BaseRAG instance.
-
-        Raises:
-            RAGConfigError: If settings contain invalid variant or mode values.
-        """
+        """Create a fully wired RAG instance from global settings."""
         variant_name = getattr(settings, "RAG_DEFAULT_VARIANT", "simple")
         retrieval_mode = getattr(settings, "RAG_RETRIEVAL_MODE", "dense")
         rerank_strategy = getattr(settings, "RAG_RERANK_STRATEGY", "mmr")
@@ -200,10 +108,8 @@ class RAGFactory:
             max_context_tokens,
         )
 
-        # Build retriever
         retriever = cls.create_retriever(store=store, mode=retrieval_mode)
 
-        # Build ranker — inject reranker only when cross_encoder is configured
         top_k = getattr(settings, "RAG_TOP_K", 5)
         reranker = get_reranker() if rerank_strategy == "cross_encoder" else None
         ranker = ContextRanker(
@@ -213,13 +119,11 @@ class RAGFactory:
             top_k=top_k,
         )
 
-        # Build assembler
         assembler = ContextAssembler(
             llm=llm,
             max_tokens=max_context_tokens,
         )
 
-        # Build variant with all wired dependencies
         return cls.create(
             variant_name=variant_name,
             retriever=retriever,
@@ -238,27 +142,7 @@ class RAGFactory:
         cache: object | None = None,
         embeddings_fn: object | None = None,
     ) -> BaseRAG:
-        """Create a RAG instance tailored to a specific request's config.
-
-        Resolves the variant from RAGConfig.resolve_variant(). If
-        config.rag_variant is set, it wins. Otherwise falls back to
-        settings.RAG_DEFAULT_VARIANT (the smart default pattern).
-
-        Use this when different requests need different RAG variants.
-
-        Args:
-            request: RAGRequest whose config carries variant preference.
-            store: QdrantStore instance.
-            llm: BaseLLM instance.
-            cache: Optional CacheManager instance.
-            embeddings_fn: Optional callable for MMR reranking.
-
-        Returns:
-            BaseRAG instance configured for this specific request.
-
-        Raises:
-            RAGConfigError: If the resolved variant is not in the registry.
-        """
+        """Create a RAG instance tailored to a specific request's config."""
         config = request.config
         variant_name = config.resolve_variant()
 
@@ -270,13 +154,11 @@ class RAGFactory:
             request.request_id,
         )
 
-        # Build retriever from request config
         retriever = cls.create_retriever(
             store=store,
             mode=config.retrieval_mode,
         )
 
-        # Build ranker from request config — inject reranker when needed
         reranker = get_reranker() if config.rerank_strategy == "cross_encoder" else None
         ranker = ContextRanker(
             strategy=config.rerank_strategy,
@@ -285,7 +167,6 @@ class RAGFactory:
             top_k=config.top_k,
         )
 
-        # Build assembler from request config
         assembler = ContextAssembler(
             llm=llm,
             max_tokens=config.max_context_tokens,
@@ -300,24 +181,12 @@ class RAGFactory:
             assembler=assembler,
         )
 
-    # Registry management
-
     @classmethod
     def available_variants(cls) -> list[str]:
-        """Return all registered RAG variant names.
-
-        Returns:
-            Sorted list of variant name strings.
-        """
         return sorted(cls._variant_registry.keys())
 
     @classmethod
     def available_retrieval_modes(cls) -> list[str]:
-        """Return all registered retrieval mode names.
-
-        Returns:
-            Sorted list of retrieval mode strings.
-        """
         return sorted(cls._retriever_registry.keys())
 
     @classmethod
@@ -326,18 +195,7 @@ class RAGFactory:
         variant_name: str,
         variant_class: type[BaseRAG],
     ) -> None:
-        """Register a new RAG variant at runtime.
-
-        Allows plugins, tests, or future layers (RLM) to add variants
-        without modifying factory source code.
-
-        Args:
-            variant_name: Unique name string for the new variant.
-            variant_class: Class that extends BaseRAG.
-
-        Raises:
-            RAGConfigError: If variant_class does not extend BaseRAG.
-        """
+        """Register a new RAG variant at runtime."""
         if not (isinstance(variant_class, type) and issubclass(variant_class, BaseRAG)):
             raise RAGConfigError(
                 f"Cannot register '{variant_name}'. "
@@ -348,21 +206,9 @@ class RAGFactory:
         cls._variant_registry[variant_name.strip().lower()] = variant_class
         logger.info("Registered RAG variant | variant=%s", variant_name)
 
-    # Private helpers
-
     @classmethod
     def _validate_variant(cls, variant_name: str) -> str:
-        """Validate a variant name against the registry.
-
-        Args:
-            variant_name: Raw variant name string from the caller.
-
-        Returns:
-            Cleaned lowercase variant name.
-
-        Raises:
-            RAGConfigError: If the name is empty or not in the registry.
-        """
+        """Validate a variant name against the registry."""
         if not variant_name or not variant_name.strip():
             raise RAGConfigError(
                 "Variant name cannot be empty. "

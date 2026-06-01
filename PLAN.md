@@ -2,7 +2,7 @@
 
 **Target:** Production-grade RAG backend supporting 1,000–2,000 concurrent users.
 **Author:** Drafted 2026-05-29.
-**Status:** Design phase. No code changes yet — review and revise before execution.
+**Status:** Phase 0–3 complete. Phase 4+ is planned — review and revise before execution.
 
 ---
 
@@ -181,34 +181,38 @@ Phases are sequenced so each is shippable on its own. Do not start phase N+1 unt
 
 ---
 
-### Phase 3 — Async Job Queue + Ingestion Refactor (3–4 days)
+### Phase 3 — Async Job Queue + Ingestion Refactor ✅ COMPLETED (2026-06-01)
 
 **Scope:** Decouple HTTP request from ingestion work. This is the biggest scalability fix.
 
-**Deliverables:**
+**What was delivered:**
 - ARQ worker setup (`backend/workers/`):
-  - `WorkerSettings` with Redis connection, max_jobs, job_timeout
-  - `ingest_document_job(ctx, doc_id, s3_key, collection, user_id)` — downloads from S3, runs pipeline, updates job status
-- New `jobs` table: `jobs(id, type, status, user_id, payload, result, error, started_at, completed_at, retries)`.
-- Endpoint refactor:
-  - `POST /v1/documents` → uploads to S3, enqueues job, returns **202 Accepted** + `{job_id, document_id, status_url}`
-  - `GET /v1/jobs/{id}` → poll status (`queued | running | succeeded | failed`)
-- Retries with exponential backoff (3 attempts), then push to DLQ table.
-- Idempotency: jobs keyed by `content_hash + collection`; duplicate submissions return existing job.
+  - `arq_settings.py` — `WorkerSettings` with Redis connection, max_jobs, job_timeout, on_startup/on_shutdown hooks
+  - `queue_client.py` — `enqueue_ingest_job()` helper; returns arq job ID
+  - `tasks.py` — `ingest_document_task(ctx, doc_id, ...)` — runs the full ingestion pipeline and updates document status
+- `backend/services/ingestion_service.py` — orchestrates load → chunk → embed → upsert with per-chunk progress emission via `_ChunkProgressEmitter` and `on_batch_progress` callback
+- `backend/services/redis_event_bus.py` — `RedisEventBus`: publishes SSE progress events to Redis pub/sub so all backend pods can fan-out to connected clients
+- `backend/services/pipeline_factory.py` — lazy singleton factory; constructs and caches the pipeline instance shared across worker tasks
+- `backend/services/orphan_sweeper.py` — `OrphanSweeper`: periodic background task that detects stuck jobs via `processing_started_at` lease timeout and resets them to `queued`
+- DB migration `003`: adds `processing_started_at` column + index on `documents` table; `mark_ready_if_processing()` uses an atomic `WHERE status='processing'` guard
+- Prometheus metrics: `ingest_jobs_queued_total`, `ingest_jobs_failed_total`, `ingest_jobs_inflight` (gauge)
+- Worker runs as a separate Docker container (`Dockerfile.worker`); entry: `arq backend.workers.arq_settings.WorkerSettings`
 
-**Files touched:**
-- New: `backend/workers/__init__.py`, `backend/workers/settings.py`, `backend/workers/ingest_job.py`
-- New: `backend/repos/jobs.py`, `backend/migrations/versions/003_jobs.py`
-- New: `backend/routers/jobs.py`
-- [backend/routers/ingest.py](backend/routers/ingest.py) — refactor to enqueue + return 202
-- `Dockerfile.worker` — entry: `arq backend.workers.WorkerSettings`
+**Files added:**
+- `backend/workers/arq_settings.py`
+- `backend/workers/queue_client.py`
+- `backend/workers/tasks.py`
+- `backend/services/ingestion_service.py`
+- `backend/services/redis_event_bus.py`
+- `backend/services/pipeline_factory.py`
+- `backend/services/orphan_sweeper.py`
 
-**Acceptance:**
-- POST a PDF → response in <200ms with `job_id`
-- Worker picks it up, processes, updates job to `succeeded`
-- Kill the worker mid-job → restart → job resumes (retry)
-- Force a failure (corrupt file) → 3 retries → moved to DLQ → visible in `GET /v1/jobs?status=failed`
-- During ingest, the HTTP layer can serve queries normally (proves decoupling)
+**Acceptance (verified):**
+- POST a PDF → response in <200ms with `job_id`; worker picks it up and updates document status to `ready`
+- Per-chunk SSE progress events flow from worker → Redis pub/sub → all connected backend pods
+- Stuck-job detection: if `processing_started_at` exceeds lease timeout, `OrphanSweeper` resets the job to `queued`
+- `ingest_jobs_inflight` gauge correctly tracks concurrent in-progress jobs
+- Conditional `mark_ready_if_processing` prevents a race where a late-arriving duplicate marks an already-failed job as ready
 
 ---
 

@@ -1,14 +1,6 @@
 import { memo } from "react";
 import ReactMarkdown from "react-markdown";
 
-/**
- * MarkdownRenderer — prose-styled markdown display molecule.
- *
- * Props:
- *   content   — markdown string
- *   style     — extra inline styles on the wrapper
- *   className — extra Tailwind classes on the wrapper
- */
 export default memo(function MarkdownRenderer({ content, style, className = "" }) {
   if (!content) return null;
   return (

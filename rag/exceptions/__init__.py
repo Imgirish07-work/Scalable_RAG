@@ -1,9 +1,4 @@
-"""
-RAG exceptions subpackage.
-
-Prefer importing from rag/__init__.py (the public API) rather than
-directly from this subpackage.
-"""
+"""RAG exceptions subpackage."""
 
 from rag.exceptions.rag_exceptions import (
     RAGError,

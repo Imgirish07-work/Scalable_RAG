@@ -1,10 +1,4 @@
-"""SQLAlchemy ORM mapping for the `documents` table.
-
-The class mirrors the schema produced by `001_create_documents.up.sql`. The
-`id` column stores the same UUID v7 value that is also written to Qdrant
-payload as `metadata.doc_id`, so a single identifier links the metadata row
-to its chunks.
-"""
+"""SQLAlchemy ORM mapping for the `documents` table; `id` is the same UUID v7 written to Qdrant payload as `metadata.doc_id`."""
 
 from datetime import datetime
 from typing import Optional
@@ -23,7 +17,7 @@ class Document(Base):
 
     id:             Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True)
     user_id:        Mapped[str] = mapped_column(Text, nullable=False)
-    # NULL while the row is 'pending' — computed during finalize's stream-download.
+    # null while pending; computed during finalize's stream-download
     content_hash:   Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     file_name:      Mapped[str] = mapped_column(Text, nullable=False)
     mime_type:      Mapped[str] = mapped_column(Text, nullable=False)
@@ -44,7 +38,7 @@ class Document(Base):
     updated_at:     Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=text("NOW()"),
     )
-    # Worker lease — set on 'processing', cleared on terminal.
+    # worker lease — set on 'processing', cleared on terminal
     processing_started_at: Mapped[Optional[datetime]] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True,
     )
@@ -52,8 +46,7 @@ class Document(Base):
         TIMESTAMP(timezone=True), nullable=True,
     )
 
-    # Mirror the CHECK constraints defined in the migration so the ORM
-    # rejects invalid values without a round-trip to Postgres.
+    # mirror migration CHECK constraints so ORM rejects bad values without a db round-trip
     __table_args__ = (
         CheckConstraint("size_bytes >= 0", name="documents_size_bytes_nonneg"),
         CheckConstraint(

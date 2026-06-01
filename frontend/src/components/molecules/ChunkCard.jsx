@@ -3,18 +3,6 @@ import { Icon } from "../atoms";
 import fileIcon from "../../Assets/svg/file.svg";
 import { C } from "../../theme";
 
-/**
- * ChunkCard — single retrieved chunk card with filename, score, and animated bar.
- *
- * Props:
- *   source    — { filename, source_url, score }
- *   index     — position in list (for staggered animation)
- *   onOpen    — called with source_url on filename click
- *   scoreType — "Cosine" | "RRF" etc.
- *   maxScore  — highest score in the set (for normalisation)
- *   style     — extra inline styles
- *   className — extra Tailwind classes
- */
 export default memo(function ChunkCard({ source, index = 0, onOpen, scoreType, maxScore, style, className = "" }) {
   const [barWidth, setBarWidth] = useState(0);
   const targetWidth = maxScore > 0 ? (source.score / maxScore) * 100 : 0;

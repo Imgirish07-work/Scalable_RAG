@@ -7,15 +7,6 @@ function getExt(filename) {
   return filename.split(".").pop().toLowerCase();
 }
 
-/**
- * FileCard — compact vertical card showing a file thumbnail with ext badge and remove.
- *
- * Props:
- *   file      — { filename }
- *   onRemove  — called with filename on remove click
- *   style     — extra inline styles
- *   className — extra Tailwind classes
- */
 export default memo(function FileCard({ file, onRemove, style, className = "" }) {
   const ext = getExt(file.filename).toUpperCase().slice(0, 4);
 

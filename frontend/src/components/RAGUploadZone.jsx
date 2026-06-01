@@ -2,14 +2,7 @@ import { useRef, useState } from "react";
 import { Button, ProgressBar } from "./atoms";
 import { C } from "../theme";
 
-/**
- * Drag-and-drop zone for multi-file upload with three inline states:
- *   - idle      → drop / browse affordance
- *   - staged    → drop / browse + Upload button
- *   - uploading → current file progress (drop still works to enqueue more)
- *
- * Pure presentation: the parent owns queue / progress state and passes it in.
- */
+// drop zone with idle / staged / uploading states — parent owns queue/progress state
 export default function RAGUploadZone({
   onAddFiles,
   onStart,

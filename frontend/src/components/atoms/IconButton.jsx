@@ -1,18 +1,6 @@
 import { memo, useState } from "react";
 import { C } from "../../theme";
 
-/**
- * IconButton — small icon-only button atom with hover highlight.
- *
- * Props:
- *   title     — tooltip text
- *   onClick   — click handler
- *   size      — width/height in px (default: 26)
- *   disabled  — disables interaction
- *   style     — extra inline styles
- *   className — extra Tailwind classes
- *   children  — icon content (SVG, emoji, etc.)
- */
 export default memo(function IconButton({
   title,
   onClick,

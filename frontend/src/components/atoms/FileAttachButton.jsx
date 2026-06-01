@@ -2,19 +2,6 @@ import { memo, useRef } from "react";
 import { C } from "../../theme";
 import { ATTACH_ACCEPT, ATTACH_MAX_BYTES, ATTACH_MAX_MB } from "../../utils/attachIcons";
 
-/**
- * FileAttachButton — paperclip icon button with a hidden file input.
- *
- * Props:
- *   onSelect(file)   — required; called with a File object after validation
- *   onError(msg)     — optional; called with an error string if validation fails
- *   accept           — optional; defaults to the shared ATTACH_ACCEPT list
- *   maxBytes         — optional; defaults to the shared ATTACH_MAX_BYTES
- *   active           — optional; visually highlights the button when a file is staged
- *   disabled         — optional
- *   size             — optional pixel size for the button (default 34)
- *   title            — optional tooltip (default mentions accepted types and size)
- */
 export default memo(function FileAttachButton({
   onSelect,
   onError,

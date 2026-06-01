@@ -6,10 +6,6 @@ function getExt(filename) {
   return filename.split(".").pop().toLowerCase();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// FileCard — fixed-width vertical card for the horizontal strip
-// ─────────────────────────────────────────────────────────────────────────────
-
 function FileCard({ file, onRemove }) {
   const ext = getExt(file.filename).toUpperCase().slice(0, 4);
 
@@ -24,7 +20,6 @@ function FileCard({ file, onRemove }) {
         padding: "8px 8px 6px",
       }}
     >
-      {/* Filename */}
       <p
         className="flex-1 text-[10px] font-medium leading-tight min-h-0"
         style={{
@@ -40,7 +35,6 @@ function FileCard({ file, onRemove }) {
         {file.filename}
       </p>
 
-      {/* Footer: type badge + remove button */}
       <div className="flex items-center justify-between mt-2 flex-shrink-0">
         <span
           className="text-[9px] font-medium rounded px-1.5 py-0.5"
@@ -62,10 +56,6 @@ function FileCard({ file, onRemove }) {
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RAGFileList — horizontal scrollable card strip with right fade hint
-// ─────────────────────────────────────────────────────────────────────────────
-
 export default function RAGFileList({ files, onRemove }) {
   const showFade = files.length > 3;
 
@@ -80,7 +70,7 @@ export default function RAGFileList({ files, onRemove }) {
         ))}
       </div>
 
-      {/* Right fade gradient — visible hint that more cards exist */}
+      {/* right fade hints that more cards exist */}
       {showFade && (
         <div
           className="absolute top-0 right-0 bottom-1 pointer-events-none"

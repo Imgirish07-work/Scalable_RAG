@@ -35,8 +35,7 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-# Allowed extension → acceptable MIME values. IngestionService re-verifies
-# the downloaded bytes via python-magic, in case the client lied.
+# IngestionService re-verifies sniffed bytes via python-magic in case the client lied
 _ALLOWED_TYPES: dict[str, set[str]] = {
     ".pdf":  {"application/pdf"},
     ".docx": {

@@ -2,14 +2,6 @@ import { memo } from "react";
 import { C } from "../../theme";
 import { ProgressBar } from "../atoms";
 
-/**
- * UploadProgress — progress bar with stage label molecule.
- *
- * Props:
- *   progress  — { stage, message, batch, total_batches, page, total_pages }
- *   style     — extra inline styles
- *   className — extra Tailwind classes
- */
 export default memo(function UploadProgress({ progress, style, className = "" }) {
   const hasDeterminate =
     (progress.stage === "embedding" && progress.total_batches) ||

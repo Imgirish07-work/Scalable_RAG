@@ -1,18 +1,6 @@
 import { memo } from "react";
 import { C } from "../../theme";
 
-/**
- * Slider — reusable range input with cyan thumb and live value display.
- *
- * Props:
- *   min, max, step   — range config
- *   value            — controlled value (string or number)
- *   onChange(val)    — called on every tick with the raw string value
- *   onCommit(val)    — optional, called on mouseUp / touchEnd (use for API saves)
- *   disabled         — disables interaction
- *   trackWidth       — number (px) for fixed width; omit to use flex: 1
- *   formatValue(val) — display formatter; defaults to String
- */
 export default memo(function Slider({
   min, max, step,
   value,

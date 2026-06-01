@@ -11,9 +11,7 @@ from utils.helpers import (
 )
 
 __all__ = [
-    # Logger
     "get_logger",
-    # Helpers
     "generate_unique_id",
     "hash_text",
     "truncate_text",

@@ -5,10 +5,6 @@ import gearIcon from "../Assets/svg/gear.svg";
 import lightbulbIcon from "../Assets/svg/lightbulb.svg";
 import warningIcon from "../Assets/svg/warning.svg";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Meta helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
 function getTempMeta(val) {
   const v = parseFloat(val);
   if (v <= 0.3) return {
@@ -49,10 +45,6 @@ function getTokenMeta(val) {
   return           { label: "Very long reply",   color: "text-red-400",    detail: "In-depth response — the model will elaborate as much as possible.",      example: "Best for: essays, research summaries, comprehensive documentation." };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal UI primitives
-// ─────────────────────────────────────────────────────────────────────────────
-
 function Tooltip({ text }) {
   return (
     <span className="ml-1 group relative cursor-help text-theme-ink-muted hover:text-theme-ink-soft">
@@ -92,18 +84,7 @@ const TOKEN_PRESETS = [
   { label: "Max",    value: 4096 },
 ];
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RAGParameters — button + popover for Temperature and Max Tokens
-//
-// Props:
-//   temperature        number   current temperature value
-//   setTemperature     fn       local state setter
-//   maxTok             number   current max tokens value
-//   setMaxTok          fn       local state setter
-//   disabled           bool     locks controls while a query is running
-//   onCommit           fn(patch) called when a value should be synced to backend
-// ─────────────────────────────────────────────────────────────────────────────
-
+// button + popover for Temperature and Max Tokens
 export default function RAGParameters({
   temperature,
   setTemperature,
@@ -136,7 +117,7 @@ export default function RAGParameters({
     setOpen(prev => !prev);
   };
 
-  // Close on window resize to avoid stale position
+  // close on window resize to avoid stale position
   useEffect(() => {
     if (!open) return;
     const close = () => setOpen(false);
@@ -146,7 +127,6 @@ export default function RAGParameters({
 
   return (
     <div>
-      {/* Toggle button */}
       <Button
         ref={btnRef}
         onClick={handleToggle}
@@ -159,10 +139,9 @@ export default function RAGParameters({
 
       {open && (
         <>
-          {/* Backdrop */}
           <div onClick={() => setOpen(false)} className="fixed inset-0 z-40" />
 
-          {/* Popover — fixed so overflow:hidden parents don't clip it */}
+          {/* fixed so overflow:hidden parents don't clip it */}
           <div
             style={{ top: pos.top, right: pos.right, maxHeight: pos.maxHeight, background: C.bgDeep, border: `1px solid ${C.line}` }}
             className="fixed z-50 w-96 overflow-y-auto overflow-x-hidden rounded-xl p-5 shadow-2xl
@@ -176,7 +155,6 @@ export default function RAGParameters({
 
             <div className="space-y-3">
 
-              {/* ── Temperature ── */}
               <div className={SECTION_CLS}>
                 <div className="flex items-center justify-between">
                   <label className="text-xs font-medium text-theme-ink">
@@ -206,7 +184,6 @@ export default function RAGParameters({
                   : <p className="text-xs italic text-theme-ink-muted">{tempMeta.tip}</p>}
               </div>
 
-              {/* ── Max Tokens ── */}
               <div className={SECTION_CLS}>
                 <div className="flex items-center justify-between">
                   <label className="text-xs font-medium text-theme-ink">
@@ -231,7 +208,6 @@ export default function RAGParameters({
                   <span>1024 — Medium</span>
                   <span>4096 — Max</span>
                 </div>
-                {/* Preset buttons */}
                 <div className="flex gap-2 mt-1">
                   {TOKEN_PRESETS.map(({ label, value }) => (
                     <Button

@@ -1,11 +1,4 @@
-"""End-to-end exercise of the document service via the live HTTP API.
-
-Runs the full happy path: create session → direct upload to MinIO → finalize
-→ poll until ready → verify in list + collections → soft-delete → verify 404.
-
-Usage (backend must be running and healthy):
-    docker compose exec backend python -m backend.services.test_drive
-"""
+"""End-to-end exercise of the document service via the live HTTP API: session → MinIO PUT → finalize → poll → list/collections → delete → 404."""
 
 import asyncio
 import json
@@ -35,12 +28,7 @@ _POLL_TIMEOUT_S = 120.0
 
 
 async def _upload_directly_to_minio(s3_key: str) -> None:
-    """Simulate the browser-direct PUT, but from inside the docker network.
-
-    Uses the internal `s3_endpoint` so the test works without DNS for the
-    public hostname. The real-browser path (presigned URL → host endpoint)
-    is exercised separately when this code is wired into a UI in step 3.
-    """
+    """Simulate the browser-direct PUT from inside the docker network using the internal s3_endpoint."""
     session = aioboto3.Session()
     async with session.client(
         "s3",
@@ -64,7 +52,7 @@ async def _read_one_sse_event(client: httpx.AsyncClient, doc_id: str) -> dict:
         data_lines: list[str] = []
         async for line in resp.aiter_lines():
             if line.startswith(":"):
-                continue  # keepalive comment
+                continue
             if line.startswith("data:"):
                 data_lines.append(line[len("data:"):].lstrip())
                 continue

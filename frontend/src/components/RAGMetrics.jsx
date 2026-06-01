@@ -1,9 +1,5 @@
 import { C } from "../theme";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MetricChip
-// ─────────────────────────────────────────────────────────────────────────────
-
 function MetricChip({ value, label }) {
   return (
     <div
@@ -23,10 +19,6 @@ function MetricChip({ value, label }) {
     </div>
   );
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Export — props unchanged: chunksFound, latency, avgScore
-// ─────────────────────────────────────────────────────────────────────────────
 
 export default function RAGMetrics({ chunksFound, latency, avgScore }) {
   return (

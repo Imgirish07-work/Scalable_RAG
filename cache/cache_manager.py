@@ -1,35 +1,4 @@
-"""
-Multi-layer LLM response cache orchestrator with hybrid lookup strategy.
-
-Design:
-    CacheManager is the single entry point for all cache operations.
-    It composes two lookup strategies — exact (SHA-256) and semantic
-    (BGE + Qdrant) — over two storage backends: L1 (in-memory LRU)
-    and L2 (Redis). Strategy selection is driven by CACHE_STRATEGY
-    in settings. Quality gate and TTL classifier run on the write path
-    to prevent cache poisoning and tune entry lifetime.
-
-    Hybrid read flow (exact + semantic):
-        L1 exact → L2 exact → Qdrant semantic → miss
-    Write flow:
-        quality gate → L1 set → L2 set → Qdrant index
-
-    When CACHE_STRATEGY='exact':    exact-only (L1 + L2)
-    When CACHE_STRATEGY='semantic': exact first, semantic fallback
-
-Chain of Responsibility:
-    RAGPipeline / BaseRAG.query() calls CacheManager.get() before LLM
-    invocation and CacheManager.set() after. CacheManager delegates to
-    ExactCacheStrategy or SemanticCacheStrategy, which in turn call
-    MemoryCacheBackend (L1) and/or RedisCacheBackend (L2) via
-    CircuitBreaker. QualityGate.check() and TTLClassifier.get_ttl()
-    are called on every write. JsonSerializer encodes/decodes entries.
-
-Dependencies:
-    cache.backend, cache.strategies, cache.serializers,
-    cache.normalizers, cache.quality, cache.models,
-    llm.models.llm_response, utils.helpers, utils.logger
-"""
+"""Multi-layer LLM response cache orchestrator composing exact + semantic strategies over L1/L2 backends."""
 
 import asyncio
 import time
@@ -70,21 +39,7 @@ logger = get_logger(__name__)
 
 
 class CacheManager:
-    """Multi-layer LLM response cache orchestrator with hybrid strategy.
-
-    Attributes:
-        _settings: Application settings (injected).
-        _enabled: Master switch — when False, all operations are no-ops.
-        _l1: L1 in-memory backend (always available).
-        _l2: L2 Redis backend (None if Redis is unavailable).
-        _exact_strategy: SHA-256 exact-match strategy (always available).
-        _semantic_strategy: BGE + Qdrant semantic strategy (None if not configured).
-        _serializer: Entry serializer.
-        _normalizer: Query normalization chain.
-        _metrics: Cumulative performance counters.
-        _in_flight: Request coalescing map keyed by cache key.
-        _initialized: Whether initialize() has been called.
-    """
+    """Multi-layer LLM response cache orchestrator with hybrid strategy."""
 
     def __init__(self, settings: Settings) -> None:
         """Sync constructor — builds components, no I/O."""
@@ -99,7 +54,6 @@ class CacheManager:
         )
         self._l2: Optional[RedisCacheBackend] = None
 
-        # Exact strategy starts with L1 only; L2 is added in initialize()
         self._exact_strategy: ExactCacheStrategy = ExactCacheStrategy(
             normalizer=self._normalizer,
             backends=[self._l1],
@@ -127,15 +81,7 @@ class CacheManager:
         )
 
     async def initialize(self) -> None:
-        """Async initialization — set up all backends and strategies.
-
-        Order:
-            1. L2 Redis (if configured)
-            2. Rebuild exact strategy with all backends
-            3. Semantic strategy (if CACHE_STRATEGY='semantic')
-
-        Must be called once before get()/set(). Safe to call multiple times.
-        """
+        """Async initialization — set up all backends and strategies."""
         if self._initialized:
             logger.debug("CacheManager already initialized, skipping")
             return
@@ -153,12 +99,7 @@ class CacheManager:
 
         await self._initialize_semantic()
 
-        # Promote recent L2 entries into L1 so the first queries after
-        # a restart get sub-millisecond L1 hits instead of Redis round-trips.
         await self._promote_l2_to_l1()
-
-        # Seed semantic Qdrant from L2 entries so paraphrase queries hit
-        # the semantic cache immediately after restart (not just within session).
         await self._seed_semantic_from_l2()
 
         self._initialized = True
@@ -171,7 +112,6 @@ class CacheManager:
         )
 
     async def _initialize_l2(self) -> None:
-        """Attempt to connect to Redis for L2 caching via config factory."""
         config = RedisConfigFactory.create(self._settings)
 
         if config is None:
@@ -195,14 +135,7 @@ class CacheManager:
             self._l2 = None
 
     async def _initialize_semantic(self) -> None:
-        """Initialize semantic strategy if configured.
-
-        Uses get_embeddings() from vectorstore/embeddings.py — same model
-        instance that RAG retrieval uses. No duplicate model loading.
-
-        Non-fatal: if Qdrant or embedding model fails, semantic
-        is disabled and the system falls back to exact-only.
-        """
+        """Initialize semantic strategy if configured; non-fatal on failure."""
         cache_strategy = getattr(self._settings, "CACHE_STRATEGY", "exact")
         if cache_strategy != "semantic":
             logger.info("Semantic strategy disabled — CACHE_STRATEGY='%s'", cache_strategy)
@@ -218,10 +151,7 @@ class CacheManager:
             threshold_high = getattr(
                 self._settings, "CACHE_SEMANTIC_THRESHOLD_HIGH", 0.93
             )
-            # Always use in-memory Qdrant for the semantic cache.
-            # QDRANT_URL is the RAG document corpus (cloud, ~200ms RTT) — it must
-            # NOT be reused here. The semantic cache stores query→key mappings only
-            # (small, ephemeral, ~KB each). In-memory is faster and correct.
+            # in-memory Qdrant required: reusing QDRANT_URL for cache would add ~200ms RTT per lookup
             self._semantic_strategy = await asyncio.to_thread(
                 SemanticCacheStrategy,
                 collection_name=collection,
@@ -239,18 +169,7 @@ class CacheManager:
             self._semantic_strategy = None
 
     async def _promote_l2_to_l1(self, limit: int = 100) -> None:
-        """Warm L1 from L2 at startup to eliminate post-restart cold cache.
-
-        Scans up to `limit` Redis keys, deserializes each entry, skips
-        expired ones, and writes the rest into L1 with remaining TTL.
-
-        Zero LLM cost — purely a Redis scan + memory write.
-        Non-fatal: any failure logs a warning and L1 starts cold instead.
-
-        Args:
-            limit: Max keys to promote. 100 covers typical workloads
-                   without making boot noticeably slower (~100-300ms).
-        """
+        """Warm L1 from L2 at startup to eliminate post-restart cold cache."""
         if self._l2 is None:
             return
 
@@ -279,7 +198,7 @@ class CacheManager:
                     promoted += 1
 
                 except Exception:
-                    continue  # corrupt entry — skip silently
+                    continue
 
             logger.info(
                 "L2→L1 promotion complete: promoted=%d, expired_skipped=%d, scanned=%d",
@@ -295,15 +214,7 @@ class CacheManager:
             )
 
     async def _seed_semantic_from_l2(self) -> None:
-        """Seed semantic Qdrant from L2 entries after restart.
-
-        Re-embeds query_text from each non-expired L2 entry using BGE and
-        upserts the vectors into the in-memory Qdrant collection, so that
-        paraphrase queries can hit the semantic cache immediately rather than
-        only within the session that originally cached the answer.
-
-        Silently skips entries that pre-date the query_text field (None).
-        """
+        """Seed semantic Qdrant from L2 entries after restart."""
         if self._semantic_strategy is None or self._l2 is None:
             return
 
@@ -334,7 +245,7 @@ class CacheManager:
                     logger.debug(
                         "Semantic seeding: skipped key=%s | %s", key[:16], exc
                     )
-                    continue  # corrupt or incompatible entry — skip silently
+                    continue
 
             logger.info(
                 "Semantic Qdrant seeded from L2: seeded=%d, skipped=%d (no query_text)",
@@ -345,8 +256,6 @@ class CacheManager:
         except Exception:
             logger.warning("Semantic seeding failed — semantic cache starts cold", exc_info=True)
 
-    # Read path
-
     async def get(
         self,
         query: str,
@@ -354,24 +263,7 @@ class CacheManager:
         temperature: float,
         system_prompt: str = "",
     ) -> CacheResult:
-        """Look up a cached LLM response.
-
-        Hybrid flow:
-            1. Exact match: L1 → L2 (by SHA-256 key)
-            2. Semantic match: Qdrant → fetch by matched key from L1/L2
-            3. Total miss
-
-        This method NEVER raises exceptions to the caller.
-
-        Args:
-            query: Raw user query.
-            model_name: LLM model identifier.
-            temperature: Generation temperature.
-            system_prompt: System prompt text.
-
-        Returns:
-            CacheResult with hit=True and LLMResponse, or hit=False.
-        """
+        """Look up a cached LLM response; never raises to the caller."""
         start = time.perf_counter()
 
         if not self._enabled:
@@ -387,13 +279,11 @@ class CacheManager:
                 system_prompt_hash=system_prompt_hash,
             )
 
-            # Exact match: L1
             result = await self._try_get_from_l1(key, start)
             if result is not None:
                 self._record_hit_metrics(result)
                 return result
 
-            # Exact match: L2
             if self._l2 is not None:
                 result = await self._try_get_from_l2(key, start)
                 if result is not None:
@@ -401,7 +291,6 @@ class CacheManager:
                     self._record_hit_metrics(result)
                     return result
 
-            # Semantic match (if enabled)
             if self._semantic_strategy is not None:
                 result = await self._try_semantic_lookup(
                     query, model_name, temperature, system_prompt_hash, start
@@ -410,7 +299,6 @@ class CacheManager:
                     self._record_hit_metrics(result)
                     return result
 
-            # Total miss
             latency = self._elapsed_ms(start)
             self._metrics.record_miss(latency)
             logger.debug(
@@ -430,7 +318,6 @@ class CacheManager:
     async def _try_get_from_l1(
         self, key: str, start: float
     ) -> Optional[CacheResult]:
-        """Attempt to read from L1 memory backend."""
         try:
             raw = await self._l1.get(key)
             if raw is None:
@@ -467,7 +354,6 @@ class CacheManager:
     async def _try_get_from_l2(
         self, key: str, start: float
     ) -> Optional[CacheResult]:
-        """Attempt to read from L2 Redis backend."""
         if self._l2 is None:
             return None
 
@@ -518,15 +404,7 @@ class CacheManager:
         system_prompt_hash: str,
         start: float,
     ) -> Optional[CacheResult]:
-        """Attempt semantic similarity match via Qdrant.
-
-        Flow:
-            1. Embed query → search Qdrant → get SimilarityMatch
-            2. Use match.cache_key to fetch from L1 → L2
-            3. Build CacheResult with semantic metadata
-
-        Returns CacheResult on hit, None on miss. Never raises.
-        """
+        """Attempt semantic similarity match via Qdrant; never raises."""
         try:
             match = await self._semantic_strategy.find_similar(
                 query=query,
@@ -540,11 +418,9 @@ class CacheManager:
 
             semantic_key = match.cache_key
 
-            # Fetch the actual entry from L1 using the matched key
             raw = await self._l1.get(semantic_key)
             layer = CacheLayer.L1_MEMORY
 
-            # L1 miss — try L2
             if raw is None and self._l2 is not None:
                 raw = await self._l2.get(semantic_key)
                 layer = CacheLayer.L2_REDIS
@@ -568,14 +444,12 @@ class CacheManager:
             entry.record_hit()
             latency = self._elapsed_ms(start)
 
-            # Map match tier to SemanticTier enum
             tier_map = {
                 "direct": SemanticTier.DIRECT,
                 "high": SemanticTier.HIGH,
             }
             semantic_tier = tier_map.get(match.tier, SemanticTier.HIGH)
 
-            # Promote to L1 if fetched from L2
             if layer == CacheLayer.L2_REDIS:
                 await self._promote_to_l1(semantic_key, CacheResult.from_hit(
                     response=entry.response,
@@ -606,7 +480,6 @@ class CacheManager:
             return None
 
     async def _promote_to_l1(self, key: str, result: CacheResult) -> None:
-        """Copy an L2 hit into L1 for faster subsequent access."""
         if result.response is None:
             return
         try:
@@ -622,8 +495,6 @@ class CacheManager:
         except Exception:
             logger.exception("L1 promotion failed: key=%s", key[:16] + "...")
 
-    # Write path
-
     async def set(
         self,
         query: str,
@@ -635,18 +506,7 @@ class CacheManager:
         sources: list = [],
         confidence_value: float = 0.0,
     ) -> bool:
-        """Cache an LLM response.
-
-        Write flow:
-            1. Quality gate check
-            2. Generate exact key (SHA-256)
-            3. Write to L1 + L2
-            4. Index in Qdrant for semantic lookup (if enabled)
-            5. Record metrics
-
-        Returns:
-            True if written to at least L1.
-        """
+        """Cache an LLM response; returns True if written to at least L1."""
         start = time.perf_counter()
 
         if not self._enabled:
@@ -703,10 +563,8 @@ class CacheManager:
 
             raw = self._serializer.serialize(entry)
 
-            # Write to L1
             await self._l1.set(key, raw, ttl)
 
-            # Write to L2
             if self._l2 is not None:
                 try:
                     await self._l2.set(key, raw, ttl)
@@ -714,7 +572,6 @@ class CacheManager:
                     logger.exception("L2 write failed: key=%s", key[:16] + "...")
                     self._metrics.record_error("l2")
 
-            # Index in Qdrant for semantic lookup
             if self._semantic_strategy is not None:
                 try:
                     await self._semantic_strategy.index_entry(
@@ -745,8 +602,6 @@ class CacheManager:
             logger.exception("Cache set failed: query='%s'", query[:60])
             return False
 
-    # Request coalescing
-
     async def get_or_wait(
         self,
         query: str,
@@ -755,22 +610,7 @@ class CacheManager:
         system_prompt: str = "",
         timeout: float = 10.0,
     ) -> CacheResult:
-        """Cache lookup with request coalescing.
-
-        If a cache miss occurs and another coroutine is already fetching
-        the same key from the LLM, this method waits for that coroutine
-        to complete (up to `timeout` seconds) and then re-checks the cache.
-
-        Args:
-            query: Raw user query.
-            model_name: LLM model identifier.
-            temperature: Generation temperature.
-            system_prompt: System prompt text.
-            timeout: Maximum seconds to wait for an in-flight request.
-
-        Returns:
-            CacheResult — may be a hit if the in-flight request completed.
-        """
+        """Cache lookup with request coalescing; waits on in-flight duplicate LLM calls."""
         if not self._enabled:
             return CacheResult.miss()
 
@@ -817,17 +657,7 @@ class CacheManager:
         temperature: float,
         system_prompt: str = "",
     ) -> None:
-        """Signal that an in-flight LLM call has completed.
-
-        Unblocks any coroutines waiting in get_or_wait() for this key
-        so they can re-check the cache instead of making duplicate LLM calls.
-
-        Args:
-            query: Raw user query.
-            model_name: LLM model identifier.
-            temperature: Generation temperature.
-            system_prompt: System prompt text.
-        """
+        """Signal that an in-flight LLM call has completed, unblocking get_or_wait() waiters."""
         system_prompt_hash = hash_text(system_prompt) if system_prompt else ""
 
         try:
@@ -847,25 +677,16 @@ class CacheManager:
             event.set()
             logger.debug("In-flight resolved: key=%s", key[:16] + "...")
 
-    # Quality gate
-
     def _passes_quality_gate(self, response: LLMResponse) -> bool:
         """Delegate to extracted QualityGate. Kept for backward compatibility."""
         return self._quality_gate.passes(response)
-
-    # Observability
 
     def get_metrics(self) -> dict:
         """Return a snapshot of cache performance metrics."""
         return self._metrics.summary()
 
     async def get_full_stats(self) -> dict:
-        """Return comprehensive stats including backend details.
-
-        Returns:
-            Dict with enabled state, strategy, per-backend stats,
-            semantic collection info, TTL map, and quality gate thresholds.
-        """
+        """Return comprehensive stats including backend, semantic, TTL, and quality gate details."""
         stats = {
             "enabled": self._enabled,
             "initialized": self._initialized,
@@ -896,8 +717,6 @@ class CacheManager:
         stats["in_flight_count"] = len(self._in_flight)
         return stats
 
-    # Admin operations
-
     async def invalidate(
         self,
         query: str,
@@ -905,17 +724,7 @@ class CacheManager:
         temperature: float,
         system_prompt: str = "",
     ) -> bool:
-        """Delete a specific cached entry from all backends.
-
-        Args:
-            query: Raw user query to invalidate.
-            model_name: LLM model identifier.
-            temperature: Generation temperature.
-            system_prompt: System prompt text.
-
-        Returns:
-            True if the key was found and deleted from at least one backend.
-        """
+        """Delete a specific cached entry from all backends; returns True if found in at least one."""
         system_prompt_hash = hash_text(system_prompt) if system_prompt else ""
 
         try:
@@ -950,11 +759,7 @@ class CacheManager:
         return deleted
 
     async def clear_all(self) -> dict:
-        """Clear ALL cached entries from ALL backends.
-
-        Returns:
-            Dict mapping backend name to number of entries removed (-1 on error).
-        """
+        """Clear all entries from all backends; returns per-backend removal counts (-1 on error)."""
         result = {}
 
         try:
@@ -993,7 +798,6 @@ class CacheManager:
             except Exception:
                 logger.exception("Semantic strategy close failed")
 
-        # Release any coroutines blocked in get_or_wait() before exiting
         async with self._in_flight_lock:
             for event in self._in_flight.values():
                 event.set()
@@ -1005,17 +809,8 @@ class CacheManager:
             self._metrics.summary(),
         )
 
-    # Private helpers
-
     def _estimate_cost(self, response: LLMResponse) -> float:
-        """Estimate token cost in USD for a given LLM response.
-
-        Args:
-            response: LLMResponse containing provider and token count.
-
-        Returns:
-            Estimated cost in USD, or 0.0 for unknown providers.
-        """
+        """Estimate token cost in USD; returns 0.0 for unknown providers."""
         tokens = response.tokens_used
         if response.provider == "openai":
             return tokens * self._settings.COST_PER_TOKEN_OPENAI
@@ -1026,11 +821,7 @@ class CacheManager:
         return 0.0
 
     def _record_hit_metrics(self, result: CacheResult) -> None:
-        """Compute token/cost savings from a cache hit and update counters.
-
-        Args:
-            result: The CacheResult that was served from cache.
-        """
+        """Compute token/cost savings from a cache hit and update metrics counters."""
         tokens_saved = 0
         cost_saved = 0.0
 
@@ -1052,18 +843,7 @@ class CacheManager:
         )
 
     def _build_entry_from_result(self, key: str, result: CacheResult) -> CacheEntry:
-        """Construct a CacheEntry for L1 promotion from an existing CacheResult.
-
-        Uses the default TTL from settings since the original TTL is not
-        carried in CacheResult. Intended for L2 → L1 copy only.
-
-        Args:
-            key: The cache key for the entry.
-            result: CacheResult carrying the response to promote.
-
-        Returns:
-            CacheEntry ready for serialization and L1 storage.
-        """
+        """Construct a CacheEntry from a CacheResult for L2 → L1 promotion."""
         ttl = self._settings.cache_ttl_seconds
         now = datetime.now(timezone.utc)
 

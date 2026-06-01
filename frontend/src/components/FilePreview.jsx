@@ -24,8 +24,7 @@ export default function FilePreview({ file, url, filename = '', mimeType = '' })
   const [loading, setLoading] = useState(false)
   const pdfRef = useRef(null)
 
-  // Resolve a usable URL for image/pdf — local File becomes an object URL,
-  // remote stays as-is. Cleanup revokes the blob URL on unmount/change.
+  // local File becomes an object URL; cleanup revokes the blob URL on unmount
   const [resolvedUrl, setResolvedUrl] = useState(null)
   useEffect(() => {
     if (file) {
@@ -37,7 +36,6 @@ export default function FilePreview({ file, url, filename = '', mimeType = '' })
     return undefined
   }, [file, url])
 
-  // Text body — fetch + decode.
   useEffect(() => {
     if (kind !== 'text') return undefined
     let cancelled = false
@@ -64,7 +62,6 @@ export default function FilePreview({ file, url, filename = '', mimeType = '' })
     return () => { cancelled = true }
   }, [kind, file, url])
 
-  // PDF — load pdf.js then render every page into the ref container.
   useEffect(() => {
     if (kind !== 'pdf' || !resolvedUrl) return undefined
     let cancelled = false

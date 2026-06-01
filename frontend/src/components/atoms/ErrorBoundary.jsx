@@ -3,13 +3,6 @@ import { C } from "../../theme";
 import Icon from "./Icon";
 import warningIcon from "../../Assets/svg/warning.svg";
 
-/**
- * ErrorBoundary — catches render errors in children and shows a fallback UI.
- *
- * Props:
- *   fallback  — optional custom fallback (ReactNode or render function receiving { error, reset })
- *   onError   — optional callback(error, errorInfo)
- */
 export default class ErrorBoundary extends Component {
   constructor(props) {
     super(props);

@@ -6,7 +6,7 @@ import { C } from "../theme";
 function ChunkCard({ source, index, onOpen, scoreType, maxScore }) {
   const [barWidth, setBarWidth] = useState(0);
 
-  // Normalize bar width relative to max score in the set so it's always visible
+  // normalize relative to max score so the bar is always visible
   const targetWidth = maxScore > 0 ? (source.score / maxScore) * 100 : 0;
 
   useEffect(() => {

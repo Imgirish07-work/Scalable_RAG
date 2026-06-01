@@ -7,6 +7,8 @@ Quick-reference for the full pipeline architecture. Two entry points:
 
 ## 1. Ingestion Flow
 
+### 1a. Synchronous (legacy / direct pipeline call)
+
 ```
 PDF file
   │
@@ -26,6 +28,71 @@ QdrantStore.upsert()     vectorstore/qdrant_store.py
 ```
 
 **Entry point:** `RAGPipeline.ingest(file_path, collection)`
+
+---
+
+### 1b. Async Ingestion Flow (Phase 3 — current production path)
+
+```
+HTTP POST /v1/ingest  (multipart upload)
+  │
+  ▼
+backend/api/v1/documents.py
+  │  writes document row (status=queued) to Postgres
+  │  calls queue_client.enqueue_ingest_job(doc_id, ...)
+  │  returns 202 Accepted + { job_id, document_id }
+  │
+  ▼ (Redis queue — arq)
+backend/workers/tasks.py  ingest_document_task(ctx, doc_id, ...)
+  │  sets document status=processing, records processing_started_at
+  │
+  ▼
+backend/services/ingestion_service.py  IngestionService.run()
+  │
+  ├─ DocumentCleaner    chunking/document_cleaner.py
+  │    normalizes raw text
+  ├─ StructurePreserver chunking/structure_preserver.py
+  │    preserves headings / tables / lists
+  ├─ Chunker            chunking/chunker.py
+  │    token-bounded chunks with overlap
+  │
+  └─ _ChunkProgressEmitter (on_batch_progress callback)
+       for each batch of embedded chunks:
+         QdrantStore.upsert()    vectorstore/qdrant_store.py
+         RedisEventBus.publish() backend/services/redis_event_bus.py
+           │  emits { doc_id, chunks_done, chunks_total } on Redis pub/sub
+           ▼
+         All backend pods subscribed → SSE push to connected clients
+  │
+  ▼
+mark_ready_if_processing()   atomic WHERE status='processing' guard
+  sets document status=ready in Postgres
+```
+
+**Stuck-job recovery:**
+```
+OrphanSweeper (periodic background task)   backend/services/orphan_sweeper.py
+  │  SELECT documents WHERE status='processing'
+  │    AND processing_started_at < NOW() - lease_timeout
+  └─ resets orphaned rows to status=queued → re-enqueued on next worker poll
+```
+
+**Prometheus metrics emitted during async ingestion:**
+- `ingest_jobs_queued_total` — incremented when a job is enqueued
+- `ingest_jobs_inflight` (gauge) — tracks concurrent in-progress tasks
+- `ingest_jobs_failed_total` — incremented on task exception
+
+**Key files (Phase 3):**
+
+| File | Role |
+|------|------|
+| `backend/workers/arq_settings.py` | ARQ `WorkerSettings`, Redis pool config |
+| `backend/workers/queue_client.py` | `enqueue_ingest_job()` helper |
+| `backend/workers/tasks.py` | `ingest_document_task` arq task |
+| `backend/services/ingestion_service.py` | Orchestrates chunk → embed → upsert |
+| `backend/services/redis_event_bus.py` | Redis pub/sub SSE fan-out |
+| `backend/services/pipeline_factory.py` | Lazy pipeline singleton for workers |
+| `backend/services/orphan_sweeper.py` | Lease-based stuck-job detector |
 
 ---
 
@@ -182,6 +249,10 @@ ProviderHealth             llm/provider_health.py
 | `rag/rag_factory.py`      | Creates `SimpleRAG` with correct retriever   |
 | `agents/agent_orchestrator.py` | Runs the full agent path               |
 | `vectorstore/qdrant_store.py` | All vector DB operations              |
+| `backend/workers/tasks.py` | ARQ task entry point for async ingestion    |
+| `backend/services/ingestion_service.py` | Core ingestion orchestration with progress emission |
+| `backend/services/redis_event_bus.py` | Redis pub/sub fan-out for SSE progress |
+| `backend/services/orphan_sweeper.py` | Stuck-job lease detection and recovery |
 
 ---
 

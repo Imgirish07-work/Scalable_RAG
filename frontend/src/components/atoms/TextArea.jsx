@@ -1,21 +1,6 @@
 import { memo } from "react";
 import { C } from "../../theme";
 
-/**
- * TextArea — labeled textarea atom.
- *
- * Props:
- *   label       — optional label above the textarea
- *   value       — controlled value
- *   onChange(v)  — called with the string value
- *   rows        — visible rows (default: 4)
- *   placeholder — placeholder text
- *   disabled    — disables interaction
- *   mono        — use monospace font (default: false)
- *   resize      — CSS resize value (default: "vertical")
- *   style       — extra inline styles on the textarea
- *   className   — extra Tailwind classes on the textarea
- */
 export default memo(function TextArea({
   label,
   value,

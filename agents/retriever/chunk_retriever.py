@@ -1,22 +1,4 @@
-"""
-ChunkRetriever — retrieval-only executor for agent sub-queries.
-
-Design:
-    Executes each sub-query as a hybrid-retrieve + rerank call with NO LLM
-    generation. Sub-queries run concurrently up to max_concurrent via a
-    semaphore. Individual failures are caught and recorded as failed results
-    so a single bad sub-query never aborts the entire batch.
-
-Chain of Responsibility:
-    AgentOrchestrator → ChunkRetriever.retrieve_all()
-    → asyncio.gather() per sub-query → RAGFactory.create_retriever()
-    → BaseRetriever.retrieve() → ContextRanker.rank()
-    → List[SubQueryResult] returned to orchestrator.
-
-Dependencies:
-    asyncio, agents.models.*, rag.context.context_ranker,
-    rag.rag_factory, config.settings
-"""
+"""Retrieval-only executor for agent sub-queries; runs them concurrently under a semaphore."""
 
 import asyncio
 import time
@@ -32,19 +14,7 @@ logger = get_logger(__name__)
 
 
 class ChunkRetriever:
-    """Executes sub-queries as retrieval-only calls (no LLM generation).
-
-    Builds a fresh retriever per sub-query (lightweight — no model loading)
-    and applies the shared ContextRanker for reranking. Runs sub-queries
-    in parallel bounded by a semaphore.
-
-    Attributes:
-        _store_factory: Async callable returning QdrantStore for a collection.
-        _ranker: Shared ContextRanker instance (reranker + MMR).
-        _retrieval_mode: 'dense' or 'hybrid'.
-        _top_k: Max chunks to return per sub-query after reranking.
-        _semaphore: Controls max concurrent sub-query executions.
-    """
+    """Executes sub-queries as retrieval-only calls (no LLM generation)."""
 
     def __init__(
         self,
@@ -54,15 +24,6 @@ class ChunkRetriever:
         top_k: int = 5,
         max_concurrent: int = 4,
     ) -> None:
-        """Initialize ChunkRetriever.
-
-        Args:
-            store_factory: Async callable: collection_name → QdrantStore.
-            ranker: Shared ContextRanker for reranking retrieved chunks.
-            retrieval_mode: 'dense' or 'hybrid' retrieval.
-            top_k: Max chunks to return per sub-query after reranking.
-            max_concurrent: Max parallel sub-query executions.
-        """
         self._store_factory = store_factory
         self._ranker = ranker
         self._retrieval_mode = retrieval_mode
@@ -76,21 +37,7 @@ class ChunkRetriever:
         user_id: str = "",
         logical_collection: str = "",
     ) -> list[SubQueryResult]:
-        """Execute all sub-query retrievals concurrently.
-
-        Failures in individual sub-queries are caught and converted to
-        SubQueryResult.from_failure() — they never abort the batch.
-
-        Args:
-            sub_queries: Sub-queries from the decomposition plan.
-            parent_request_id: Parent request ID for log tracing.
-            user_id: Tenant filter forwarded to every retriever call.
-            logical_collection: Logical collection ("folder") filter forwarded
-                to every retriever call. Empty string = no logical scope.
-
-        Returns:
-            SubQueryResult per sub-query in the same order as input.
-        """
+        """Execute all sub-query retrievals concurrently."""
         tasks = [
             self._retrieve_with_semaphore(
                 sq, parent_request_id, user_id, logical_collection,
@@ -126,23 +73,13 @@ class ChunkRetriever:
         user_id: str = "",
         logical_collection: str = "",
     ) -> SubQueryResult:
-        """Execute a single sub-query retrieval: fetch → rerank → return chunks.
-
-        Args:
-            sub_query: The sub-query to execute.
-            parent_request_id: Parent request ID for log tracing.
-            user_id: Tenant filter applied at the retriever.
-            logical_collection: Logical-collection filter applied at the retriever.
-
-        Returns:
-            SubQueryResult with retrieved chunks or failure metadata.
-        """
+        """Execute a single sub-query retrieval and rerank."""
         start = time.perf_counter()
 
         try:
             store = await self._store_factory(sub_query.collection)
 
-            # Use retrieval_top_k from ranker — cross_encoder needs more candidates.
+            # cross_encoder needs more candidates so use ranker's retrieval_top_k
             coarse_top_k = self._ranker.retrieval_top_k
             retriever = RAGFactory.create_retriever(
                 store=store,
@@ -157,7 +94,6 @@ class ChunkRetriever:
             )
             ranked_chunks = await self._ranker.rank(raw_chunks, sub_query.query)
 
-            # Cap to configured top_k after reranking.
             final_chunks = ranked_chunks[:self._top_k]
             latency_ms = (time.perf_counter() - start) * 1000
 

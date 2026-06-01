@@ -1,6 +1,3 @@
-/**
- * molecules/index.js — barrel export for all molecule components.
- */
 export { default as AttachmentPill }    from "./AttachmentPill";
 export { default as ChunkCard }         from "./ChunkCard";
 export { default as ConfigRow }         from "./ConfigRow";

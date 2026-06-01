@@ -1,22 +1,7 @@
 import { useRef, useEffect } from "react";
 import { C } from "../../theme";
 
-/**
- * ChatThread — scrollable chat message list organism.
- *
- * Renders an array of messages using caller-supplied render functions for each
- * role, keeping the thread auto-scrolled to the bottom on new messages.
- *
- * Props:
- *   messages          — [{ id, role: "user"|"assistant", content, ... }]
- *   renderUser(msg, i, isLast)      — returns JSX for a user message
- *   renderAssistant(msg, i)         — returns JSX for an assistant message
- *   streamingText     — if truthy, renders a streaming bubble at the bottom
- *   renderStreaming(text)            — returns JSX for the streaming indicator
- *   emptyState        — React node shown when messages is empty
- *   style             — extra inline styles
- *   className         — extra Tailwind classes
- */
+// scrollable chat message list, auto-scrolls to bottom on new messages
 export default function ChatThread({
   messages     = [],
   renderUser,

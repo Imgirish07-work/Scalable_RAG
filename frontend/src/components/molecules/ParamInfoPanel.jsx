@@ -4,15 +4,6 @@ import lightbulbIcon from "../../Assets/svg/lightbulb.svg";
 import warningIcon  from "../../Assets/svg/warning.svg";
 import checkmarkIcon from "../../Assets/svg/checkmark.svg";
 
-/**
- * ParamInfoPanel — expandable detail panel for a model parameter.
- *
- * Props:
- *   meta      — { detail, example, avoid } from getTempMeta / getTokenMeta / getTopPMeta
- *   color     — Tailwind text-color class for the example line (e.g. "text-blue-400")
- *   style     — extra inline styles
- *   className — extra Tailwind classes
- */
 export default memo(function ParamInfoPanel({ meta, color, style, className = "" }) {
   if (!meta?.detail) return null;
 

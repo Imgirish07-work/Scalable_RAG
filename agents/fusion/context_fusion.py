@@ -1,28 +1,4 @@
-"""
-ContextFusion — merges sub-query chunk results into a single coherent context.
-
-Design:
-    Three steps executed in order:
-        1. Slot reservation — guarantee 1 best chunk per non-empty sub-query
-           so no sub-topic is silenced by MMR's diversity pressure.
-        2. MMR on remainder — applies ContextRanker over non-reserved chunks
-           for diversity; deduplication by chunk_id prevents repeats.
-        3. Token budget — ContextAssembler trims the merged set to fit the
-           configured token limit.
-
-    Output is a structured string with [Sub-query N: ...] labels so the
-    synthesis LLM knows which chunks address which sub-topic. Failed
-    sub-queries appear as explicit gap markers in the structured context.
-
-Chain of Responsibility:
-    AgentOrchestrator → ContextFusion.fuse()
-    → (structured_context_str, used_chunks) returned to orchestrator
-    → orchestrator calls strong_llm.chat() with structured_context_str.
-
-Dependencies:
-    rag.context.context_ranker, rag.context.context_assembler,
-    agents.models.agent_response, rag.models.rag_response
-"""
+"""Merges sub-query chunks into a token-bounded structured context with [Sub-query N: ...] labels."""
 
 from agents.models.agent_response import SubQueryResult
 from rag.context.context_assembler import ContextAssembler
@@ -36,27 +12,13 @@ _CHUNK_SEPARATOR = "\n\n---\n\n"
 
 
 class ContextFusion:
-    """Merges chunks from multiple sub-queries into one token-bounded context.
-
-    Guarantees at least one chunk per sub-topic (slot reservation) before
-    MMR diversification and token budget enforcement.
-
-    Attributes:
-        _ranker: ContextRanker for MMR diversification of the remainder pool.
-        _assembler: ContextAssembler for token-bounded context assembly.
-    """
+    """Merges chunks from multiple sub-queries into one token-bounded context."""
 
     def __init__(
         self,
         ranker: ContextRanker,
         assembler: ContextAssembler,
     ) -> None:
-        """Initialize ContextFusion.
-
-        Args:
-            ranker: Shared ContextRanker for MMR diversification.
-            assembler: ContextAssembler for token budget enforcement.
-        """
         self._ranker = ranker
         self._assembler = assembler
 
@@ -65,17 +27,7 @@ class ContextFusion:
         sub_results: list[SubQueryResult],
         query: str,
     ) -> tuple[str, list[RetrievedChunk]]:
-        """Merge sub-query chunks into a token-bounded structured context.
-
-        Args:
-            sub_results: All sub-query results (strong, weak-after-rewrite, failed).
-            query: Original user query used for MMR relevance scoring.
-
-        Returns:
-            Tuple of (structured_context_str, used_chunks).
-            structured_context_str has [Sub-query N: ...] labels per sub-topic.
-            used_chunks is the deduplicated list of chunks that fit the token budget.
-        """
+        """Merge sub-query chunks into a token-bounded structured context."""
         successful = [r for r in sub_results if r.success and r.chunks]
         failed = [r for r in sub_results if not r.success or not r.chunks]
 
@@ -83,8 +35,7 @@ class ContextFusion:
             logger.warning("Context fusion | no successful sub-queries | empty context")
             return "", []
 
-        # Step 1: reserve the best-scored chunk from each successful sub-query.
-        # Sorted descending by reranker_score (fallback to relevance_score).
+        # step 1: reserve best chunk per sub-query so mmr cannot silence a sub-topic
         reserved: list[tuple[SubQueryResult, RetrievedChunk]] = []
         remainder: list[RetrievedChunk] = []
 
@@ -97,7 +48,7 @@ class ContextFusion:
             reserved.append((result, sorted_chunks[0]))
             remainder.extend(sorted_chunks[1:])
 
-        # Step 2: deduplicate remainder against reserved and within itself.
+        # step 2: dedupe remainder
         seen_ids = {chunk.chunk_id for _, chunk in reserved}
         unique_remainder: list[RetrievedChunk] = []
         for chunk in remainder:
@@ -105,19 +56,18 @@ class ContextFusion:
                 seen_ids.add(chunk.chunk_id)
                 unique_remainder.append(chunk)
 
-        # Step 3: apply MMR to remainder for diversity.
+        # step 3: mmr on remainder
         diverse_remainder = (
             await self._ranker.rank(unique_remainder, query)
             if unique_remainder else []
         )
 
-        # Reserved chunks lead — they guarantee sub-topic coverage.
+        # reserved chunks lead to guarantee sub-topic coverage
         all_chunks = [chunk for _, chunk in reserved] + diverse_remainder
 
-        # Step 4: enforce token budget via assembler.
+        # step 4: enforce token budget
         _, used_chunks, tokens_used = await self._assembler.assemble(all_chunks)
 
-        # Step 5: build structured context string with sub-query labels.
         structured_context = _build_structured_context(reserved, used_chunks, failed)
 
         logger.info(
@@ -135,19 +85,7 @@ def _build_structured_context(
     used_chunks: list[RetrievedChunk],
     failed: list[SubQueryResult],
 ) -> str:
-    """Build a context string grouped by sub-query label.
-
-    Labels inform the synthesis LLM which chunks cover which sub-topic.
-    Failed sub-queries appear as explicit gap markers.
-
-    Args:
-        reserved: (sub_result, best_chunk) pairs — one per successful sub-query.
-        used_chunks: All chunks that passed the token budget.
-        failed: Sub-queries with no usable chunks.
-
-    Returns:
-        Structured context string with [Sub-query N: ...] section headers.
-    """
+    """Build a context string grouped by sub-query label."""
     used_ids = {c.chunk_id for c in used_chunks}
     sections: list[str] = []
 

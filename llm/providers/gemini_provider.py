@@ -1,21 +1,4 @@
-"""
-Google Gemini implementation of BaseLLM.
-
-Design:
-    Concrete BaseLLM subclass. Translates all Gemini SDK errors into the
-    LLMError hierarchy before raising, so the pipeline never handles raw
-    SDK exceptions. Includes automatic retry with parsed delay for 429s.
-
-Chain of Responsibility:
-    LLMFactory.create("gemini") instantiates this provider →
-    returned as BaseLLM → BaseRAG.generate() calls generate() or chat() →
-    LLMRateLimiter wraps calls when rate limiting is enabled.
-
-Dependencies:
-    google.genai, google.api_core.exceptions, llm.contracts.base_llm,
-    llm.models.llm_response, llm.exceptions.llm_exceptions,
-    config.settings, utils.logger.
-"""
+"""Google Gemini implementation of BaseLLM with automatic retry on 429."""
 
 import asyncio
 import re
@@ -46,8 +29,7 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Maps Gemini finish_reason enum names to normalized lowercase strings,
-# matching OpenAI's convention so downstream code needs no provider branches.
+# maps gemini finish_reason enum names to normalized lowercase strings
 _GEMINI_FINISH_REASON_MAP = {
     "STOP": "stop",
     "MAX_TOKENS": "length",
@@ -57,24 +39,14 @@ _GEMINI_FINISH_REASON_MAP = {
     "FINISH_REASON_UNSPECIFIED": "unknown",
 }
 
-# Gemini 429 error messages include "Please retry in X.Xs" — parse and honor it.
+# gemini 429 messages include "Please retry in X.Xs" — parse and honor it
 _RETRY_AFTER_PATTERN = re.compile(r"retry in (\d+(?:\.\d+)?)\s*s", re.IGNORECASE)
-_DEFAULT_RETRY_DELAY_S = 65.0   # safe fallback when the delay is not parseable (1-min window)
-_MAX_RATE_LIMIT_RETRIES = 2     # attempt up to 2 retries before raising LLMRateLimitError
+_DEFAULT_RETRY_DELAY_S = 65.0
+_MAX_RATE_LIMIT_RETRIES = 2
 
 
 def _parse_retry_after(error_message: str) -> float:
-    """Extract the retry-after delay from a Gemini 429 error message.
-
-    Parses "Please retry in 37.5s" from ResourceExhausted error text.
-    Adds a 2-second buffer to the parsed delay to avoid an immediate re-hit.
-
-    Args:
-        error_message: Raw exception string from ResourceExhausted.
-
-    Returns:
-        Seconds to wait before retrying.
-    """
+    """Extract retry-after seconds from a Gemini 429 message; adds 2s buffer."""
     match = _RETRY_AFTER_PATTERN.search(error_message)
     if match:
         return float(match.group(1)) + 2.0
@@ -82,16 +54,7 @@ def _parse_retry_after(error_message: str) -> float:
 
 
 class GeminiProvider(BaseLLM):
-    """Google Gemini implementation of BaseLLM.
-
-    Attributes:
-        _client: google.genai.Client instance.
-        _generation_config: Default GenerateContentConfig for API calls.
-        _model: Active model name string.
-        _temperature: Default sampling temperature.
-        _max_tokens: Default max output tokens.
-        _timeout: Request timeout in seconds.
-    """
+    """Google Gemini implementation of BaseLLM."""
 
     def __init__(
         self,
@@ -101,18 +64,7 @@ class GeminiProvider(BaseLLM):
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
     ) -> None:
-        """Initialize the Gemini client and generation config.
-
-        Args:
-            api_key: Gemini API key. Falls back to settings.gemini_api_key.
-            model: Model name. Falls back to settings.gemini_model.
-            temperature: Sampling temperature 0.0–2.0. Falls back to settings.
-            max_tokens: Max tokens in response. Falls back to settings.
-            timeout: Request timeout in seconds. Falls back to settings.
-
-        Raises:
-            LLMAuthError: If no API key is available from args or settings.
-        """
+        """Initialize the Gemini client and generation config."""
         self._api_key = api_key or settings.gemini_api_key
         self._model = model or settings.gemini_model
         self._temperature = (
@@ -143,61 +95,21 @@ class GeminiProvider(BaseLLM):
             self._max_tokens,
         )
 
-    # Properties — required by BaseLLM
-
     @property
     def provider_name(self) -> str:
-        """Returns the provider identifier string 'gemini'."""
         return "gemini"
 
     @property
     def model_name(self) -> str:
-        """Returns the active model name e.g. 'gemini-2.5-flash'."""
         return self._model
 
-    # BaseLLM abstract method implementations
-
     async def generate(self, prompt: str, **kwargs) -> LLMResponse:
-        """Single-turn text generation.
-
-        Args:
-            prompt: Input text prompt.
-            **kwargs: Per-call overrides for temperature or max_tokens.
-
-        Returns:
-            LLMResponse with generated text, token usage, and timing.
-
-        Raises:
-            LLMAuthError: If API key is invalid.
-            LLMRateLimitError: If quota is exceeded.
-            LLMTimeoutError: If request deadline is exceeded.
-            LLMTokenLimitError: If prompt exceeds context window.
-            LLMProviderError: For any other provider-side failure.
-        """
+        """Single-turn text generation."""
         contents = self._build_contents(prompt)
         return await self._call_api(contents, **kwargs)
 
     async def chat(self, messages: List[dict], **kwargs) -> LLMResponse:
-        """Multi-turn conversation with OpenAI-format message input.
-
-        Converts OpenAI-format messages to Gemini format internally.
-
-        Args:
-            messages: List of dicts [{"role": "user", "content": "..."}].
-                Roles: 'user', 'assistant' (→ 'model'), 'system' (→ 'user').
-            **kwargs: Per-call overrides for temperature or max_tokens.
-
-        Returns:
-            LLMResponse with generated text, token usage, and timing.
-
-        Raises:
-            ValueError: If messages list is empty.
-            LLMAuthError: If API key is invalid.
-            LLMRateLimitError: If quota is exceeded.
-            LLMTimeoutError: If request deadline is exceeded.
-            LLMTokenLimitError: If prompt exceeds context window.
-            LLMProviderError: For any other provider-side failure.
-        """
+        """Multi-turn conversation with OpenAI-format message input."""
         if not messages:
             raise ValueError("Messages list cannot be empty.")
 
@@ -205,18 +117,7 @@ class GeminiProvider(BaseLLM):
         return await self._call_api(contents, **kwargs)
 
     async def count_tokens(self, text: str) -> int:
-        """Count tokens using Gemini's native count_tokens API.
-
-        More accurate than tiktoken for Gemini models because it uses the
-        model's actual tokenizer. Makes an API call (I/O-bound).
-        Falls back to a character-based estimate on failure.
-
-        Args:
-            text: Input text to count tokens for.
-
-        Returns:
-            Token count as integer. Returns 0 for empty input.
-        """
+        """Count tokens via Gemini's native API; falls back to char-based estimate on failure."""
         if not text:
             return 0
 
@@ -231,16 +132,11 @@ class GeminiProvider(BaseLLM):
                 "Gemini count_tokens failed, estimating via char count | error=%s",
                 str(exc),
             )
-            # Rough fallback: 1 token ≈ 4 characters
+            # rough fallback: 1 token ~ 4 chars
             return len(text) // 4
 
     async def is_available(self) -> bool:
-        """Health check — send a minimal request to verify API reachability.
-
-        Returns:
-            True if Gemini API responds successfully.
-            False if the health check fails for any reason.
-        """
+        """Health check — send a minimal request to verify API reachability."""
         try:
             await self._client.aio.models.generate_content(
                 model=self._model,
@@ -251,39 +147,18 @@ class GeminiProvider(BaseLLM):
             logger.warning("Gemini health check failed | error=%s", str(exc))
             return False
 
-    # Private methods
-
     async def _call_api(self, contents: list, **kwargs) -> LLMResponse:
-        """Execute the Gemini API call with retry, timing, and error handling.
-
-        Rebuilds the generation config if per-call overrides are provided.
-        Retries up to _MAX_RATE_LIMIT_RETRIES times on ResourceExhausted,
-        honoring the delay parsed from the error message.
-
-        Args:
-            contents: Gemini-formatted message list.
-            **kwargs: Per-call overrides for temperature or max_tokens.
-
-        Returns:
-            LLMResponse with generated text, token usage, and timing.
-
-        Raises:
-            LLMAuthError: If API key is invalid.
-            LLMRateLimitError: If quota is exceeded after all retries.
-            LLMTimeoutError: If request deadline is exceeded.
-            LLMTokenLimitError: If prompt exceeds context window.
-            LLMProviderError: For any other provider-side failure.
-        """
+        """Execute the Gemini API call with retry, timing, and error handling."""
         temperature = kwargs.get("temperature", self._temperature)
         max_tokens = kwargs.get("max_tokens", self._max_tokens)
         response_mime_type = kwargs.get("response_mime_type")
-        # Thinking budget defaults to 0 (disabled) — saves 8-11s per RAG call
+        # thinking budget defaults to 0 — saves 8-11s per call
         thinking_budget = kwargs.get("thinking_budget", 0)
 
         config_kwargs = dict(
             temperature=temperature,
             max_output_tokens=max_tokens,
-            # AFC adds ~200ms overhead and is irrelevant for RAG generation
+            # afc adds ~200ms overhead and is irrelevant for rag generation
             automatic_function_calling=types.AutomaticFunctionCallingConfig(
                 disable=True
             ),
@@ -320,7 +195,7 @@ class GeminiProvider(BaseLLM):
                     )
                     await asyncio.sleep(delay)
                     continue
-                # Retries exhausted — translate and raise
+                # retries exhausted — translate and raise
                 self._handle_error(exc)
 
             except (
@@ -330,7 +205,7 @@ class GeminiProvider(BaseLLM):
                 LLMTokenLimitError,
                 LLMProviderError,
             ):
-                # Already translated — re-raise without double-wrapping
+                # already translated — re-raise without double-wrapping
                 raise
 
             except Exception as exc:
@@ -341,39 +216,20 @@ class GeminiProvider(BaseLLM):
                     str(exc),
                 )
                 self._handle_error(exc)
-                # _handle_error always raises; this line satisfies the type checker
+                # _handle_error always raises; satisfies the type checker
                 raise LLMProviderError(
                     f"Unhandled error in Gemini provider. | {exc}"
                 )
 
-        # Unreachable in practice; satisfies the type checker
+        # unreachable in practice; satisfies the type checker
         raise LLMProviderError(f"Gemini call failed after retries. | {last_exc}")
 
     def _build_contents(self, prompt: str) -> list:
-        """Wrap a plain prompt string into the Gemini contents format.
-
-        Args:
-            prompt: Raw text prompt.
-
-        Returns:
-            Gemini contents list with a single user message.
-        """
+        """Wrap a plain prompt string into the Gemini contents format."""
         return [{"role": "user", "parts": [{"text": prompt}]}]
 
     def _convert_messages(self, messages: List[dict]) -> list:
-        """Convert OpenAI message format to Gemini contents format.
-
-        Mapping:
-            OpenAI 'user'      → Gemini 'user'
-            OpenAI 'assistant' → Gemini 'model'
-            OpenAI 'system'    → Gemini 'user' (Gemini has no system role)
-
-        Args:
-            messages: OpenAI-format message list.
-
-        Returns:
-            Gemini-format contents list.
-        """
+        """Convert OpenAI message format to Gemini contents format."""
         role_map = {
             "user": "user",
             "assistant": "model",
@@ -391,21 +247,7 @@ class GeminiProvider(BaseLLM):
         return contents
 
     def _parse_response(self, response, latency_ms: float) -> LLMResponse:
-        """Parse a raw Gemini API response into a standard LLMResponse.
-
-        Extracts token usage from usage_metadata, normalizes finish_reason
-        from the Gemini enum to a lowercase string, and extracts generated text.
-
-        Args:
-            response: Raw Gemini API response object.
-            latency_ms: Elapsed time for the API call in milliseconds.
-
-        Returns:
-            LLMResponse with normalized fields.
-
-        Raises:
-            LLMProviderError: If the response has no usable text (safety block).
-        """
+        """Parse a raw Gemini API response into a standard LLMResponse."""
         usage = response.usage_metadata
         prompt_tokens = usage.prompt_token_count if usage else 0
         completion_tokens = usage.candidates_token_count if usage else 0
@@ -414,7 +256,7 @@ class GeminiProvider(BaseLLM):
         finish_reason = "unknown"
         if response.candidates:
             raw_reason = response.candidates[0].finish_reason
-            # Handle both enum objects (have .name) and plain strings
+            # handle both enum objects (have .name) and plain strings
             reason_str = (
                 raw_reason.name
                 if hasattr(raw_reason, "name")
@@ -424,7 +266,7 @@ class GeminiProvider(BaseLLM):
                 reason_str, reason_str.lower()
             )
 
-        # response.text raises ValueError if candidates are blocked by safety filters
+        # response.text raises ValueError when candidates are blocked by safety filters
         try:
             text = response.text
         except (ValueError, AttributeError) as exc:
@@ -455,33 +297,16 @@ class GeminiProvider(BaseLLM):
         )
 
     def _handle_error(self, error: Exception) -> None:
-        """Translate Gemini SDK exceptions into the LLMError hierarchy.
-
-        String-based checks run before isinstance checks because some 400
-        errors (e.g. invalid API key) and new SDK ClientError(429) variants
-        are not subclasses of the google.api_core exception types.
-
-        Args:
-            error: Raw exception from the Gemini SDK.
-
-        Raises:
-            LLMAuthError: For authentication failures.
-            LLMRateLimitError: For quota exceeded.
-            LLMTimeoutError: For deadline exceeded.
-            LLMTokenLimitError: For context window exceeded.
-            LLMProviderError: For all other errors.
-        """
+        """Translate Gemini SDK exceptions into the LLMError hierarchy."""
         error_message = str(error).lower()
 
-        # String check first — 400 errors with invalid API key arrive as generic
-        # exceptions, not as Unauthenticated
+        # string check first — 400 errors with invalid api key arrive as generic exceptions
         if "api key not valid" in error_message or "api_key_invalid" in error_message:
             raise LLMAuthError(
                 f"Gemini authentication failed. Check your API key. | {error}"
             ) from error
 
-        # String check before isinstance — new google.genai SDK raises ClientError(429)
-        # which is NOT a subclass of google.api_core.exceptions.ResourceExhausted
+        # string check before isinstance — new sdk raises ClientError(429), not ResourceExhausted
         if "resource_exhausted" in error_message or "quota" in error_message:
             raise LLMRateLimitError(
                 f"Gemini rate limit exceeded. Retry after delay. | {error}"
@@ -513,7 +338,7 @@ class GeminiProvider(BaseLLM):
                 f"Gemini API error occurred. | {error}"
             ) from error
 
-        # Catch-all for unknown errors — still wrap in our hierarchy
+        # catch-all — still wrap in our hierarchy
         raise LLMProviderError(
             f"Unexpected error from Gemini provider. | {error}"
         ) from error

@@ -1,26 +1,4 @@
-"""
-Pydantic response models for RAG queries.
-
-Design:
-    Dataclass-style Pydantic v2 models, frozen where immutability is
-    required. RetrievedChunk is decoupled from LangChain's Document class
-    so LangChain types never leak into the API contract. RAGTimings splits
-    latency into retrieval, ranking, and generation components so operators
-    can identify pipeline bottlenecks without extra profiling. ConfidenceScore
-    carries both value and method so callers always know how confidence was
-    computed. RAGResponse wraps LLMResponse data (not the object itself) and
-    adds RAG-specific fields. Factory classmethods handle construction from
-    cache hits vs fresh generation.
-
-Chain of Responsibility:
-    Constructed by BaseRAG.query() → returned to RAGPipeline → serialized
-    by the FastAPI API layer. from_cache() is called on cache hits;
-    from_generation() is called after the full pipeline completes.
-
-Dependencies:
-    pydantic (BaseModel, ConfigDict, Field, field_validator, model_validator)
-    llm.models.llm_response (LLMResponse)
-"""
+"""Pydantic response models for RAG queries."""
 
 from __future__ import annotations
 
@@ -32,30 +10,7 @@ from llm.models.llm_response import LLMResponse
 
 
 class RetrievedChunk(BaseModel):
-    """A single chunk retrieved from the vector store.
-
-    Decoupled from LangChain's Document class. The from_document()
-    classmethod handles conversion at the retriever boundary. This is
-    what all downstream layers see — never raw LangChain objects.
-
-    Attributes:
-        content: Clean text content (post _restore_original_content).
-        source_file: Original document filename.
-        chunk_id: SHA-256 hash of chunk content (from hash_text()).
-        relevance_score: Cosine similarity score from retrieval (0.0–1.0).
-        section_heading: Section heading from structure_preserver, if any.
-        page_number: Page number from document_loader, if any.
-        content_type: Content type tag (text, code, table, list), if any.
-        used_in_context: True if this chunk was included in the final context
-            sent to the LLM. False if excluded by token budget or ranker.
-        metadata: Catch-all dict for additional chunker metadata not covered
-            by dedicated fields. Future-proofs for arbitrary agent signals.
-        vector: Pre-fetched embedding vector from Qdrant for zero-cost MMR
-            inter-chunk similarity. Excluded from API and cache output.
-        reranker_score: Cross-encoder score (sigmoid 0.0–1.0) from the
-            reranker. None when the reranker was not used. Excluded from
-            API and cache output.
-    """
+    """A single chunk retrieved from the vector store."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -99,18 +54,13 @@ class RetrievedChunk(BaseModel):
         default_factory=dict,
         description="Additional metadata from chunker",
     )
-    # Internal pipeline field — excluded from API/cache serialization.
-    # Carries the pre-fetched Qdrant embedding vector so MMR can compute
-    # inter-chunk similarity without re-embedding (saves ~2-4s per query).
+    # pre-fetched qdrant vector for zero-cost mmr inter-chunk similarity
     vector: list[float] | None = Field(
         default=None,
         exclude=True,
         description="Pre-fetched embedding vector for MMR. Not in API output.",
     )
-    # Internal pipeline field — excluded from API/cache serialization.
-    # Cross-encoder score from the reranker (sigmoid 0.0-1.0). Used by
-    # base_rag.query() to detect low-confidence retrievals before assembling
-    # context. None when reranker was not used (dense/mmr-only paths).
+    # cross-encoder reranker score (sigmoid 0.0-1.0); none when reranker was not used
     reranker_score: float | None = Field(
         default=None,
         exclude=True,
@@ -120,17 +70,7 @@ class RetrievedChunk(BaseModel):
     @field_validator("content")
     @classmethod
     def validate_content_not_blank(cls, value: str) -> str:
-        """Reject blank or whitespace-only content.
-
-        Args:
-            value: Raw content string.
-
-        Returns:
-            Stripped content string.
-
-        Raises:
-            ValueError: If content is whitespace only.
-        """
+        """Reject blank or whitespace-only content."""
         if not value.strip():
             raise ValueError("Chunk content cannot be blank.")
         return value
@@ -142,24 +82,10 @@ class RetrievedChunk(BaseModel):
         relevance_score: float = 0.0,
         vector: list[float] | None = None,
     ) -> "RetrievedChunk":
-        """Convert a LangChain Document to a RetrievedChunk.
-
-        Extracts known metadata fields into dedicated attributes.
-        Any remaining metadata keys go into the catch-all dict.
-
-        Args:
-            doc: LangChain Document with page_content and metadata dict.
-            relevance_score: Cosine similarity score from retrieval.
-            vector: Pre-fetched embedding vector from Qdrant (optional).
-                Forwarded to enable zero-cost MMR diversity scoring.
-
-        Returns:
-            RetrievedChunk instance with all available fields populated.
-        """
+        """Convert a LangChain Document to a RetrievedChunk."""
         meta = getattr(doc, "metadata", {}) or {}
 
-        # Extract known fields from metadata — "vector" excluded so it
-        # doesn't leak into the catch-all extra_metadata dict.
+        # "vector" excluded so it doesn't leak into the catch-all extra_metadata
         known_fields = {
             "source", "source_file", "chunk_id",
             "section_heading", "page_number", "content_type",
@@ -185,17 +111,7 @@ class RetrievedChunk(BaseModel):
 
 
 class ConfidenceScore(BaseModel):
-    """Confidence score paired with the computation method.
-
-    Carrying the method alongside the value lets callers understand the
-    signal quality. Different variants can switch scoring methods without
-    changing the response contract.
-
-    Attributes:
-        value: Confidence score in range 0.0–1.0.
-        method: How the score was computed: retrieval, llm, hybrid,
-            reranker, chain_eval, or cache.
-    """
+    """Confidence score paired with the computation method."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -213,19 +129,7 @@ class ConfidenceScore(BaseModel):
 
 
 class RAGTimings(BaseModel):
-    """Split latency measurements for the RAG pipeline.
-
-    One flat latency_ms number hides whether retrieval or LLM generation
-    is the bottleneck. This model exposes each step separately.
-
-    Attributes:
-        retrieval_ms: Time spent in the retrieve() step.
-        ranking_ms: Time spent in the rank() step (MMR, cross-encoder, etc.).
-        generation_ms: Time spent in the generate() step (LLM call).
-        total_ms: Wall-clock time for the entire query() pipeline.
-            May exceed the sum of individual steps due to overhead in
-            cache checks, context assembly, and serialization.
-    """
+    """Split latency measurements for the RAG pipeline."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -252,31 +156,7 @@ class RAGTimings(BaseModel):
 
 
 class RAGResponse(BaseModel):
-    """Output model for all RAG queries.
-
-    Wraps the LLM-generated answer with retrieval context, timing
-    diagnostics, confidence scoring, and cache metadata. Every RAG
-    variant returns this exact model. Pipeline and agent layers import
-    only RAGResponse — never raw LLMResponse for RAG queries.
-
-    Attributes:
-        answer: The generated answer text.
-        sources: Retrieved chunks with relevance scores and metadata.
-            Empty list when include_sources=False in RAGConfig.
-        timings: Split latency measurements (retrieval, ranking, generation).
-        confidence: Confidence score with computation method.
-        cache_hit: True if the answer was served from cache.
-        cache_layer: Cache layer that served the hit (L1, L2, semantic).
-            None when cache_hit is False.
-        rag_variant: Which variant produced this response.
-        context_tokens_used: Tokens consumed by the assembled context.
-        model_name: LLM model that generated the answer.
-        request_id: Traces back to the originating RAGRequest.
-        prompt_tokens: Input tokens consumed by the LLM call.
-        completion_tokens: Output tokens generated by the LLM call.
-        low_confidence: Flag set when relevance is below threshold.
-            Caller decides how to surface this.
-    """
+    """Output model for all RAG queries."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -337,18 +217,9 @@ class RAGResponse(BaseModel):
         description="Low confidence flag: retrieval relevance below threshold",
     )
 
-    # Cross-field validators
-
     @model_validator(mode="after")
     def validate_cache_layer_consistency(self) -> RAGResponse:
-        """Ensure cache_layer is only set when cache_hit is True.
-
-        Returns:
-            Self if the combination is valid.
-
-        Raises:
-            ValueError: If cache_layer is set but cache_hit is False.
-        """
+        """Ensure cache_layer is only set when cache_hit is True."""
         if self.cache_layer is not None and not self.cache_hit:
             raise ValueError(
                 "cache_layer cannot be set when cache_hit is False. "
@@ -359,22 +230,10 @@ class RAGResponse(BaseModel):
     @field_validator("answer")
     @classmethod
     def validate_answer_not_blank(cls, value: str) -> str:
-        """Reject blank or whitespace-only answers.
-
-        Args:
-            value: Raw answer string.
-
-        Returns:
-            Stripped answer string.
-
-        Raises:
-            ValueError: If answer is whitespace only.
-        """
+        """Reject blank or whitespace-only answers."""
         if not value.strip():
             raise ValueError("Answer cannot be blank or whitespace only.")
         return value
-
-    # Factory classmethods
 
     @classmethod
     def from_cache(
@@ -387,23 +246,7 @@ class RAGResponse(BaseModel):
         sources: list = [],
         confidence_value: float = 0.0,
     ) -> RAGResponse:
-        """Build a RAGResponse from a cached LLMResponse.
-
-        Used by BaseRAG.query() when the cache returns a hit. Retrieval
-        and generation timings are omitted — only cache lookup latency is set.
-
-        Args:
-            cached_response: The LLMResponse retrieved from cache.
-            request_id: Request ID from the originating RAGRequest.
-            rag_variant: Variant configured for this request (informational).
-            cache_layer: Cache layer that served the hit (L1, L2, semantic).
-            lookup_latency_ms: Time spent on the cache lookup.
-            sources: Retrieved chunks restored from the cache entry.
-            confidence_value: Confidence score stored with the cache entry.
-
-        Returns:
-            RAGResponse with cache_hit=True and minimal timings.
-        """
+        """Build a RAGResponse from a cached LLMResponse."""
         return cls(
             answer=cached_response.text,
             sources=sources,
@@ -432,25 +275,7 @@ class RAGResponse(BaseModel):
         context_tokens_used: int = 0,
         low_confidence: bool = False,
     ) -> RAGResponse:
-        """Build a RAGResponse from a fresh LLM generation.
-
-        Used by BaseRAG.query() after the full pipeline completes
-        (retrieve → rank → assemble → generate).
-
-        Args:
-            answer: The generated answer text.
-            llm_response: Raw LLMResponse from the LLM provider.
-            sources: Retrieved chunks with relevance scores.
-            timings: Split latency measurements for the pipeline.
-            confidence: Confidence score with computation method.
-            request_id: Request ID from the originating RAGRequest.
-            rag_variant: Which variant produced this response.
-            context_tokens_used: Tokens consumed by the assembled context.
-            low_confidence: True if the variant flagged below-threshold relevance.
-
-        Returns:
-            RAGResponse with cache_hit=False and full diagnostics.
-        """
+        """Build a RAGResponse from a fresh LLM generation."""
         return cls(
             answer=answer,
             sources=sources,

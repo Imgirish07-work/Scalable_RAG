@@ -122,8 +122,7 @@ class DocumentRepository:
         logger.info("Document soft-deleted | doc_id=%s", doc_id)
 
     async def hard_delete(self, doc_id: str) -> None:
-        """Permanently remove the row. Used on terminal ingestion failure
-        and on the rollback path of a duplicate-detected upload."""
+        """Permanently remove the row; used on terminal failure and duplicate-detected rollback."""
         stmt = delete(Document).where(Document.id == doc_id)
         await self._session.execute(stmt)
         logger.info("Document hard-deleted | doc_id=%s", doc_id)

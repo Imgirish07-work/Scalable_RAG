@@ -1,12 +1,4 @@
-"""End-to-end smoke test for the object store.
-
-Exercises every public path: bucket bootstrap, presigned PUT, real HTTP PUT
-against MinIO, HEAD, streaming download, and idempotent delete. Designed to
-run inside the backend container, against the dev MinIO service.
-
-Usage:
-    docker compose exec backend python -m backend.storage.smoke_test
-"""
+"""End-to-end smoke test for the object store covering bucket bootstrap, presigned PUT, HEAD, streaming download, and idempotent delete."""
 
 import asyncio
 import sys

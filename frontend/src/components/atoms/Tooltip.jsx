@@ -1,16 +1,6 @@
 import { memo } from "react";
 import { C } from "../../theme";
 
-/**
- * Tooltip — hover-reveal info tooltip atom.
- *
- * Props:
- *   text      — tooltip content (string or node)
- *   icon      — trigger element (default: ⓘ)
- *   width     — popup width (default: 224)
- *   style     — extra inline styles on the popup
- *   className — extra Tailwind classes on the wrapper
- */
 export default memo(function Tooltip({
   text,
   icon      = "ⓘ",

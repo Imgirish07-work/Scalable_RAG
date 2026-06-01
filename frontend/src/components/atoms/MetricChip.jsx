@@ -1,15 +1,6 @@
 import { memo } from "react";
 import { C } from "../../theme";
 
-/**
- * MetricChip — value + label stat display atom.
- *
- * Props:
- *   value     — primary display value (string or number)
- *   label     — description below the value
- *   style     — extra inline styles
- *   className — extra Tailwind classes
- */
 export default memo(function MetricChip({
   value,
   label,

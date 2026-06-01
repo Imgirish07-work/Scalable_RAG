@@ -1,6 +1,3 @@
-/**
- * atoms/index.js — barrel export for all atom components.
- */
 export { default as Alert }               from "./Alert";
 export { default as Avatar }              from "./Avatar";
 export { default as Badge }               from "./Badge";

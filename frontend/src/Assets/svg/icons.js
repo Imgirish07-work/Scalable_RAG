@@ -1,10 +1,4 @@
-/**
- * Centralized SVG icon imports for the application.
- * Usage: import { IconClose, IconSearch, ... } from "@/Assets/svg/icons";
- * All SVGs use currentColor so they inherit the parent text color.
- */
-
-// ─── General UI Icons ─────────────────────────────────────────────
+// centralized SVG icon imports — all use currentColor
 export { default as IconClose } from "./close.svg";
 export { default as IconWarning } from "./warning.svg";
 export { default as IconCheck } from "./checkmark.svg";
@@ -35,7 +29,6 @@ export { default as IconAlert } from "./alert.svg";
 export { default as IconBan } from "./ban.svg";
 export { default as IconLightbulb } from "./lightbulb.svg";
 
-// ─── Domain / Category Icons ──────────────────────────────────────
 export { default as IconHealthcare } from "./hospital.svg";
 export { default as IconChart } from "./chart.svg";
 export { default as IconGlobe } from "./globe.svg";
@@ -54,7 +47,6 @@ export { default as IconDocument } from "./document.svg";
 export { default as IconDocLines } from "./doc-lines.svg";
 export { default as IconJsonBracket } from "./json-bracket.svg";
 
-// ─── File Type Icons ──────────────────────────────────────────────
 export { default as IconFilePython } from "./file-python.svg";
 export { default as IconFileJs } from "./file-js.svg";
 export { default as IconFileReact } from "./file-react.svg";

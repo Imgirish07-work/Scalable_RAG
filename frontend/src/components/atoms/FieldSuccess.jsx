@@ -2,15 +2,6 @@ import { memo } from "react";
 import Icon from "./Icon";
 import checkIcon from "../../Assets/svg/checkmark.svg";
 
-/**
- * FieldSuccess — inline validation success message atom.
- *
- * Props:
- *   show      — renders only when truthy
- *   message   — text to display (default: "Looks good!")
- *   style     — extra inline styles
- *   className — extra Tailwind classes
- */
 export default memo(function FieldSuccess({
   show,
   message   = "Looks good!",

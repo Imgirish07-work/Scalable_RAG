@@ -3,21 +3,7 @@ import { C } from "../../theme";
 import Skeleton from "../atoms/Skeleton";
 import Spinner from "../atoms/Spinner";
 
-/**
- * ConfigRow — label + children layout for configuration panels.
- *
- * Props:
- *   label     — row label text
- *   help      — tooltip / title text on hover
- *   border    — show bottom border (default: true)
- *   loading   — initial-load placeholder: replaces the control with a Skeleton
- *   saving    — update-in-flight indicator: small spinner appears next to the
- *               label while the change is being persisted. Distinct from
- *               `loading` because the control still shows its current value.
- *   children  — control element(s) on the right
- *   style     — extra inline styles
- *   className — extra Tailwind classes
- */
+// label + children layout for config panels — loading shows skeleton, saving shows spinner next to label
 export default memo(function ConfigRow({
   label,
   help,

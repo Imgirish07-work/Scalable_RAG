@@ -1,21 +1,4 @@
-"""
-Agent response models.
-
-Design:
-    SubQueryResult captures the outcome of a single sub-query retrieval.
-    Sub-queries in the new architecture perform retrieval-only (no per-query
-    generation). All chunks are fused and a single LLM call generates the
-    final answer. AgentResponse aggregates sub-results and exposes
-    to_rag_response() for callers that don't need agent internals.
-
-Chain of Responsibility:
-    ChunkRetriever produces List[SubQueryResult] → ChunkQualityGate evaluates
-    quality → AgentOrchestrator rewrites weak sub-queries → ContextFusion merges
-    chunks → single LLM generation → AgentResponse → RAGPipeline.to_rag_response().
-
-Dependencies:
-    pydantic, rag.models.rag_response
-"""
+"""Agent response models."""
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -28,21 +11,7 @@ from rag.models.rag_response import (
 
 
 class SubQueryResult(BaseModel):
-    """Result of a single sub-query retrieval (no per-query LLM generation).
-
-    Attributes:
-        sub_query_id: Unique ID for tracing.
-        query: Sub-query text executed (may differ from original if rewritten).
-        collection: Qdrant collection queried.
-        purpose: What this sub-query was meant to resolve.
-        chunks: Retrieved and reranked chunks from the vector store.
-        confidence: Average reranker/relevance score across chunks (0-1).
-        success: True if usable chunks were retrieved.
-        is_weak: True if chunks exist but quality is below threshold.
-                 Weak sub-queries are rewritten once using the fast LLM.
-        failure_reason: Why retrieval failed, populated only when success=False.
-        latency_ms: Retrieval execution time in milliseconds.
-    """
+    """Result of a single sub-query retrieval."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -67,19 +36,7 @@ class SubQueryResult(BaseModel):
         latency_ms: float,
         purpose: str = "",
     ) -> "SubQueryResult":
-        """Create from a successful retrieval result.
-
-        Args:
-            sub_query_id: ID of the originating sub-query.
-            query: The sub-query text (possibly rewritten by the fast LLM).
-            collection: Collection that was queried.
-            chunks: Retrieved and reranked chunks.
-            latency_ms: Execution time in milliseconds.
-            purpose: What this sub-query was meant to resolve.
-
-        Returns:
-            SubQueryResult marked as successful with computed confidence.
-        """
+        """Create from a successful retrieval result."""
         confidence = (
             sum(c.reranker_score if c.reranker_score is not None else c.relevance_score
                 for c in chunks) / len(chunks)
@@ -106,19 +63,7 @@ class SubQueryResult(BaseModel):
         latency_ms: float,
         purpose: str = "",
     ) -> "SubQueryResult":
-        """Create from a failed sub-query retrieval.
-
-        Args:
-            sub_query_id: ID of the originating sub-query.
-            query: The sub-query text.
-            collection: Collection that was queried.
-            reason: Human-readable failure description.
-            latency_ms: Time spent before failure.
-            purpose: What this sub-query was meant to resolve.
-
-        Returns:
-            SubQueryResult marked as failed with empty chunks.
-        """
+        """Create from a failed sub-query retrieval."""
         return cls(
             sub_query_id=sub_query_id,
             query=query,
@@ -131,22 +76,7 @@ class SubQueryResult(BaseModel):
 
 
 class AgentResponse(BaseModel):
-    """Full agent response with sub-query transparency.
-
-    Attributes:
-        answer: Final synthesized answer from the single generation LLM call.
-        sub_results: Retrieval results from each sub-query.
-        plan_reasoning: The planner's decomposition reasoning.
-        confidence: Aggregate confidence across sub-queries.
-        total_sub_queries: Number of sub-queries planned.
-        successful_sub_queries: Number that returned usable chunks.
-        failed_sub_queries: Number that returned no usable chunks.
-        timings: Aggregate timing breakdown.
-        request_id: Parent request ID for tracing.
-        model_name: LLM model used for final synthesis.
-        prompt_tokens: Total prompt tokens (plan + rewrites + synthesis).
-        completion_tokens: Total completion tokens (plan + rewrites + synthesis).
-    """
+    """Full agent response with sub-query transparency."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -171,11 +101,7 @@ class AgentResponse(BaseModel):
     completion_tokens: int = Field(default=0, ge=0)
 
     def to_rag_response(self) -> RAGResponse:
-        """Collapse to a standard RAGResponse for pipeline callers.
-
-        Returns:
-            RAGResponse with the synthesized answer and all source chunks.
-        """
+        """Collapse to a standard RAGResponse for pipeline callers."""
         all_sources = [
             chunk
             for result in self.sub_results

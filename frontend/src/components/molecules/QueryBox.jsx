@@ -5,31 +5,7 @@ import FileAttachButton from "../atoms/FileAttachButton";
 import AttachmentPill from "./AttachmentPill";
 import { C } from "../../theme";
 
-/**
- * QueryBox — text input + Send/Stop button molecule with optional multi-file attachments.
- *
- * Props:
- *   value          — controlled text value
- *   onChange(val)  — called on every keystroke
- *   onSubmit()     — called when Send is clicked or Enter pressed
- *   onStop()       — called when Stop is clicked; if provided, shown during isLoading
- *   isLoading      — shows StopButton instead of SendButton when true
- *   disabled       — disables the input
- *   placeholder    — input placeholder text
- *   inputRef       — optional ref forwarded to the textarea
- *   leftAdornment  — optional element rendered in the action row, far left
- *   rightAdornment — optional element rendered in the action row, before Send
- *   canSubmit      — optional override for the send-button enabled state.
- *                    If undefined, send is enabled when value or attachments exist.
- *
- * Multi-file attachment (opt-in by passing onAttachmentsChange):
- *   attachments              — File[] currently staged
- *   onAttachmentsChange(arr) — called whenever the list changes (add/remove)
- *   attachError              — optional error string from the most recent add attempt
- *   onAttachError(msg)       — optional handler for size/validation errors
- *   attachAccept             — optional accept string (defaults to FileAttachButton's)
- *   attachMaxBytes           — optional max size (defaults to FileAttachButton's)
- */
+// text input + Send/Stop button with optional multi-file attachments
 export default memo(function QueryBox({
   value,
   onChange,
@@ -53,7 +29,7 @@ export default memo(function QueryBox({
   const fileAttachEnabled = typeof onAttachmentsChange === "function";
   const files = Array.isArray(attachments) ? attachments : [];
 
-  // Files alone are not sufficient — the user must also type a prompt.
+  // files alone are not sufficient — user must also type a prompt
   const hasContent = value.trim().length > 0;
   const baseCanSend = canSubmit !== undefined ? canSubmit : hasContent;
   const canSend     = baseCanSend && !isLoading && !disabled;
@@ -87,7 +63,6 @@ export default memo(function QueryBox({
         border: `1.5px solid ${C.lineCard}`,
       }}
     >
-      {/* Staged-attachments row — one pill per file */}
       {fileAttachEnabled && files.length > 0 && (
         <div className="flex flex-wrap gap-1 pt-2 px-4">
           {files.map((f, i) => (
@@ -117,7 +92,6 @@ export default memo(function QueryBox({
         style={{ lineHeight: 1.5, maxHeight: 140 }}
       />
 
-      {/* Bottom action row — attach (left), spacer, right adornments, send/stop */}
       <div className="flex items-center gap-1.5 px-1.5 pb-1.5">
         {fileAttachEnabled && (
           <div className="flex-shrink-0">

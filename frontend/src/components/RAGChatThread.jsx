@@ -3,8 +3,6 @@ import ReactMarkdown from "react-markdown";
 import { C } from "../theme";
 import StreamingCaret from "./atoms/StreamingCaret";
 
-// Private helpers
-
 function SourceChip({ filename, onClick }) {
   const [hovered, setHovered] = useState(false);
   return (
@@ -81,8 +79,6 @@ export function IconRetry() {
   );
 }
 
-// Public exports
-
 export function UserBubble({ msg, copiedId, onCopy, onEdit, disabled }) {
   const [hovered,   setHovered]   = useState(false);
   const [editMode,  setEditMode]  = useState(false);
@@ -155,7 +151,6 @@ export function UserBubble({ msg, copiedId, onCopy, onEdit, disabled }) {
         </div>
       )}
 
-      {/* Action bar — hover reveal, hidden in edit mode or while query runs */}
       {!editMode && (
         <div
           className="flex items-center gap-0.5 justify-end mt-1 transition-opacity duration-150"
@@ -191,7 +186,6 @@ export function AssistantBubble({ msg, copiedId, onCopy, onRetry, disabled }) {
         onMouseLeave={() => setHovered(false)}
       >
 
-      {/* Answer body */}
       <div
         className="prose prose-invert prose-sm max-w-none text-sm leading-relaxed"
         style={{ color: C.ink }}
@@ -205,7 +199,6 @@ export function AssistantBubble({ msg, copiedId, onCopy, onRetry, disabled }) {
         >{msg.content}</ReactMarkdown>
       </div>
 
-      {/* Source chips */}
       {uniqueSources.length > 0 && (
         <div className="flex flex-wrap gap-2">
           {uniqueSources.map((s, i) => (
@@ -214,7 +207,6 @@ export function AssistantBubble({ msg, copiedId, onCopy, onRetry, disabled }) {
         </div>
       )}
 
-      {/* Action bar — hover reveal */}
       <div
         className="flex items-center gap-0.5 transition-opacity duration-150"
         style={{ opacity: hovered && !disabled ? 1 : 0, pointerEvents: hovered && !disabled ? "auto" : "none" }}

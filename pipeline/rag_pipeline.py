@@ -1,29 +1,9 @@
-"""
-RAGPipeline — single entry point for the entire RAG system.
+"""Facade over all subsystems (LLM, vector store, cache, RAG variants, agent layer); owns lifecycle, query routing, ingestion, health, and fallback."""
 
-Design:
-    Facade pattern over all subsystems (LLM, vector store, cache, RAG
-    variants, agent layer). Owns lifecycle (init/shutdown), query routing,
-    document ingestion, health checks, and fallback logic. Delegates all
-    processing to existing layers — the pipeline is glue and lifecycle,
-    not business logic.
-
-Chain of Responsibility:
-    External callers (FastAPI, CLI, tests) → RAGPipeline.query()
-    → if complex: AgentOrchestrator.execute() else: BaseRAG.query()
-    RAGPipeline.query_raw() provides raw RAGRequest access for advanced callers.
-
-Dependencies:
-    agents.agent_orchestrator, cache.cache_manager, chunking.*,
-    llm.llm_factory, rag.rag_factory, vectorstore.qdrant_store
-"""
-
-# stdlib
 import asyncio
 import time
 from typing import Awaitable, Callable, Optional
 
-# internal
 from agents.agent_orchestrator import AgentOrchestrator
 from agents.exceptions.agent_exceptions import AgentError
 from agents.planner.complexity_detector import should_decompose
@@ -65,24 +45,11 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Fallback variant used when the requested variant fails.
 _FALLBACK_VARIANT = "simple"
 
 
 class RAGPipeline:
-    """Single entry point for the entire RAG system.
-
-    Manages lifecycle of all subsystems, routes queries to the
-    appropriate RAG variant, handles fallbacks on failure, and
-    provides document ingestion and health check capabilities.
-
-    Attributes:
-        _initialized: Whether initialize() has been called successfully.
-        _llm: Primary LLM provider instance.
-        _fallback_llm: Optional secondary LLM for failover.
-        _store: QdrantStore instance.
-        _cache: Optional CacheManager instance.
-    """
+    """Single entry point for the entire RAG system."""
 
     def __init__(
         self,
@@ -91,17 +58,6 @@ class RAGPipeline:
         store: Optional[QdrantStore] = None,
         cache: Optional[CacheManager] = None,
     ) -> None:
-        """Initialize RAGPipeline.
-
-        Dependencies can be injected for testing. When None, the
-        pipeline creates them from settings during initialize().
-
-        Args:
-            llm: Optional primary LLM provider. Built from settings if None.
-            fallback_llm: Optional fallback LLM provider.
-            store: Optional QdrantStore. Built from settings if None.
-            cache: Optional CacheManager. Built from settings if None.
-        """
         self._llm = llm
         self._fallback_llm = fallback_llm
         self._store = store
@@ -109,22 +65,11 @@ class RAGPipeline:
         self._initialized = False
         self._agent_orchestrator: Optional[AgentOrchestrator] = None
         self._collections: dict[str, str] = {}
-        # Cache of QdrantStore instances keyed by collection name.
-        # All share self._store._client so they query the same Qdrant database.
+        # all share self._store._client so they query the same Qdrant instance
         self._collection_stores: dict[str, QdrantStore] = {}
 
-    # Lifecycle
-
     async def initialize(self) -> None:
-        """Boot all subsystems in dependency order.
-
-        Order: LLM providers → Vector store → Cache.
-        LLM first because semantic cache needs the embedding model,
-        and health checks need the LLM available.
-
-        Raises:
-            PipelineInitError: If any critical subsystem fails to start.
-        """
+        """Boot all subsystems in dependency order."""
         if self._initialized:
             logger.info("Pipeline already initialized, skipping")
             return
@@ -133,8 +78,6 @@ class RAGPipeline:
         init_start = time.perf_counter()
 
         try:
-            # LLM providers — LLMFactory.create_from_settings() wraps the
-            # provider in LLMRateLimiter automatically; no manual wrapping needed.
             if self._llm is None:
                 self._llm = LLMFactory.create_from_settings()
                 logger.info(
@@ -145,7 +88,6 @@ class RAGPipeline:
             if self._fallback_llm is None:
                 self._fallback_llm = self._try_create_fallback_llm()
 
-            # Vector store
             if self._store is None:
                 self._store = QdrantStore(
                     in_memory=settings.debug,
@@ -154,7 +96,6 @@ class RAGPipeline:
             await self._store.initialize()
             logger.info("Vector store initialized")
 
-            # Cache is non-critical — failure degrades gracefully, not crashes.
             if self._cache is None and settings.cache_enabled:
                 self._cache = CacheManager(settings)
             if self._cache:
@@ -169,8 +110,6 @@ class RAGPipeline:
                 details={"error_type": type(exc).__name__, "error": str(exc)},
             ) from exc
 
-        # Warm-up forces all heavy models to load now so the first real
-        # user query pays zero cold-start penalty.
         await self._run_warmup()
 
         elapsed = (time.perf_counter() - init_start) * 1000
@@ -178,11 +117,7 @@ class RAGPipeline:
         logger.info("Pipeline initialized in %.1fms", elapsed)
 
     async def shutdown(self) -> None:
-        """Tear down all subsystems in reverse dependency order.
-
-        Order: Cache → Vector store. LLM providers have no cleanup.
-        Safe to call even if initialize() was never called or failed.
-        """
+        """Tear down all subsystems in reverse dependency order."""
         logger.info("Pipeline shutting down")
 
         if self._cache:
@@ -203,20 +138,7 @@ class RAGPipeline:
         logger.info("Pipeline shutdown complete")
 
     async def _run_warmup(self) -> None:
-        """Force all heavy models to load before the first real query.
-
-        Runs four warm-up tasks in parallel so the total boot cost is
-        max(all four), not sum(all four). Each task is silenced with
-        return_exceptions=True — a warm-up failure never crashes the
-        pipeline; it just logs a warning and the first real query pays
-        that cold-start penalty instead.
-
-        What each task fixes:
-            embedding  — BGE ONNX model load + JIT kernel compile (3-8s)
-            splade     — SPLADE sparse model load via FastEmbed (1-3s)
-            qdrant     — HNSW graph segments loaded into RAM (200-500ms)
-            llm        — TCP + TLS handshake to provider API (500-1500ms)
-        """
+        """Force all heavy models to load before the first real query."""
         warmup_start = time.perf_counter()
         logger.info("Pipeline warm-up starting...")
 
@@ -237,7 +159,7 @@ class RAGPipeline:
                     await self._store.similarity_search_with_vectors("warmup", k=1)
                     logger.debug("Warm-up: Qdrant HNSW index ready")
                 except Exception:
-                    pass  # empty collection is fine — HNSW still loads
+                    pass  # empty collection is fine, hnsw still loads
 
         async def _warmup_llm() -> None:
             if self._llm:
@@ -245,7 +167,7 @@ class RAGPipeline:
                     await self._llm.generate("Reply with: OK", max_tokens=2)
                     logger.debug("Warm-up: LLM connection pool ready")
                 except Exception:
-                    pass  # non-critical — connection opens on first real query
+                    pass  # non-critical, connection opens on first real query
 
         results = await asyncio.gather(
             _warmup_embeddings(),
@@ -264,17 +186,11 @@ class RAGPipeline:
         logger.info("Pipeline warm-up complete in %.1fms", elapsed)
 
     async def health_check(self) -> PipelineHealthStatus:
-        """Check health of all subsystems.
-
-        Returns:
-            PipelineHealthStatus with per-subsystem status.
-        """
+        """Check health of all subsystems."""
         llm_status = await self._check_llm_health()
         store_status = await self._check_store_health()
         cache_status = await self._check_cache_health()
 
-        # Ready only if LLM and vector store are both healthy.
-        # Cache is non-critical — degraded state is acceptable.
         ready = llm_status == "ok" and store_status == "ok"
 
         return PipelineHealthStatus(
@@ -299,23 +215,10 @@ class RAGPipeline:
         collections: dict[str, str],
         max_concurrent: int = 4,
     ) -> None:
-        """Configure the agent layer for query decomposition.
-
-        Must be called after initialize(). Creates AgentOrchestrator with
-        a strong LLM (planning + synthesis) and a fast LLM (weak sub-query
-        rewriting). The store_factory provides per-collection QdrantStore
-        instances for parallel retrieval.
-
-        Args:
-            collections: Dict of collection_name -> description.
-                Used by the planner to route sub-queries.
-            max_concurrent: Max concurrent sub-query retrieval executions.
-        """
+        """Configure the agent layer for query decomposition."""
         self._ensure_initialized()
         self._collections = collections
 
-        # Fast LLM for weak sub-query rewriting — cheaper model, bounded use.
-        # Falls back silently to strong LLM if creation fails.
         fast_llm = self._try_create_fast_llm()
 
         self._agent_orchestrator = AgentOrchestrator(
@@ -333,29 +236,11 @@ class RAGPipeline:
             fast_llm.model_name if fast_llm else "fallback_to_strong",
         )
 
-    # Query — the main entry point
-
     async def query(
         self,
         pipeline_query: PipelineQuery,
     ) -> RAGResponse:
-        """Execute a query through the full RAG pipeline.
-
-        Validates input, selects the appropriate RAG variant,
-        executes, and falls back on failure.
-
-        Args:
-            pipeline_query: Simplified external query model.
-
-        Returns:
-            RAGResponse with answer, sources, timings, confidence.
-
-        Raises:
-            PipelineValidationError: If input validation fails.
-            PipelineFallbackExhaustedError: If all strategies fail.
-            LLMAuthError: If LLM authentication fails (propagated as-is).
-            LLMRateLimitError: If LLM rate limit hit (propagated as-is).
-        """
+        """Execute a query through the full RAG pipeline."""
         self._ensure_initialized()
         request = self._validate_and_convert(pipeline_query)
 
@@ -374,8 +259,6 @@ class RAGPipeline:
             return response
 
         except (LLMAuthError, LLMRateLimitError):
-            # Auth and rate-limit errors are not retryable via fallback;
-            # the caller must handle these (fix credentials, back off, etc.).
             raise
 
         except (RAGError, LLMTimeoutError) as exc:
@@ -389,22 +272,7 @@ class RAGPipeline:
         self,
         request: RAGRequest,
     ) -> RAGResponse:
-        """Execute a query using a raw RAGRequest (advanced usage).
-
-        Bypasses PipelineQuery validation — the caller is responsible
-        for constructing a valid RAGRequest. Useful for internal
-        callers (agents, tests) that need full RAGRequest control.
-
-        Args:
-            request: Fully constructed RAGRequest.
-
-        Returns:
-            RAGResponse with answer, sources, timings, confidence.
-
-        Raises:
-            PipelineValidationError: If pipeline is not initialized.
-            PipelineFallbackExhaustedError: If all strategies fail.
-        """
+        """Execute a query using a raw RAGRequest (advanced usage)."""
         self._ensure_initialized()
 
         logger.info(
@@ -430,10 +298,6 @@ class RAGPipeline:
             )
             return await self._handle_fallback(request, exc, query_start)
 
-    # Document ingestion
-
-    # Default logical-collection name when the caller does not supply one.
-    # Every chunk is stamped with this value so filter_collection queries work.
     _DEFAULT_LOGICAL_COLLECTION = "default"
 
     async def ingest(
@@ -444,30 +308,7 @@ class RAGPipeline:
         doc_id: str = "",
         on_batch_progress: Optional[Callable[[int, int], Awaitable[None]]] = None,
     ) -> IngestionResult:
-        """Ingest a document into the vector store.
-
-        Runs the full ingestion pipeline: load → clean → preserve structure
-        → chunk → embed → store. The physical Qdrant collection is always
-        settings.qdrant_collection_name; `collection` is a logical "folder"
-        stamped into every chunk's payload for later filtering.
-
-        Args:
-            file_path: Path to the document file.
-            collection: Logical collection ("folder") name within the user's
-                corpus. None defaults to 'default'.
-            user_id: Owning user ID written to every chunk's payload.
-                Empty string means no per-user scoping.
-            doc_id: Stable identifier for the source document (e.g. a UUID
-                generated by the backend). Written to every chunk's payload
-                so the document can be deleted/updated as a unit later.
-
-        Returns:
-            IngestionResult with chunk counts and timing.
-
-        Raises:
-            PipelineValidationError: If pipeline is not initialized.
-            PipelineIngestionError: If any ingestion step fails.
-        """
+        """Ingest a document into the vector store."""
         self._ensure_initialized()
 
         logical_collection = (collection or self._DEFAULT_LOGICAL_COLLECTION).strip() \
@@ -483,24 +324,18 @@ class RAGPipeline:
         ingest_start = time.perf_counter()
 
         try:
-            # Load and clean — DocumentCleaner.load_and_clean handles both steps.
             cleaner = DocumentCleaner()
             raw_docs = await asyncio.to_thread(cleaner.load_and_clean, file_path)
             logger.info("Loaded %d pages from '%s'", len(raw_docs), file_path)
 
-            # Tag headings, tables, and other structural elements.
             preserver = StructurePreserver()
             structured_docs = await asyncio.to_thread(preserver.preserve, raw_docs)
 
-            # Chunk into retrieval-sized pieces.
             chunker = Chunker()
             chunks = await asyncio.to_thread(chunker.split_documents, structured_docs)
             total_chunks = len(chunks)
             logger.info("Produced %d chunks", total_chunks)
 
-            # Stamp tenancy + logical-collection metadata on every chunk so
-            # QdrantStore's setdefault preserves these instead of writing
-            # placeholder defaults.
             for chunk in chunks:
                 if user_id:
                     chunk.metadata["user_id"] = user_id
@@ -508,10 +343,7 @@ class RAGPipeline:
                     chunk.metadata["doc_id"] = doc_id
                 chunk.metadata["collection"] = logical_collection
 
-            # Reuse the pipeline's existing Qdrant client so the ingested
-            # collection is visible to all subsequent queries. Creating a new
-            # QdrantStore without sharing the client would produce an isolated
-            # in-memory database unreachable by queries.
+            # reuse existing Qdrant client so ingested docs are visible to all running queries
             ingest_store = QdrantStore(
                 collection_name=physical_collection,
                 client=self._store._client,
@@ -522,12 +354,7 @@ class RAGPipeline:
                 chunks, on_batch_progress=on_batch_progress,
             )
 
-            # Post-ingest HNSW warmup — forces Qdrant to load the freshly
-            # built HNSW graph segments into RAM right now, so the first
-            # real query against this collection pays zero cold-start penalty.
-            # BGE and SPLADE are already hot (used above to encode chunks),
-            # so this one dummy search costs only the Qdrant RTT (~110ms).
-            if point_ids:  # only worth warming if new data was actually stored
+            if point_ids:
                 try:
                     await ingest_store.similarity_search_with_vectors("warmup", k=1)
                     logger.debug(
@@ -535,14 +362,12 @@ class RAGPipeline:
                         physical_collection, logical_collection,
                     )
                 except Exception:
-                    pass  # non-fatal — first query pays cold-start instead
+                    pass
 
             elapsed = (time.perf_counter() - ingest_start) * 1000
             stored = len(point_ids)
             duplicates = total_chunks - stored
 
-            # `collection` in the result is the logical folder name the caller
-            # sees; the physical Qdrant target is implementation detail.
             result = IngestionResult(
                 file_path=file_path,
                 collection=logical_collection,
@@ -571,8 +396,7 @@ class RAGPipeline:
             ) from exc
 
     async def list_collections(self) -> list[dict]:
-        """Return Qdrant collections enriched with description (from the agent
-        registry) and per-collection document counts."""
+        """Return Qdrant collections enriched with description and document counts."""
         self._ensure_initialized()
         names = await self._store.list_all_collections()
 
@@ -587,16 +411,8 @@ class RAGPipeline:
             })
         return results
 
-    # Internal — query execution and routing
-
     def _should_use_agent(self, request: RAGRequest) -> bool:
-        """Decide whether to route this request through the agent layer.
-
-        Respects force_agent override in RAGConfig:
-            True  → always use agent (if configured)
-            False → never use agent
-            None  → auto-detect via should_decompose()
-        """
+        """Decide whether to route this request through the agent layer."""
         force = request.config.force_agent
         if force is True:
             return self._agent_orchestrator is not None
@@ -609,24 +425,13 @@ class RAGPipeline:
         request: RAGRequest,
         llm: BaseLLM,
     ) -> RAGResponse:
-        """Build the RAG variant and execute the query.
-
-        Routes complex queries through the agent layer (with cache check).
-        Simple queries go directly to a RAG variant.
-
-        Args:
-            request: Validated RAGRequest.
-            llm: LLM provider to use for this execution.
-
-        Returns:
-            RAGResponse from the selected execution path.
-        """
+        """Build the RAG variant and execute the query."""
         if self._should_use_agent(request):
             logger.info(
                 "Routing to agent decomposition | request_id=%s",
                 request.request_id,
             )
-            # Cache check before the expensive planner + parallel retrieval + synthesis.
+            # cache check before expensive planner + parallel retrieval + synthesis
             if self._cache:
                 cached = await self._try_agent_cache_read(request)
                 if cached:
@@ -642,9 +447,6 @@ class RAGPipeline:
                 return rag_response
 
             except AgentError as exc:
-                # Agent path failed (all sub-queries failed retrieval or verification,
-                # or synthesis produced no output). Fall through to direct RAG so the
-                # user always receives an answer rather than a hard error.
                 logger.warning(
                     "Agent path failed | request_id=%s | error=%s | reason=%s | "
                     "falling back to direct RAG",
@@ -653,21 +455,16 @@ class RAGPipeline:
                     exc,
                 )
 
-        # Direct RAG path — used for simple queries and as agent fallback.
         rag = await self._build_rag_for_request(request, llm)
         return await rag.query(request)
 
     async def _try_agent_cache_read(self, request: RAGRequest) -> RAGResponse | None:
-        """Attempt to read a cached agent response. Returns None on miss or error.
-
-        Uses "__agent__" as the system_prompt discriminator so agent cache
-        keys never collide with SimpleRAG keys for the same query.
-        """
+        """Attempt to read a cached agent response. Returns None on miss or error."""
         try:
             result = await self._cache.get_or_wait(
                 query=request.query,
                 model_name=self._llm.model_name,
-                temperature=0.0,          # synthesis temperature
+                temperature=0.0,
                 system_prompt="__agent__",
             )
             if result.hit:
@@ -709,7 +506,7 @@ class RAGPipeline:
         response: RAGResponse,
     ) -> None:
         """Write a synthesized agent response to cache. Errors are caught and logged."""
-        # Never cache a degraded response — both LLMs failed, answer is a stub.
+        # never cache a degraded response — both LLMs failed and answer is a stub
         if response.model_name == "unavailable":
             logger.warning(
                 "Agent cache write skipped — degraded response | request_id=%s",
@@ -750,19 +547,7 @@ class RAGPipeline:
             )
 
     async def _get_store_for_collection(self, collection_name: str) -> QdrantStore:
-        """Return a QdrantStore scoped to the given collection.
-
-        Returns self._store directly for its own collection. Otherwise
-        creates (once) and caches a new QdrantStore that shares the same
-        Qdrant client — same pattern as ingest(). All collections live in
-        one database; each store just targets a different collection name.
-
-        Args:
-            collection_name: Target Qdrant collection name.
-
-        Returns:
-            Initialized QdrantStore targeting collection_name.
-        """
+        """Return a QdrantStore scoped to the given collection."""
         if collection_name == self._store.collection_name:
             return self._store
 
@@ -782,18 +567,7 @@ class RAGPipeline:
         request: RAGRequest,
         llm: BaseLLM,
     ) -> BaseRAG:
-        """Build the appropriate RAG variant for this request.
-
-        Resolves the correct QdrantStore for the request's collection,
-        then delegates to RAGFactory.create_from_request().
-
-        Args:
-            request: RAGRequest with config specifying the variant.
-            llm: LLM provider to inject into the RAG variant.
-
-        Returns:
-            Configured BaseRAG subclass instance.
-        """
+        """Build the appropriate RAG variant for this request."""
         store = await self._get_store_for_collection(request.collection_name)
         return RAGFactory.create_from_request(
             request=request,
@@ -803,33 +577,13 @@ class RAGPipeline:
             embeddings_fn=get_embeddings,
         )
 
-    # Internal — fallback logic
-
     async def _handle_fallback(
         self,
         request: RAGRequest,
         original_error: Exception,
         query_start: float,
     ) -> RAGResponse:
-        """Attempt recovery after primary execution fails.
-
-        Fallback strategy (in order):
-        1. Retry with SimpleRAG if a complex variant failed.
-        2. Retry with fallback LLM if primary LLM timed out.
-        3. Give up — raise PipelineFallbackExhaustedError.
-
-        Args:
-            request: The original RAGRequest.
-            original_error: The exception that triggered fallback.
-            query_start: perf_counter timestamp for total latency.
-
-        Returns:
-            RAGResponse from a fallback strategy.
-
-        Raises:
-            PipelineFallbackExhaustedError: If no fallback succeeds.
-        """
-        # Strategy 1 — retry with simpler variant using the same LLM.
+        """Attempt recovery after primary execution fails."""
         variant = self._get_request_variant(request)
         if variant != _FALLBACK_VARIANT:
             logger.info(
@@ -848,7 +602,6 @@ class RAGPipeline:
                     request.request_id, exc,
                 )
 
-        # Strategy 2 — retry with fallback LLM using the simpler variant.
         if self._fallback_llm:
             logger.info(
                 "Fallback: retrying request_id=%s with fallback LLM",
@@ -868,7 +621,6 @@ class RAGPipeline:
                     request.request_id, exc,
                 )
 
-        # All fallbacks exhausted — surface to caller.
         raise PipelineFallbackExhaustedError(
             message="All fallback strategies exhausted",
             details={
@@ -880,17 +632,7 @@ class RAGPipeline:
         )
 
     def _downgrade_variant(self, request: RAGRequest) -> RAGRequest:
-        """Create a copy of the request with the variant downgraded to simple.
-
-        Preserves all other config fields. Builds a new RAGRequest
-        since the model may be frozen.
-
-        Args:
-            request: Original RAGRequest.
-
-        Returns:
-            New RAGRequest with variant set to _FALLBACK_VARIANT.
-        """
+        """Create a copy of the request with the variant downgraded to simple."""
         original_config = request.config or RAGConfig()
 
         downgraded_config = RAGConfig(
@@ -906,8 +648,6 @@ class RAGPipeline:
             confidence_method=original_config.confidence_method,
         )
 
-        # Tenancy + logical-collection filters MUST carry over to the fallback;
-        # dropping them on retry would leak across users or widen the scope.
         return RAGRequest(
             query=request.query,
             collection_name=request.collection_name,
@@ -919,14 +659,7 @@ class RAGPipeline:
         )
 
     def _describe_fallbacks(self, original_variant: str) -> list[str]:
-        """Describe which fallback strategies were attempted.
-
-        Args:
-            original_variant: The originally requested variant.
-
-        Returns:
-            List of fallback descriptions for logging.
-        """
+        """Describe which fallback strategies were attempted."""
         attempted = []
         if original_variant != _FALLBACK_VARIANT:
             attempted.append(f"variant_downgrade: {original_variant} -> {_FALLBACK_VARIANT}")
@@ -936,14 +669,8 @@ class RAGPipeline:
             )
         return attempted
 
-    # Internal — validation
-
     def _ensure_initialized(self) -> None:
-        """Guard against using the pipeline before initialization.
-
-        Raises:
-            PipelineValidationError: If pipeline is not initialized.
-        """
+        """Guard against using the pipeline before initialization."""
         if not self._initialized:
             raise PipelineValidationError(
                 message="Pipeline not initialized. Call await pipeline.initialize() first.",
@@ -954,17 +681,7 @@ class RAGPipeline:
         self,
         pipeline_query: PipelineQuery,
     ) -> RAGRequest:
-        """Validate external query and convert to internal RAGRequest.
-
-        Args:
-            pipeline_query: External PipelineQuery model.
-
-        Returns:
-            Validated RAGRequest.
-
-        Raises:
-            PipelineValidationError: If validation fails.
-        """
+        """Validate external query and convert to internal RAGRequest."""
         try:
             return pipeline_query.to_rag_request()
         except Exception as exc:
@@ -978,26 +695,13 @@ class RAGPipeline:
             ) from exc
 
     def _get_request_variant(self, request: RAGRequest) -> str:
-        """Extract the variant name from a request, with default.
-
-        Args:
-            request: RAGRequest to inspect.
-
-        Returns:
-            Variant name string.
-        """
+        """Extract the variant name from a request, with default."""
         if request.config and request.config.rag_variant:
             return request.config.rag_variant
         return settings.RAG_DEFAULT_VARIANT
 
-    # Internal — health checks
-
     async def _check_llm_health(self) -> str:
-        """Check LLM provider availability.
-
-        Returns:
-            "ok" if available, error description otherwise.
-        """
+        """Check LLM provider availability."""
         if not self._llm:
             return "not configured"
         try:
@@ -1007,28 +711,17 @@ class RAGPipeline:
             return f"error: {exc}"
 
     async def _check_store_health(self) -> str:
-        """Check vector store availability.
-
-        Returns:
-            "ok" if accessible, error description otherwise.
-        """
+        """Check vector store availability."""
         if not self._store:
             return "not configured"
         try:
-            # get_collection_stats is a lightweight read-only operation.
             await self._store.get_collection_stats()
             return "ok"
         except Exception as exc:
             return f"error: {exc}"
 
     async def _check_cache_health(self) -> str:
-        """Check cache subsystem availability.
-
-        Cache is non-critical — "degraded" is an acceptable state.
-
-        Returns:
-            "ok", "disabled", "degraded", or error description.
-        """
+        """Check cache subsystem availability."""
         if not settings.cache_enabled:
             return "disabled"
         if not self._cache:
@@ -1039,17 +732,8 @@ class RAGPipeline:
         except Exception as exc:
             return f"degraded: {exc}"
 
-    # Internal — LLM factory helpers
-
     def _try_create_fast_llm(self) -> Optional[BaseLLM]:
-        """Attempt to create a fast LLM for weak sub-query rewriting.
-
-        Uses GROQ_MODEL_FAST from settings when available. Non-fatal —
-        configure_agents() falls back to the strong LLM if this fails.
-
-        Returns:
-            Fast BaseLLM instance, or None if creation fails.
-        """
+        """Attempt to create a fast LLM for weak sub-query rewriting."""
         try:
             fast = LLMFactory.create_rate_limited(
                 provider_name=getattr(settings, "LLM_PROVIDER", "groq"),
@@ -1065,15 +749,7 @@ class RAGPipeline:
             return None
 
     def _try_create_fallback_llm(self) -> Optional[BaseLLM]:
-        """Attempt to create a fallback LLM provider.
-
-        Tries the secondary provider (if primary is gemini → openai,
-        if primary is openai → gemini). Failure is non-fatal — the
-        pipeline works without a fallback, just loses one retry path.
-
-        Returns:
-            Fallback BaseLLM instance, or None if creation fails.
-        """
+        """Attempt to create a fallback LLM provider."""
         primary = self._llm.provider_name if self._llm else ""
         fallback_provider = "openai" if primary == "gemini" else "gemini"
 
@@ -1091,8 +767,6 @@ class RAGPipeline:
             )
             return None
 
-    # Internal — metrics and logging
-
     def _log_query_metrics(
         self,
         request: RAGRequest,
@@ -1100,14 +774,7 @@ class RAGPipeline:
         query_start: float,
         fallback: bool = False,
     ) -> None:
-        """Log query execution metrics.
-
-        Args:
-            request: The executed RAGRequest.
-            response: The RAGResponse produced.
-            query_start: perf_counter timestamp from query start.
-            fallback: Whether this response came from a fallback path.
-        """
+        """Log query execution metrics."""
         total_ms = (time.perf_counter() - query_start) * 1000
 
         logger.info(

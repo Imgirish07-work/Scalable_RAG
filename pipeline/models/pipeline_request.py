@@ -1,51 +1,16 @@
-"""
-Simplified external-facing request and response models for the pipeline.
+"""Simplified external-facing request and response models for the pipeline."""
 
-Design:
-    PipelineQuery is the public API surface. Internal layers use RAGRequest
-    and RAGConfig — but external callers (FastAPI endpoints, CLI, scripts)
-    should not need to know about those internals. PipelineQuery translates
-    to RAGRequest + RAGConfig via to_rag_request().
-
-Chain of Responsibility:
-    External caller constructs PipelineQuery → RAGPipeline.query() converts
-    it to RAGRequest via to_rag_request() → BaseRAG.query() receives it.
-
-Dependencies:
-    pydantic, rag.models.rag_request
-"""
-
-# stdlib
 from typing import Optional
 from uuid import uuid4
 
-# third-party
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-# internal
 from config.settings import settings
 from rag.models.rag_request import ConversationTurn, RAGConfig, RAGRequest
 
 
 class PipelineQuery(BaseModel):
-    """Simplified query interface for external callers.
-
-    Exposes only the fields that external consumers need. Advanced
-    users who need full control can bypass this and pass RAGRequest
-    directly to pipeline.query_raw().
-
-    Attributes:
-        query: The user's natural language question.
-        collection: Optional logical collection ("folder") within the user's
-            corpus. None means search across all of the user's documents.
-            The physical Qdrant collection is fixed by settings.
-        variant: RAG variant override ('simple'). None uses settings default.
-        conversation_history: Optional prior turns for multi-turn queries.
-        temperature: LLM temperature override. None uses settings default.
-        top_k: Number of chunks to retrieve. None uses settings default.
-        include_sources: Whether to include source chunks in the response.
-        request_id: Optional caller-provided request ID for tracing.
-    """
+    """Simplified query interface for external callers."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -103,17 +68,7 @@ class PipelineQuery(BaseModel):
     @field_validator("variant")
     @classmethod
     def validate_variant(cls, v: Optional[str]) -> Optional[str]:
-        """Validate variant name against known variants.
-
-        Args:
-            v: Variant name or None.
-
-        Returns:
-            Lowercased variant name or None.
-
-        Raises:
-            ValueError: If variant is not a recognized name.
-        """
+        """Validate variant name against known variants."""
         if v is None:
             return None
         allowed = {"simple"}
@@ -124,20 +79,10 @@ class PipelineQuery(BaseModel):
         return normalized
 
     def to_rag_request(self) -> RAGRequest:
-        """Convert to internal RAGRequest + RAGConfig.
-
-        The physical Qdrant collection is pinned to settings.qdrant_collection_name
-        — every user's chunks live there and are separated by user_id. The
-        caller-supplied `collection` (if any) is forwarded as a logical filter.
-
-        Returns:
-            RAGRequest ready for BaseRAG.query().
-        """
+        """Convert to internal RAGRequest + RAGConfig."""
         from rag.domain_profiles import apply_domain_profile
 
-        # Only pass optional fields when explicitly set — RAGConfig fields
-        # top_k and temperature are non-optional (int/float), so passing None
-        # would fail Pydantic validation. Omitting them uses the field defaults.
+        # ragconfig top_k and temperature are non-optional, omit when none to use field defaults
         config_kwargs: dict = {
             "rag_variant": self.variant,
             "include_sources": self.include_sources,
@@ -148,7 +93,7 @@ class PipelineQuery(BaseModel):
         if self.temperature is not None:
             config_kwargs["temperature"] = self.temperature
 
-        # Apply domain profile defaults — caller-supplied values above win.
+        # caller-supplied values above win over domain defaults
         config_kwargs = apply_domain_profile(config_kwargs, self.domain)
 
         config = RAGConfig(**config_kwargs)
@@ -165,15 +110,7 @@ class PipelineQuery(BaseModel):
 
 
 class PipelineHealthStatus(BaseModel):
-    """Health check result for the pipeline and its subsystems.
-
-    Attributes:
-        ready: True only if ALL critical subsystems are healthy.
-        llm: LLM provider status.
-        vector_store: Qdrant status.
-        cache: Cache subsystem status.
-        details: Optional extra info per subsystem.
-    """
+    """Health check result for the pipeline and its subsystems."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -200,16 +137,7 @@ class PipelineHealthStatus(BaseModel):
 
 
 class IngestionResult(BaseModel):
-    """Result of a document ingestion operation.
-
-    Attributes:
-        file_path: Path of the ingested file.
-        collection: Target collection name.
-        chunks_stored: Number of chunks successfully stored.
-        total_chunks: Total chunks produced by chunker (before dedup).
-        duplicates_skipped: Chunks skipped due to deduplication.
-        elapsed_ms: Total ingestion time in milliseconds.
-    """
+    """Result of a document ingestion operation."""
 
     model_config = ConfigDict(frozen=True)
 

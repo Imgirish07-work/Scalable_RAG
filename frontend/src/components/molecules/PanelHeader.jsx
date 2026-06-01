@@ -1,18 +1,6 @@
 import { memo } from "react";
 import { C } from "../../theme";
 
-/**
- * PanelHeader — titled section header with an optional action link/button.
- *
- * Props:
- *   title      — section label (string or node)
- *   action     — label for the right-side action (string, optional)
- *   onAction   — click handler for the action
- *   border     — show a bottom border (default: false)
- *   style      — extra inline styles on the root wrapper
- *   className  — extra Tailwind classes
- *   children   — rendered to the right of the title (overrides action/onAction)
- */
 export default memo(function PanelHeader({
   title,
   action,

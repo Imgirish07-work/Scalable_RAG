@@ -1,88 +1,38 @@
-"""
-ChunkQualityGate — deterministic quality evaluation for sub-query retrieval results.
-
-Design:
-    Evaluates retrieved chunks using average reranker/relevance scores and
-    chunk count. Zero LLM calls — purely deterministic signal from the
-    cross-encoder already applied by ChunkRetriever.
-
-    Classification:
-        strong  — enough chunks with good avg score → pass through as-is.
-        weak    — chunks exist but avg score is below threshold → flag for
-                  fast-LLM rewrite + one re-retrieval pass.
-        failed  — zero chunks → accept as an information gap, synthesizer
-                  acknowledges it; no retry attempted.
-
-Chain of Responsibility:
-    ChunkRetriever → ChunkQualityGate.evaluate()
-    → AgentOrchestrator rewrites weak sub-queries (fast LLM, 1 call each).
-
-Dependencies:
-    agents.models.agent_response
-"""
+"""Deterministic strong/weak/failed classifier for sub-query retrieval results."""
 
 from agents.models.agent_response import SubQueryResult
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Minimum chunk count for a sub-query to be considered strong.
 _MIN_CHUNKS = 2
 
-# Minimum average reranker/relevance score to pass as strong.
-# Below this the sub-query is weak — has signal but not enough.
-# Calibrated for BGE Reranker Base: relevant content scores 0.40-0.95,
-# moderately relevant 0.25-0.55, irrelevant 0.02-0.20.
-# 0.25 is the lower boundary of the "moderately relevant" band — sub-queries
-# averaging below this have genuinely marginal retrieval and benefit from rewrite.
+# bge reranker base: relevant 0.40-0.95, moderate 0.25-0.55, irrelevant 0.02-0.20
 _MIN_AVG_SCORE = 0.25
 
 
 class ChunkQualityGate:
-    """Classifies each sub-query result as strong, weak, or failed.
-
-    Weak results are flagged with is_weak=True so the orchestrator can
-    rewrite the sub-query with the fast LLM and re-retrieve once.
-    Failed results (0 chunks) have success=False — accepted as gaps.
-
-    Attributes:
-        _min_chunks: Minimum chunk count to be considered strong.
-        _min_avg_score: Minimum average score to be considered strong.
-    """
+    """Classifies each sub-query result as strong, weak, or failed."""
 
     def __init__(
         self,
         min_chunks: int = _MIN_CHUNKS,
         min_avg_score: float = _MIN_AVG_SCORE,
     ) -> None:
-        """Initialize ChunkQualityGate.
-
-        Args:
-            min_chunks: Minimum chunk count threshold.
-            min_avg_score: Minimum average reranker score threshold.
-        """
         self._min_chunks = min_chunks
         self._min_avg_score = min_avg_score
 
     def evaluate(self, results: list[SubQueryResult]) -> list[SubQueryResult]:
-        """Classify each sub-query result and update quality flags.
-
-        Args:
-            results: Sub-query results from ChunkRetriever.
-
-        Returns:
-            Same list with is_weak and success flags updated where needed.
-        """
+        """Classify each sub-query result and update quality flags."""
         evaluated = []
 
         for result in results:
             if not result.success:
-                # Already failed at retrieval level — pass through unchanged.
                 evaluated.append(result)
                 continue
 
             if not result.chunks:
-                # Zero chunks → mark as failed (information gap, no retry).
+                # zero chunks treated as info gap, no retry
                 logger.info(
                     "Quality gate | FAILED (0 chunks) | id=%s | query='%s'",
                     result.sub_query_id, result.query[:60],

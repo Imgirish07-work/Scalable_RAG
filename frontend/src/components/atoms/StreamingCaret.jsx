@@ -1,10 +1,5 @@
 import { C } from "../../theme";
 
-/**
- * StreamingCaret — blinking accent-coloured caret shown at the end of
- * streaming assistant content. Single source of truth so the cursor looks
- * identical across Model Playground, RAG Playground, and Prompt Solution.
- */
 export default function StreamingCaret() {
   return (
     <span

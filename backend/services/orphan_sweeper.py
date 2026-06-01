@@ -49,8 +49,7 @@ class OrphanSweeper:
             self._processing_lease,
         )
         try:
-            # Defer first tick so boot-time pipeline init finishes before we
-            # contend for DB connections.
+            # defer first tick so pipeline init finishes before we contend for db connections
             if await self._sleep_or_stop():
                 return
             while not self._stop_event.is_set():
@@ -127,7 +126,7 @@ class OrphanSweeper:
                     )
                 if not moved:
                     continue
-                # MinIO blob is preserved so the user can retry via POST /retry.
+                # minio blob is preserved so the user can retry via POST /retry
                 try:
                     await self._delete_qdrant_chunks(doc_id)
                 except Exception:

@@ -67,7 +67,6 @@ class IngestionService:
         ingest_jobs_inflight.inc()
 
         try:
-            # Step 1 — flip status to processing; capture row fields up-front.
             async with self._with_repo() as repo:
                 document = await repo.find_by_id(doc_id)
                 if document is None:
@@ -80,7 +79,6 @@ class IngestionService:
 
             await publish("processing")
 
-            # Step 2 — fetch bytes from MinIO and hash them.
             metadata = await self._retry(self._store.head_object, s3_key)
             await publish(
                 "downloading",
@@ -94,7 +92,6 @@ class IngestionService:
 
             self._verify_mime_from_disk(temp_path, expected=expected_mime)
 
-            # Step 3 — dedup against existing user content.
             async with self._with_repo() as repo:
                 existing = await repo.find_active_by_content_hash(
                     user_id, content_hash,
@@ -113,7 +110,6 @@ class IngestionService:
                 )
                 return
 
-            # Step 4 — chunk and embed via the RAG pipeline.
             async with self._with_repo() as repo:
                 await repo.set_content_hash(doc_id, content_hash)
 
@@ -124,7 +120,7 @@ class IngestionService:
                 on_batch_progress=progress.emit,
             )
 
-            # Step 5 — guarded ready transition; skip success if sweeper got here first.
+            # guarded transition — skip success if sweeper already moved the row
             async with self._with_repo() as repo:
                 committed = await repo.mark_ready_if_processing(
                     doc_id, chunks_count=ingestion.chunks_stored,

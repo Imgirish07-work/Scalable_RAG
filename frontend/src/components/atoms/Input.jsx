@@ -1,21 +1,6 @@
 import { memo } from "react";
 import { C } from "../../theme";
 
-/**
- * Input — styled text input atom.
- *
- * Props:
- *   type        — input type (default: "text")
- *   value       — controlled value
- *   onChange     — called with raw event
- *   onBlur      — blur handler
- *   placeholder — placeholder text
- *   hasError    — highlights border red
- *   disabled    — disables interaction
- *   style       — extra inline styles
- *   className   — extra Tailwind classes
- *   ...rest     — forwarded to <input>
- */
 export default memo(function Input({
   type       = "text",
   value,

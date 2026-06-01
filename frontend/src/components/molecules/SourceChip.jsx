@@ -1,15 +1,6 @@
 import { memo, useState } from "react";
 import { C } from "../../theme";
 
-/**
- * SourceChip — clickable file-source badge molecule.
- *
- * Props:
- *   filename  — displayed label
- *   onClick   — click handler (e.g. open SAS URL)
- *   style     — extra inline styles
- *   className — extra Tailwind classes
- */
 export default memo(function SourceChip({
   filename,
   onClick,

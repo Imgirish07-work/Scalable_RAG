@@ -1,21 +1,6 @@
 import { memo } from "react";
 import IconButton from "../atoms/IconButton";
 
-/**
- * MsgActionBar — hover-reveal row of icon actions for chat messages.
- *
- * Props:
- *   visible     — whether the bar is visible (parent hover state)
- *   copiedId    — id of the currently-copied message (for copy icon feedback)
- *   msgId       — this message's id
- *   onCopy      — copy handler
- *   onEdit      — edit handler (optional; hidden if omitted)
- *   onRetry     — retry handler (optional; hidden if omitted)
- *   disabled    — disables all actions
- *   style       — extra inline styles
- *   className   — extra Tailwind classes
- */
-
 function IconCopy({ active }) {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke={active ? "#3fb950" : "currentColor"}

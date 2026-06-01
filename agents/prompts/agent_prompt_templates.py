@@ -1,25 +1,4 @@
-"""
-Prompt templates for the agent layer.
-
-Design:
-    Two prompt pairs: planning and synthesis. Each is a module-level constant
-    (static system prompt) plus a builder function that injects runtime values
-    into the user prompt. All builders return (system_prompt, user_prompt)
-    tuples compatible with BaseLLM.chat().
-
-    A third lightweight prompt handles weak sub-query rewriting — used with
-    the fast LLM to reformulate low-quality sub-queries before re-retrieval.
-
-Chain of Responsibility:
-    QueryPlanner calls build_planning_prompt().
-    AgentOrchestrator calls build_rewrite_prompt() for weak sub-queries (fast LLM).
-    AgentOrchestrator calls build_synthesis_prompt() for final generation (strong LLM).
-
-Dependencies:
-    None (stdlib only).
-"""
-
-# Planning — decompose query into independent sub-queries
+"""Prompt templates for the agent layer: planning, rewrite, synthesis."""
 
 PLANNING_SYSTEM_PROMPT = (
     "You are a query decomposition planner. Your job is to break a complex "
@@ -56,8 +35,6 @@ PLANNING_USER_PROMPT = (
 )
 
 
-# Sub-query rewrite — reformulate a weak sub-query using partial results (fast LLM)
-
 REWRITE_SYSTEM_PROMPT = (
     "You are a search query optimizer. Given a search query and partial results "
     "that were retrieved with low relevance, rewrite the query to retrieve better "
@@ -78,8 +55,6 @@ REWRITE_USER_PROMPT = (
 )
 
 
-# Synthesis — generate the final answer from structured fused context (strong LLM)
-
 SYNTHESIS_SYSTEM_PROMPT = (
     "You are a helpful assistant. Answer the user's question using ONLY the "
     "provided context. The context is organized by sub-topics.\n\n"
@@ -99,21 +74,11 @@ SYNTHESIS_USER_PROMPT = (
 )
 
 
-# Builder functions
-
 def build_planning_prompt(
     query: str,
     collections: dict[str, str],
 ) -> tuple[str, str]:
-    """Build planning prompts for query decomposition.
-
-    Args:
-        query: The original user query.
-        collections: Dict of collection_name → description.
-
-    Returns:
-        Tuple of (system_prompt, user_prompt) for BaseLLM.chat().
-    """
+    """Build planning prompts for query decomposition."""
     collection_lines = [
         f"- {name}: {description}"
         for name, description in collections.items()
@@ -132,20 +97,8 @@ def build_rewrite_prompt(
     purpose: str,
     best_chunk_content: str,
 ) -> tuple[str, str]:
-    """Build rewrite prompts for weak sub-query reformulation.
-
-    Called with the fast LLM. The best available chunk is used as context
-    to guide the rewrite even though its relevance score is low.
-
-    Args:
-        query: The original sub-query that returned weak results.
-        purpose: What the sub-query was meant to resolve.
-        best_chunk_content: Content of the highest-scored chunk retrieved.
-
-    Returns:
-        Tuple of (system_prompt, user_prompt) for BaseLLM.chat().
-    """
-    # Limit chunk preview to avoid token waste on the rewrite call.
+    """Build rewrite prompts for weak sub-query reformulation."""
+    # limit chunk preview to avoid token waste on the rewrite call
     preview = best_chunk_content[:400] if best_chunk_content else "No results found."
 
     user_prompt = REWRITE_USER_PROMPT.format(
@@ -160,18 +113,7 @@ def build_synthesis_prompt(
     query: str,
     structured_context: str,
 ) -> tuple[str, str]:
-    """Build synthesis prompts for final answer generation.
-
-    The structured_context is pre-formatted by ContextFusion with
-    [Sub-query N: ...] labels grouping chunks by sub-topic.
-
-    Args:
-        query: The original user query.
-        structured_context: Fused context string from ContextFusion.fuse().
-
-    Returns:
-        Tuple of (system_prompt, user_prompt) for BaseLLM.chat().
-    """
+    """Build synthesis prompts for final answer generation."""
     user_prompt = SYNTHESIS_USER_PROMPT.format(
         query=query,
         structured_context=structured_context,

@@ -1,5 +1,3 @@
-"""Agents package — multi-step query decomposition and synthesis."""
-
 from agents.agent_orchestrator import AgentOrchestrator
 from agents.models.agent_request import DecompositionPlan, SubQuery
 from agents.models.agent_response import AgentResponse, SubQueryResult

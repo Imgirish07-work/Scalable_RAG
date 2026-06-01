@@ -1,6 +1,6 @@
 # Scalable RAG System — Optimizations
 
-Complete catalogue of all 57 optimizations implemented across the codebase.
+Complete catalogue of all 62 optimizations implemented across the codebase.
 Organized by system layer. Each entry covers: what it does, benefit, drawbacks,
 how it is implemented, and where.
 
@@ -22,8 +22,9 @@ how it is implemented, and where.
 12. [LLM — Reliability & Factory](#12-llm--reliability--factory)
 13. [Agents](#13-agents)
 14. [Chunking & Document Processing](#14-chunking--document-processing)
-15. [Configuration](#15-configuration)
-16. [Summary Table](#16-summary-table)
+15. [Async Ingestion Queue (Phase 3)](#15-async-ingestion-queue-phase-3)
+16. [Configuration](#16-configuration)
+17. [Summary Table](#17-summary-table)
 
 ---
 
@@ -1621,7 +1622,157 @@ over the buffer tuples to preserve per-page metadata.
 
 ---
 
-## 15. Configuration
+## 15. Async Ingestion Queue (Phase 3)
+
+---
+
+### OPT-58 · ARQ Redis-Backed Async Job Queue
+
+**Category:** Scalability, Performance
+
+**What it does:**
+Ingestion work is decoupled from the HTTP request lifecycle using ARQ (async Redis
+queue). The API handler enqueues a job and returns 202 Accepted in <200 ms; the
+heavy work (load → chunk → embed → upsert) runs in a separate worker process.
+
+**Benefit:**
+HTTP pods are never blocked by ingestion. Under burst upload load, jobs queue in
+Redis and workers drain at their own pace without back-pressuring the API. Worker
+count scales independently from API pod count.
+
+**Drawbacks:**
+Adds operational complexity: Redis must be highly available, and a Redis restart
+loses in-memory jobs unless persistence is enabled. Job status visibility requires
+polling the documents table.
+
+**How implemented:**
+`queue_client.enqueue_ingest_job()` calls `arq.create_pool()` and `pool.enqueue_job()`.
+`WorkerSettings` in `arq_settings.py` declares functions, Redis settings, and concurrency
+limits. The arq worker container runs `arq backend.workers.arq_settings.WorkerSettings`.
+
+**Where:** `backend/workers/arq_settings.py`, `backend/workers/queue_client.py`, `backend/workers/tasks.py`
+
+---
+
+### OPT-59 · Per-Chunk Progress Emission via Redis Pub/Sub
+
+**Category:** Performance, Scalability
+
+**What it does:**
+`_ChunkProgressEmitter` invokes the `on_batch_progress` callback after each embedded
+batch. The callback publishes `{ doc_id, chunks_done, chunks_total }` to a Redis
+pub/sub channel. Every backend pod subscribes and fans out SSE events to connected
+clients without polling Postgres.
+
+**Benefit:**
+Real-time ingestion progress reaches the UI with sub-second latency regardless of
+how many backend pods are running. No polling loop needed on either the server or
+client side for progress updates.
+
+**Drawbacks:**
+Fire-and-forget pub/sub — a client that connects after processing completes misses
+intermediate events and must fall back to a final status query. Redis pub/sub is
+not persistent; events are lost if no subscriber is listening at publish time.
+
+**How implemented:**
+`IngestionService.run()` passes `_ChunkProgressEmitter.emit` as `on_batch_progress`.
+After each `QdrantStore.upsert()` batch, `RedisEventBus.publish(channel, payload)`
+is called. Backend pods run an async subscriber coroutine that pushes to open SSE
+connections.
+
+**Where:** `backend/services/ingestion_service.py`, `backend/services/redis_event_bus.py`
+
+---
+
+### OPT-60 · Stuck-Job Lease Detection (OrphanSweeper)
+
+**Category:** Reliability
+
+**What it does:**
+The `documents` table gains a `processing_started_at` timestamp (migration 003).
+When a worker claims a job it writes this timestamp. `OrphanSweeper` periodically
+queries for documents where `status='processing'` and
+`processing_started_at < NOW() - lease_timeout`, resetting them to `status='queued'`
+so another worker can pick them up.
+
+**Benefit:**
+Prevents jobs from being permanently stuck if a worker crashes mid-ingestion with no
+clean shutdown. The lease mechanism is purely DB-driven — no external heartbeat
+service is required.
+
+**Drawbacks:**
+Lease timeout must be tuned to be longer than the worst-case ingest time for any
+document. Too short → false-positive orphan detection and duplicate processing. Too
+long → stuck jobs are visible to users for too long before recovery.
+
+**How implemented:**
+`OrphanSweeper.sweep()` runs as a periodic `asyncio` background task.
+`UPDATE documents SET status='queued', processing_started_at=NULL
+ WHERE status='processing' AND processing_started_at < :cutoff`.
+
+**Where:** `backend/services/orphan_sweeper.py`
+
+---
+
+### OPT-61 · Atomic Conditional Status Transition (mark_ready_if_processing)
+
+**Category:** Reliability
+
+**What it does:**
+The final step of a successful ingestion uses `UPDATE documents SET status='ready'
+WHERE id=:id AND status='processing'` rather than an unconditional update. If the
+row was concurrently reset to `queued` by the OrphanSweeper (or another process), the
+update matches zero rows and the task exits cleanly without overwriting the new state.
+
+**Benefit:**
+Eliminates the TOCTOU race where a slow worker finishing after its lease expired
+would incorrectly mark a freshly re-queued (or already re-processing) document as
+ready.
+
+**Drawbacks:**
+Callers must check the affected-rows count to distinguish "updated successfully" from
+"row was already in a different state." The silent no-op requires the surrounding
+code to handle the zero-rows case without raising an error.
+
+**How implemented:**
+`DocumentRepository.mark_ready_if_processing(doc_id)` executes the conditional UPDATE
+and returns the rowcount. The task checks `if rowcount == 0: log.warning(...)`.
+
+**Where:** `backend/workers/tasks.py`, `backend/repositories/database.py`
+
+---
+
+### OPT-62 · Ingest Job Prometheus Metrics
+
+**Category:** Reliability, Scalability
+
+**What it does:**
+Three Prometheus metrics are emitted around the async ingestion lifecycle:
+`ingest_jobs_queued_total` (counter, on enqueue), `ingest_jobs_inflight` (gauge,
+incremented on task start / decremented on finish or error), and
+`ingest_jobs_failed_total` (counter, on exception).
+
+**Benefit:**
+Enables Grafana alerting on queue depth surges, worker saturation (inflight gauge
+near max_jobs), and elevated failure rates without any log parsing. The `inflight`
+gauge provides instant visibility into worker utilisation.
+
+**Drawbacks:**
+Metrics are per-process; horizontal scaling requires Prometheus scraping all worker
+pods and aggregating with `sum()`. The `inflight` gauge can drift negative if a
+worker crashes between increment and decrement — acceptable for alerting, not
+suitable for billing.
+
+**How implemented:**
+`backend/metrics.py` defines the three instruments. `tasks.py` increments/decrements
+around the task body using `try/finally` to guarantee the inflight gauge is always
+decremented.
+
+**Where:** `backend/metrics.py`, `backend/workers/tasks.py`
+
+---
+
+## 16. Configuration
 
 ---
 
@@ -1680,7 +1831,7 @@ state — concurrent registration in parallel tests can cause interference.
 
 ---
 
-## 16. Summary Table
+## 17. Summary Table
 
 | ID | Optimization | Category | File |
 |---|---|---|---|
@@ -1741,18 +1892,23 @@ state — concurrent registration in parallel tests can cause interference.
 | OPT-55 | Groq Queue + Worker Burst Protection | Reliability, Scalability | `llm/providers/groq_model_pool.py` |
 | OPT-56 | Five-Model Dynamic Pool Routing 4-Dimension | Reliability, Cost, Scalability | `llm/providers/model_router.py`, `llm/rate_limiter/rate_limit_tracker.py` |
 | OPT-57 | Short-Page Merging — No Silent Content Loss | Quality, Reliability | `chunking/document_cleaner.py` |
+| OPT-58 | ARQ Redis-Backed Async Job Queue | Scalability, Performance | `backend/workers/arq_settings.py`, `queue_client.py`, `tasks.py` |
+| OPT-59 | Per-Chunk Progress via Redis Pub/Sub | Performance, Scalability | `backend/services/ingestion_service.py`, `redis_event_bus.py` |
+| OPT-60 | Stuck-Job Lease Detection (OrphanSweeper) | Reliability | `backend/services/orphan_sweeper.py` |
+| OPT-61 | Atomic Conditional Status Transition | Reliability | `backend/workers/tasks.py` |
+| OPT-62 | Ingest Job Prometheus Metrics | Reliability, Scalability | `backend/metrics.py`, `backend/workers/tasks.py` |
 
 ---
 
-**Total: 57 optimizations across 6 system layers.**
+**Total: 62 optimizations across 7 system layers.**
 
 | Category | Count |
 |---|---|
-| Performance | 22 |
+| Performance | 23 |
 | Quality | 20 |
-| Reliability | 16 |
+| Reliability | 20 |
 | Cost | 10 |
-| Scalability | 9 |
+| Scalability | 12 |
 | Memory | 3 |
 
 *(Many optimizations span multiple categories; counts reflect primary category.)*

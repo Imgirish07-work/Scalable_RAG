@@ -1,5 +1,3 @@
-/* ── Organisms — barrel export ───────────────────────────────── */
-
 export { default as Sidebar }        from "./Sidebar";
 export { default as ChatThread }     from "./ChatThread";
 export { default as ParameterPanel } from "./ParameterPanel";

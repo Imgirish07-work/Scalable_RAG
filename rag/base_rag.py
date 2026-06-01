@@ -1,32 +1,4 @@
-"""
-Abstract base class for all RAG variants using the Template Method pattern.
-
-Design:
-    Template Method pattern: query() is a sealed algorithm skeleton.
-    No variant can reorder, skip, or add pipeline steps — they can only
-    override individual hooks. Cache integration, timing instrumentation,
-    and confidence computation all live here and are inherited for free.
-    All dependencies (retriever, LLM, cache, ranker, assembler) are
-    constructor-injected for full testability with mocks.
-
-Chain of Responsibility:
-    RAGFactory creates and injects dependencies → BaseRAG.query() orchestrates
-    the sealed pipeline → retrieve() calls BaseRetriever → rank() calls
-    ContextRanker → assemble_context() calls ContextAssembler →
-    generate() calls BaseLLM.chat().
-
-Dependencies:
-    llm.contracts.base_llm (BaseLLM)
-    llm.models.llm_response (LLMResponse)
-    llm.provider_health (provider_health)
-    rag.models.rag_request (RAGRequest)
-    rag.models.rag_response (RAGResponse, RetrievedChunk, ConfidenceScore, RAGTimings)
-    rag.retrieval.base_retriever (BaseRetriever)
-    rag.context.context_assembler (ContextAssembler)
-    rag.context.context_ranker (ContextRanker)
-    rag.prompts.rag_prompt_templates
-    rag.exceptions.rag_exceptions
-"""
+"""Abstract base class for RAG variants using Template Method; query() is sealed."""
 
 import time
 from abc import ABC, abstractmethod
@@ -61,29 +33,7 @@ logger = get_logger(__name__)
 
 
 class BaseRAG(ABC):
-    """Abstract base class for all RAG variants.
-
-    Implements the Template Method pattern: query() is sealed and defines
-    the algorithm skeleton. Variants override individual hooks to customize
-    behavior without changing the pipeline flow.
-
-    Subclasses MUST implement:
-        - retrieve(query, top_k, filters) -> list[RetrievedChunk]
-        - variant_name (property) -> str
-
-    Subclasses MAY override:
-        - pre_process(request) -> str
-        - rank(chunks, query) -> list[RetrievedChunk]
-        - assemble_context(chunks) -> tuple[str, list[RetrievedChunk], int]
-        - generate(context, query, request) -> LLMResponse
-
-    Attributes:
-        _retriever: BaseRetriever for vector store access.
-        _llm: BaseLLM for text generation and token counting.
-        _cache: Optional CacheManager for response caching.
-        _ranker: ContextRanker for post-retrieval reranking.
-        _assembler: ContextAssembler for token-bounded context building.
-    """
+    """Abstract base class for all RAG variants."""
 
     def __init__(
         self,
@@ -94,27 +44,10 @@ class BaseRAG(ABC):
         assembler: ContextAssembler | None = None,
         fallback_llm: BaseLLM | None = None,
     ) -> None:
-        """Initialize BaseRAG with all dependencies.
-
-        Args:
-            retriever: Vector store retriever (dense or hybrid).
-            llm: LLM provider for generation and token counting.
-            cache: Optional CacheManager. If None, caching is skipped.
-                Typed as object to avoid circular imports.
-            ranker: Optional ContextRanker. If None, a default MMR
-                ranker is created.
-            assembler: Optional ContextAssembler. If None, a default
-                assembler is created using the provided LLM for
-                token counting.
-            fallback_llm: Optional secondary LLM used when the primary
-                provider enters cooldown or fails with a provider error.
-        """
         self._retriever = retriever
         self._llm = llm
         self._fallback_llm = fallback_llm
         self._cache = cache
-        # Inject reranker at construction so per-request cross_encoder works
-        # without re-instantiating the ranker on every query.
         self._ranker = ranker or ContextRanker(
             strategy="mmr",
             embeddings_fn=get_embeddings,
@@ -133,16 +66,10 @@ class BaseRAG(ABC):
             "enabled" if self._cache else "disabled",
         )
 
-    # Abstract — subclasses MUST implement
-
     @property
     @abstractmethod
     def variant_name(self) -> str:
-        """Return the variant identifier string.
-
-        Returns:
-            Variant name e.g. 'simple', 'chain'.
-        """
+        """Return the variant identifier string."""
 
     @abstractmethod
     async def retrieve(
@@ -152,49 +79,10 @@ class BaseRAG(ABC):
         filters: list | None = None,
         request: RAGRequest | None = None,
     ) -> list[RetrievedChunk]:
-        """Retrieve relevant chunks from the vector store.
-
-        This is the primary hook every variant implements. SimpleRAG
-        calls the retriever directly.
-
-        Args:
-            query: Processed query string (output of pre_process).
-            top_k: Maximum chunks to retrieve.
-            filters: Optional metadata filters from RAGConfig.
-            request: Full RAGRequest for any variant-specific config.
-                SimpleRAG ignores it.
-
-        Returns:
-            List of RetrievedChunk ordered by relevance.
-
-        Raises:
-            RAGRetrievalError: If retrieval fails.
-        """
-
-    # Sealed pipeline — query() orchestrates everything
+        """Retrieve relevant chunks from the vector store."""
 
     async def query(self, request: RAGRequest) -> RAGResponse:
-        """Execute the full RAG pipeline.
-
-        This method is SEALED — variants do not override it. The pipeline
-        flow is fixed: cache → pre_process → retrieve → rank → assemble →
-        generate → cache_write → return.
-
-        Variants customize behavior by overriding individual hooks
-        (retrieve, pre_process, rank, generate).
-
-        Args:
-            request: RAGRequest with query, collection, config, and
-                optional conversation history.
-
-        Returns:
-            RAGResponse with answer, sources, timings, and diagnostics.
-
-        Raises:
-            RAGRetrievalError: If retrieval fails.
-            RAGContextError: If context assembly fails.
-            RAGGenerationError: If LLM generation fails.
-        """
+        """Execute the full RAG pipeline; sealed, do not override."""
         total_start = time.perf_counter()
         config = request.config
 
@@ -207,18 +95,14 @@ class BaseRAG(ABC):
             request.collection_name,
         )
 
-        # Step 1: Cache check
         if self._cache:
             cache_result = await self._try_cache_read(request)
             if cache_result is not None:
                 return cache_result
 
-        # Step 2: Pre-process
         processed_query = await self.pre_process(request)
 
-        # Step 3: Retrieve
-        # For cross_encoder: fetch RERANKER_COARSE_TOP_K candidates (e.g. 10) so
-        # the reranker has enough to score; otherwise fetch config.top_k directly.
+        # cross_encoder needs a larger coarse candidate pool before reranking
         active_strategy = config.rerank_strategy
         if active_strategy == "cross_encoder" and self._ranker._reranker is not None:
             from config.settings import settings as _s
@@ -235,21 +119,10 @@ class BaseRAG(ABC):
         )
         retrieval_ms = (time.perf_counter() - retrieval_start) * 1000
 
-        # Step 4: Rank
         ranking_start = time.perf_counter()
         ranked_chunks = await self.rank(chunks, processed_query, strategy=active_strategy)
         ranking_ms = (time.perf_counter() - ranking_start) * 1000
 
-        # Step 4b: Reranker quality check + MMR recovery.
-        #
-        # When cross-encoder scores fall below threshold (common in narrative/
-        # domain-specific corpora where ms-marco-MiniLM is miscalibrated), we
-        # do NOT immediately fail. Instead, re-rank the same coarse candidates
-        # with MMR — no extra retrieval call, zero added latency for the normal
-        # path. Only if MMR also returns nothing do we return "no context".
-        #
-        # This eliminates the retrieval-reranker domain-mismatch failure mode
-        # without adding any network calls.
         if ranked_chunks:
             reranker_scores = [
                 c.reranker_score for c in ranked_chunks if c.reranker_score is not None
@@ -264,23 +137,18 @@ class BaseRAG(ABC):
                         top_reranker_score,
                         threshold,
                     )
-                    # Re-rank the original coarse candidates (still in `chunks`)
-                    # with MMR — MMR is corpus-agnostic and does not depend on
-                    # ms-marco calibration.
                     ranked_chunks = await self._ranker.rank(
                         chunks, processed_query, strategy="mmr"
                     )
                     ranking_ms = (time.perf_counter() - ranking_start) * 1000
 
                     if not ranked_chunks:
-                        # Genuine zero-retrieval failure — nothing to recover from.
                         total_ms = (time.perf_counter() - total_start) * 1000
                         logger.warning(
                             "MMR fallback returned no chunks — returning "
                             "low-confidence response | request_id=%s",
                             request.request_id,
                         )
-                        # Unblock any coalesced requests waiting on this key.
                         if self._cache:
                             try:
                                 await self._cache.resolve_in_flight(
@@ -331,17 +199,6 @@ class BaseRAG(ABC):
                         top_reranker_score,
                     )
 
-        # Step 4c: Minimum context guarantee.
-        #
-        # The cross-encoder ratio filter (SCORE_RATIO × top_score) can reduce
-        # ranked_chunks to 1 even when the query is valid and data exists.
-        # Example: scores=[0.65, 0.08, 0.06] with RATIO=0.4 → threshold=0.26
-        #   → only 0.65 survives. top_score=0.65 > THRESHOLD=0.12, so the
-        #   MMR recovery (step 4b) does NOT trigger. 1 chunk reaches the assembler.
-        #
-        # Fix: backfill from the original coarse pool (already in memory — no
-        # extra retrieval) up to RAG_MIN_CONTEXT_CHUNKS. Backfill candidates are
-        # sorted by their Qdrant relevance_score so the best are always added first.
         _min_ctx = config.min_context_chunks
         if ranked_chunks and len(ranked_chunks) < _min_ctx:
             already_ids = {c.chunk_id for c in ranked_chunks}
@@ -358,10 +215,6 @@ class BaseRAG(ABC):
                     min(needed, len(backfill)), len(ranked_chunks), _min_ctx,
                 )
             elif active_strategy != "cross_encoder":
-                # Backfill pool is exhausted because no coarse over-fetch was done
-                # (MMR/none strategies only retrieve config.top_k candidates, not
-                # RERANKER_COARSE_TOP_K). Expand to 2×top_k and re-retrieve once.
-                # This is the only path where an extra retrieval call is justified.
                 expanded_k = config.top_k * 2
                 logger.info(
                     "Adaptive top_k expansion | original_k=%d | expanded_k=%d",
@@ -379,17 +232,14 @@ class BaseRAG(ABC):
                 )
                 ranking_ms = (time.perf_counter() - ranking_start) * 1000
 
-        # Step 5: Assemble context
         context_str, updated_chunks, context_tokens = await self.assemble_context(
             ranked_chunks
         )
 
-        # Step 6: Generate
         generation_start = time.perf_counter()
         llm_response = await self.generate(context_str, processed_query, request)
         generation_ms = (time.perf_counter() - generation_start) * 1000
 
-        # Step 7: Build response
         total_ms = (time.perf_counter() - total_start) * 1000
 
         timings = RAGTimings(
@@ -404,7 +254,6 @@ class BaseRAG(ABC):
             method=config.confidence_method,
         )
 
-        # Omit source chunks when the caller has disabled source inclusion
         sources = updated_chunks if config.include_sources else []
 
         rag_response = RAGResponse.from_generation(
@@ -419,7 +268,6 @@ class BaseRAG(ABC):
             low_confidence=self._get_low_confidence_flag(),
         )
 
-        # Step 8: Cache write
         if self._cache:
             await self._try_cache_write(request, llm_response, sources, confidence)
 
@@ -436,30 +284,12 @@ class BaseRAG(ABC):
 
         return rag_response
 
-    # Overridable hooks — sensible defaults, variants customize
-
     async def pre_process(self, request: RAGRequest) -> str:
-        """Pre-process the query before retrieval.
-
-        Default behavior: if conversation_history exists, use the LLM to
-        resolve pronouns and make the query self-contained. Otherwise,
-        return the query as-is (already stripped by RAGRequest validator).
-
-        QueryExpansionRAG (future) would override this to generate a
-        hypothetical answer for HyDE embedding.
-
-        Args:
-            request: Full RAGRequest with query and optional history.
-
-        Returns:
-            Processed query string ready for retrieval.
-        """
-        # Without history there is nothing to resolve — return directly
+        """Pre-process the query; resolves pronouns via LLM when history exists."""
         chat_messages = request.get_chat_messages()
         if not chat_messages:
             return request.query
 
-        # Build a conversation-aware refinement prompt
         history_str = format_conversation_history(chat_messages)
         system_prompt, user_prompt = build_conversation_refinement_prompt(
             query=request.query,
@@ -501,42 +331,14 @@ class BaseRAG(ABC):
         query: str,
         strategy: str | None = None,
     ) -> list[RetrievedChunk]:
-        """Rerank retrieved chunks using the configured strategy.
-
-        Default behavior: delegate to the injected ContextRanker.
-        Subclasses may override this to add variant-specific evaluation
-        before or after reranking.
-
-        Args:
-            chunks: Retrieved chunks from retrieve().
-            query: Processed query string.
-            strategy: Per-request strategy override (e.g. 'cross_encoder').
-                Passed through to ContextRanker.rank().
-
-        Returns:
-            Reranked list of RetrievedChunk.
-        """
+        """Rerank retrieved chunks using the configured strategy."""
         return await self._ranker.rank(chunks, query, strategy=strategy)
 
     async def assemble_context(
         self,
         chunks: list[RetrievedChunk],
     ) -> tuple[str, list[RetrievedChunk], int]:
-        """Assemble ranked chunks into a token-bounded context string.
-
-        Default behavior: delegate to the injected ContextAssembler.
-        Rarely overridden — the assembler handles token budgeting,
-        source labeling, and used_in_context flagging.
-
-        Args:
-            chunks: Ranked chunks from rank().
-
-        Returns:
-            Tuple of (context_string, updated_chunks, tokens_used).
-
-        Raises:
-            RAGContextError: If no chunks fit the token budget.
-        """
+        """Assemble ranked chunks into a token-bounded context string."""
         return await self._assembler.assemble(chunks)
 
     async def generate(
@@ -545,33 +347,7 @@ class BaseRAG(ABC):
         query: str,
         request: RAGRequest,
     ) -> LLMResponse:
-        """Generate an answer using the LLM with assembled context.
-
-        Default behavior:
-            - Build system + user prompts from templates.
-            - If custom system_prompt is set in RAGConfig, use that instead.
-            - If conversation_history exists, include it in the prompt.
-            - Call the LLM via chat() with system + user messages.
-            - If the primary LLM is in cooldown, route directly to the
-              fallback LLM without paying the timeout penalty.
-            - On provider-level failure, mark primary unhealthy and retry
-              generation with fallback (saves re-running full retrieval).
-
-        MultiAgentRAG (future) would override this to synthesize answers
-        across multiple sub-query results.
-
-        Args:
-            context: Assembled context string from assemble_context().
-            query: Processed query string.
-            request: Full RAGRequest for conversation history and config.
-
-        Returns:
-            LLMResponse from the LLM provider.
-
-        Raises:
-            RAGGenerationError: If LLM returns empty or unusable output.
-        """
-        # Build conversation history string if available
+        """Generate an answer using the LLM with assembled context."""
         chat_messages = request.get_chat_messages()
         history_str = (
             format_conversation_history(chat_messages)
@@ -579,14 +355,12 @@ class BaseRAG(ABC):
             else None
         )
 
-        # Build prompt pair from templates
         system_prompt, user_prompt = build_rag_prompt(
             query=query,
             context=context,
             conversation_history=history_str,
         )
 
-        # Allow per-request system prompt override
         if request.config.system_prompt:
             system_prompt = request.config.system_prompt
 
@@ -598,8 +372,7 @@ class BaseRAG(ABC):
         try:
             from llm.exceptions.llm_exceptions import LLMError, LLMProviderError
 
-            # Skip primary LLM if it is in cooldown (e.g. blocked by Zscaler).
-            # Routes directly to fallback without paying the timeout penalty.
+            # skip primary if in cooldown to avoid unnecessary timeout latency
             _skip_primary = (
                 not provider_health.is_available(self._llm.provider_name)
                 and self._fallback_llm is not None
@@ -619,7 +392,6 @@ class BaseRAG(ABC):
                     messages,
                     temperature=request.config.temperature,
                 )
-                # Successful call — clear any prior failure state immediately.
                 provider_health.mark_recovered(self._llm.provider_name)
 
             if not response.text or not response.text.strip():
@@ -639,11 +411,7 @@ class BaseRAG(ABC):
             raise
 
         except Exception as exc:
-            # Any LLM-layer error (timeout, rate-limit, provider failure) with a
-            # fallback configured → retry generation with the fallback LLM only.
-            # Re-retrieval is skipped — this saves ~3-4s vs re-running the pipeline.
-            # Only LLMProviderError (hard failure) marks the primary as unavailable;
-            # transient errors (timeout, rate-limit) let the pool self-recover.
+            # hard LLMProviderError marks primary unavailable; other LLMErrors do not
             if isinstance(exc, LLMError) and self._fallback_llm is not None:
                 if isinstance(exc, LLMProviderError):
                     provider_health.mark_failed(self._llm.provider_name)
@@ -674,7 +442,6 @@ class BaseRAG(ABC):
                         details={"request_id": request.request_id},
                     ) from fallback_exc
 
-            # No fallback configured — propagate LLM errors as-is, wrap the rest
             if isinstance(exc, LLMError):
                 raise
 
@@ -686,20 +453,8 @@ class BaseRAG(ABC):
                 },
             ) from exc
 
-    # Private helpers
-
     async def _try_cache_read(self, request: RAGRequest) -> RAGResponse | None:
-        """Attempt to read a cached response. Returns None on miss or error.
-
-        Cache errors are caught and logged — they never propagate to the
-        caller. A cache failure means the full pipeline runs instead.
-
-        Args:
-            request: RAGRequest used to compute the cache key.
-
-        Returns:
-            RAGResponse if cache hit, None otherwise.
-        """
+        """Attempt to read a cached response. Returns None on miss or error."""
         try:
             result = await self._cache.get_or_wait(
                 query=request.query,
@@ -757,17 +512,7 @@ class BaseRAG(ABC):
         sources: list[RetrievedChunk] | None = None,
         confidence: ConfidenceScore | None = None,
     ) -> None:
-        """Attempt to write a response to cache. Errors are caught and logged.
-
-        Cache write is the last step before return. Failures do not affect
-        the response already built — they are surfaced only via a warning log.
-
-        Args:
-            request: RAGRequest used to compute the cache key.
-            llm_response: LLMResponse to store.
-            sources: Retrieved chunks to store alongside the response.
-            confidence: Confidence score to persist for cache hit responses.
-        """
+        """Attempt to write a response to cache. Errors are caught and logged."""
         try:
             await self._cache.set(
                 query=request.query,
@@ -792,14 +537,7 @@ class BaseRAG(ABC):
             )
 
     def _get_low_confidence_flag(self) -> bool:
-        """Return whether the current query result has low confidence.
-
-        Default: always False. Subclasses override this via the
-        _is_low_confidence instance variable set during retrieve().
-
-        Returns:
-            True if the variant flagged low confidence for this query.
-        """
+        """Return whether the current query result has low confidence."""
         return getattr(self, "_is_low_confidence", False)
 
     def _compute_confidence(
@@ -807,23 +545,7 @@ class BaseRAG(ABC):
         chunks: list[RetrievedChunk],
         method: str = "retrieval",
     ) -> ConfidenceScore:
-        """Compute a confidence score from retrieval results.
-
-        Averages relevance scores of chunks that were included in the
-        context (used_in_context=True). Prefers reranker scores when
-        available — cross-encoder attends jointly to (query, chunk) and
-        is a stronger relevance signal than cosine distance alone.
-
-        Subclasses may override this to use LLM-evaluated relevance scores.
-
-        Args:
-            chunks: Updated chunks with used_in_context flags set.
-            method: Confidence scoring method string from RAGConfig.
-
-        Returns:
-            ConfidenceScore with value and method.
-        """
-        # Only count chunks that were actually used in context
+        """Compute a confidence score from retrieval results."""
         used_chunks = [c for c in chunks if c.used_in_context]
 
         if not used_chunks:
@@ -831,10 +553,7 @@ class BaseRAG(ABC):
 
         import math
 
-        # Prefer reranker scores when available — the cross-encoder reads
-        # (query, chunk) jointly via full attention, making it a direct
-        # semantic relevance signal rather than a vector distance proxy.
-        # Fall back to cosine/RRF relevance scores when reranker didn't run.
+        # cross-encoder scores are preferred: joint (query, chunk) attention is stronger than cosine
         reranker_scores = [
             c.reranker_score for c in used_chunks if c.reranker_score is not None
         ]
@@ -842,8 +561,7 @@ class BaseRAG(ABC):
             scores = sorted(reranker_scores, reverse=True)
             method = "reranker"
         else:
-            # Average the top-⌈k/2⌉ scores — avoids skew from low-scoring tail
-            # chunks (especially pronounced with hybrid RRF scoring).
+            # average top-ceil(k/2) to avoid skew from low-scoring tail chunks
             scores = sorted(
                 (c.relevance_score for c in used_chunks), reverse=True
             )
@@ -851,17 +569,11 @@ class BaseRAG(ABC):
         top_n = max(1, math.ceil(len(scores) / 2))
         avg_score = sum(scores[:top_n]) / top_n
 
-        # Clamp to valid range
         avg_score = max(0.0, min(1.0, avg_score))
 
         return ConfidenceScore(value=round(avg_score, 4), method=method)
 
     def __repr__(self) -> str:
-        """Human-readable representation for logging.
-
-        Returns:
-            String like 'SimpleRAG(retriever=dense, llm=gemini)'.
-        """
         return (
             f"{self.__class__.__name__}("
             f"retriever={self._retriever.retriever_type}, "

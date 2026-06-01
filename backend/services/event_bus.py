@@ -12,7 +12,7 @@ logger = get_logger(__name__)
 
 
 _TERMINAL_PHASES = {"ready", "failed", "duplicate"}
-_SUBSCRIBER_QUEUE_SIZE = 128  # cap memory if an SSE consumer falls behind
+_SUBSCRIBER_QUEUE_SIZE = 128  # cap memory if an sse consumer falls behind
 
 
 @runtime_checkable

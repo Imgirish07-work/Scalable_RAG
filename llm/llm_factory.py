@@ -1,32 +1,4 @@
-"""
-Factory for creating and configuring LLM provider instances.
-
-Design:
-    Class-level registry pattern. The registry dict maps provider name strings
-    to their concrete BaseLLM subclasses. Adding a new provider requires only
-    one registry entry — no other code changes. All public methods are
-    classmethods so no factory instantiation is needed at the call site.
-
-    Groq pool path:
-        When default_provider == 'groq', create_from_settings() returns a
-        GroqModelPool instead of a plain GroqProvider. The pool manages 5
-        models with dynamic routing and header-based rate limit tracking.
-        create_groq_pool() is also available for explicit pool construction.
-
-        The existing create() / create_rate_limited() methods still work for
-        single-model Groq usage (e.g. tests, one-off scripts) by passing
-        provider_name='groq' as before.
-
-Chain of Responsibility:
-    Pipeline calls LLMFactory.create() or create_from_settings() →
-    factory instantiates the concrete provider → wraps it in LLMRateLimiter
-    when enabled → returns BaseLLM to RAGPipeline.configure_llm().
-
-Dependencies:
-    llm.contracts.base_llm, llm.providers.*, llm.exceptions.llm_exceptions,
-    llm.rate_limiter (LLMRateLimiter, get_rate_limit_config),
-    llm.providers.groq_model_pool, config.settings, utils.logger.
-"""
+"""Factory for creating and configuring LLM provider instances via a class-level registry."""
 
 from typing import Optional
 
@@ -44,22 +16,13 @@ logger = get_logger(__name__)
 
 
 class LLMFactory:
-    """Creates and configures LLM provider instances from a registry.
+    """Creates and configures LLM provider instances from a registry; all methods are classmethods."""
 
-    All methods are classmethods — no instantiation of LLMFactory is needed.
-
-    Attributes:
-        _registry: Maps provider name strings to their BaseLLM subclasses.
-    """
-
-    # Single source of truth for all registered providers
     _registry: dict[str, type[BaseLLM]] = {
         "openai": OpenAIProvider,
         "gemini": GeminiProvider,
         "groq": GroqProvider,
     }
-
-    # Public methods
 
     @classmethod
     def create(
@@ -71,25 +34,7 @@ class LLMFactory:
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
     ) -> BaseLLM:
-        """Create and return a raw (non-rate-limited) LLM provider instance.
-
-        Only passes explicitly-provided overrides to the constructor.
-        The provider's __init__ falls back to settings for any unset parameter.
-
-        Args:
-            provider_name: Provider to create e.g. 'openai', 'gemini', 'groq'.
-            api_key: Optional API key override.
-            model: Optional model name override.
-            temperature: Optional sampling temperature override.
-            max_tokens: Optional max output tokens override.
-            timeout: Optional request timeout override in seconds.
-
-        Returns:
-            BaseLLM instance — always the contract type, never a concrete class.
-
-        Raises:
-            LLMProviderError: If provider_name is empty or not in the registry.
-        """
+        """Create and return a raw (non-rate-limited) LLM provider instance."""
         cleaned_name = cls._validate_provider(provider_name)
         provider_class = cls._registry[cleaned_name]
 
@@ -115,25 +60,7 @@ class LLMFactory:
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
     ) -> BaseLLM:
-        """Create a provider and wrap it with the per-model rate limiter.
-
-        Single call that handles both creation and rate limiting, preventing
-        any code path from accidentally using an unthrottled raw provider.
-        Rate limiting is skipped when LLM_RATE_LIMITER_ENABLED=False
-        (used in tests and local dev).
-
-        Args:
-            provider_name: Provider name e.g. 'groq', 'gemini', 'openai'.
-            api_key: Optional API key override.
-            model: Optional model name override.
-            temperature: Optional temperature override.
-            max_tokens: Optional max tokens override.
-            timeout: Optional request timeout override.
-
-        Returns:
-            LLMRateLimiter-wrapped BaseLLM when rate limiting is enabled,
-            raw provider BaseLLM otherwise.
-        """
+        """Create a provider wrapped with LLMRateLimiter; skips wrapping if rate limiter disabled."""
         provider = cls.create(
             provider_name=provider_name,
             api_key=api_key,
@@ -163,24 +90,7 @@ class LLMFactory:
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
     ) -> GroqModelPool:
-        """Create a GroqModelPool that dynamically routes across 5 Groq models.
-
-        The pool is the recommended way to use Groq — it routes each call to
-        the best available model based on real-time header data, preventing
-        429 exhaustion from hitting a single model's daily RPD limit.
-
-        All args fall back to settings when not provided, matching the same
-        defaults as create_rate_limited("groq").
-
-        Args:
-            api_key:     Groq API key. Falls back to settings.groq_api_key.
-            temperature: Default temperature. Falls back to settings.temperature.
-            max_tokens:  Default max output tokens. Falls back to settings.max_tokens.
-            timeout:     Request timeout in seconds. Falls back to settings.GROQ_TIMEOUT.
-
-        Returns:
-            GroqModelPool instance implementing BaseLLM.
-        """
+        """Create a GroqModelPool that dynamically routes across multiple Groq models."""
         logger.info("Creating GroqModelPool (multi-model dynamic routing)")
 
         return GroqModelPool(
@@ -192,23 +102,7 @@ class LLMFactory:
 
     @classmethod
     def create_from_settings(cls) -> BaseLLM:
-        """Create a provider from the default_provider setting.
-
-        When default_provider == 'groq', returns a GroqModelPool for dynamic
-        multi-model routing instead of a single-model GroqProvider. The pool
-        manages its own reactive rate limiting via response headers, so no
-        LLMRateLimiter wrapper is added for Groq.
-
-        For all other providers, returns the standard rate-limited single-model
-        provider, wrapping with LLMRateLimiter when LLM_RATE_LIMITER_ENABLED.
-
-        Returns:
-            BaseLLM configured from settings. Either a GroqModelPool (groq)
-            or a rate-limited single-model provider (openai, gemini).
-
-        Raises:
-            LLMProviderError: If default_provider in settings is not registered.
-        """
+        """Create a provider from settings.default_provider; uses GroqModelPool when provider=='groq'."""
         provider_name = settings.default_provider
 
         logger.info(
@@ -216,38 +110,20 @@ class LLMFactory:
             provider_name,
         )
 
-        # Groq → use the multi-model pool (reactive header-based rate limiting)
+        # groq uses the multi-model pool with reactive header-based rate limiting
         if provider_name.strip().lower() == "groq":
             return cls.create_groq_pool()
 
-        # All other providers → single model with LLMRateLimiter wrapper
         return cls.create_rate_limited(provider_name)
 
     @classmethod
     def available_providers(cls) -> list[str]:
-        """Return all registered provider names sorted alphabetically.
-
-        Useful for validation, health checks, and CLI help text.
-
-        Returns:
-            Sorted list of provider name strings.
-        """
+        """Return all registered provider names sorted alphabetically."""
         return sorted(cls._registry.keys())
 
     @classmethod
     def register(cls, provider_name: str, provider_class: type[BaseLLM]) -> None:
-        """Register a new provider at runtime.
-
-        Allows external plugins or test mocks to add providers without
-        modifying the factory source. Validates that the class implements BaseLLM.
-
-        Args:
-            provider_name: Unique identifier string e.g. 'anthropic'.
-            provider_class: Class that subclasses BaseLLM.
-
-        Raises:
-            LLMProviderError: If provider_class does not subclass BaseLLM.
-        """
+        """Register a new provider at runtime; validates that provider_class subclasses BaseLLM."""
         if not (isinstance(provider_class, type) and issubclass(provider_class, BaseLLM)):
             raise LLMProviderError(
                 f"Cannot register '{provider_name}'. "
@@ -257,21 +133,9 @@ class LLMFactory:
         cls._registry[provider_name.strip().lower()] = provider_class
         logger.info("Registered new LLM provider | provider=%s", provider_name)
 
-    # Private methods
-
     @classmethod
     def _validate_provider(cls, provider_name: str) -> str:
-        """Validate the provider name and return its cleaned lowercase form.
-
-        Args:
-            provider_name: Raw provider name string from the caller.
-
-        Returns:
-            Cleaned lowercase provider name.
-
-        Raises:
-            LLMProviderError: If provider_name is empty or not in the registry.
-        """
+        """Validate the provider name and return its cleaned lowercase form."""
         if not provider_name or not provider_name.strip():
             raise LLMProviderError(
                 "Provider name cannot be empty. "
@@ -297,21 +161,7 @@ class LLMFactory:
         max_tokens: Optional[int],
         timeout: Optional[float],
     ) -> dict:
-        """Build a kwargs dict containing only explicitly-provided overrides.
-
-        Excludes None values so the provider's __init__ falls back to settings
-        for any parameter not explicitly set by the caller.
-
-        Args:
-            api_key: Optional API key override.
-            model: Optional model name override.
-            temperature: Optional temperature override.
-            max_tokens: Optional max tokens override.
-            timeout: Optional timeout override.
-
-        Returns:
-            Dict containing only non-None overrides.
-        """
+        """Build a kwargs dict containing only non-None overrides."""
         kwargs = {}
 
         if api_key is not None:

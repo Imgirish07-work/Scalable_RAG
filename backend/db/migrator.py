@@ -1,19 +1,4 @@
-"""SQL migration runner.
-
-Usage:
-    python -m backend.db.migrator up      Apply every pending .up.sql migration.
-    python -m backend.db.migrator down    Revert the most recently applied migration.
-    python -m backend.db.migrator info    Show applied + pending status.
-
-Run inside the backend container so `BACKEND_DATABASE_URL` resolves the
-`postgres` compose hostname:
-
-    docker compose exec backend python -m backend.db.migrator up
-
-Each migration is applied in its own transaction; partial failures roll back
-that migration alone. The bookkeeping table `_schema_migrations` tracks which
-versions are applied and is created on first run.
-"""
+"""SQL migration runner (`up`/`down`/`info`); each migration runs in its own transaction and `_schema_migrations` tracks applied versions."""
 
 import argparse
 import asyncio

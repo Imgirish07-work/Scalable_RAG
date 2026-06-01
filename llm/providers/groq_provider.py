@@ -1,21 +1,4 @@
-"""
-Groq LLM provider — OpenAI-compatible subclass of OpenAIProvider.
-
-Design:
-    Groq exposes an OpenAI-compatible REST API, so this provider inherits
-    all call logic, error translation, token counting, and response parsing
-    from OpenAIProvider. Only the base URL, API key, and provider_name differ.
-
-Chain of Responsibility:
-    LLMFactory.create("groq") instantiates this provider →
-    returned as BaseLLM → BaseRAG.generate() calls generate() or chat() →
-    LLMRateLimiter wraps calls when rate limiting is enabled.
-
-Dependencies:
-    llm.providers.openai_provider.OpenAIProvider,
-    llm.exceptions.llm_exceptions.LLMAuthError,
-    config.settings, utils.logger.
-"""
+"""Groq LLM provider — OpenAI-compatible subclass of OpenAIProvider."""
 
 from typing import Optional
 
@@ -32,19 +15,7 @@ _GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 
 class GroqProvider(OpenAIProvider):
-    """Groq implementation of BaseLLM via OpenAI-compatible API.
-
-    Inherits all API call logic, error translation, and token counting from
-    OpenAIProvider. Only the client base_url and API key differ.
-
-    Default model is GROQ_MODEL_STRONG (llama-3.3-70b-versatile).
-    Pass model= explicitly to use GROQ_MODEL_FAST or GROQ_MODEL_FALLBACK.
-
-    Model roles (configured in settings / .env):
-        GROQ_MODEL_FAST     llama-3.1-8b-instant       classify, decompose, simple queries
-        GROQ_MODEL_STRONG   llama-3.3-70b-versatile    final synthesis (default)
-        GROQ_MODEL_FALLBACK qwen/qwen3-32b              fallback when strong model hits 429
-    """
+    """Groq implementation of BaseLLM via OpenAI-compatible API; default model is GROQ_MODEL_STRONG."""
 
     def __init__(
         self,
@@ -54,18 +25,7 @@ class GroqProvider(OpenAIProvider):
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
     ) -> None:
-        """Initialize Groq provider with Groq-specific key and base URL.
-
-        Args:
-            api_key: Groq API key. Falls back to settings.groq_api_key.
-            model: Model name. Falls back to settings.GROQ_MODEL_STRONG.
-            temperature: Sampling temperature. Falls back to settings.
-            max_tokens: Max output tokens. Falls back to settings.
-            timeout: Request timeout in seconds. Falls back to settings.GROQ_TIMEOUT.
-
-        Raises:
-            LLMAuthError: If no Groq API key is available.
-        """
+        """Initialize Groq provider with Groq-specific key and base URL."""
         resolved_key = api_key or settings.groq_api_key
         if not resolved_key:
             raise LLMAuthError(
@@ -73,8 +33,7 @@ class GroqProvider(OpenAIProvider):
                 "Set GROQ_API_KEY in .env or pass api_key argument."
             )
 
-        # Use a Groq-specific timeout — shorter than the global request_timeout so
-        # Zscaler-blocked requests fail fast and fall back to Gemini quickly
+        # groq-specific timeout — shorter than global so zscaler blocks fail fast
         resolved_timeout = timeout if timeout is not None else settings.GROQ_TIMEOUT
 
         super().__init__(
@@ -84,7 +43,7 @@ class GroqProvider(OpenAIProvider):
             max_tokens=max_tokens,
             timeout=resolved_timeout,
             base_url=_GROQ_BASE_URL,
-            max_retries=0,  # disable SDK retries — GroqModelPool._dispatch handles 429 by switching models immediately
+            max_retries=0,  # disable sdk retries — GroqModelPool handles 429 by switching models
         )
 
         self._encoder = tiktoken.get_encoding("cl100k_base")
@@ -96,25 +55,10 @@ class GroqProvider(OpenAIProvider):
 
     @property
     def provider_name(self) -> str:
-        """Returns the provider identifier string 'groq'."""
         return "groq"
 
     async def count_tokens(self, text: str) -> int:
-        """Count tokens using cl100k_base — best tiktoken approximation for Groq models.
-
-        LLaMA 3 (128k vocab) and Qwen models are not in tiktoken's registry.
-        OpenAIProvider's fallback uses o200k_base (200k vocab, GPT-4o encoder),
-        which undercounts by ~8-15% because its larger vocabulary merges more
-        subword units. cl100k_base (100k vocab, GPT-4 encoder) is a closer
-        approximation to LLaMA's 128k vocab and avoids the undercount that causes
-        context assembler to pack more text than the model window actually allows.
-
-        Args:
-            text: Input text to count tokens for.
-
-        Returns:
-            Token count as integer. Returns 0 for empty input.
-        """
+        """Count tokens via cl100k_base — closest tiktoken match for LLaMA's 128k vocab."""
         if not text:
             return 0
         return len(self._encoder.encode(text))

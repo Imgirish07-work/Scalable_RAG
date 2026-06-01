@@ -1,19 +1,7 @@
 import { memo } from "react";
 import { NOTIFICATION_STYLES, NotificationIcon, CloseIcon } from "./notificationStyles";
 
-/**
- * Alert — inline, persistent notification. Visual twin of Toast.
- *
- * Props:
- *   type        — "success" | "warning" | "error" | "info" (default: "info")
- *   title       — bold heading (optional)
- *   message     — body text (or pass children for rich content)
- *   dismissible — show close button (default: false)
- *   onDismiss   — called when close button is clicked
- *   action      — optional node rendered after the message (e.g. retry button)
- *   className   — extra wrapper classes
- *   style       — extra wrapper styles
- */
+// inline, persistent notification — visual twin of Toast
 function Alert({
   type = "info",
   title,

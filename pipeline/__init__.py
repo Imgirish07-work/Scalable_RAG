@@ -1,5 +1,3 @@
-"""Pipeline package — single entry point for the entire RAG system."""
-
 from pipeline.rag_pipeline import RAGPipeline
 from pipeline.models.pipeline_request import (
     IngestionResult,

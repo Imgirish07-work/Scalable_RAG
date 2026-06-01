@@ -3,10 +3,6 @@ import { Alert, Tooltip, Slider } from "../atoms";
 import { ParamInfoPanel } from "../molecules";
 import { C } from "../../theme";
 
-/**
- * Shared metadata helpers for parameter controls.
- * Re-exported so consumers (pages, other organisms) can use them directly.
- */
 export function getTempMeta(val) {
   const v = parseFloat(val);
 
@@ -47,17 +43,7 @@ const TOKEN_PRESETS = [
   { label: "Max",    value: 4096 },
 ];
 
-/**
- * ParameterPanel — unified temperature / max-tokens / top-p controls organism.
- *
- * Props:
- *   temp / setTemp        — temperature value + setter
- *   maxTok / setMaxTok    — max tokens value + setter
- *   topP / setTopP        — top-p value + setter (optional — omit to hide)
- *   disabled              — lock controls during generation
- *   onCommit(patch)       — optional, called on mouseUp for backend sync
- *   style / className     — extra styles
- */
+// unified temperature / max-tokens / top-p controls
 export default function ParameterPanel({
   temp, setTemp,
   maxTok, setMaxTok,
@@ -92,7 +78,6 @@ export default function ParameterPanel({
     <div className={`space-y-3 ${className}`} style={style}>
       {disabled && <Alert type="warning" message="Parameters locked while generating…" />}
 
-      {/* Temperature */}
       <div ref={tempRef} className={sectionCls}>
         <div className="flex items-center justify-between">
           <label className="text-xs font-medium text-theme-ink">
@@ -119,7 +104,6 @@ export default function ParameterPanel({
           : <p className="text-xs italic text-theme-ink-muted">{tempMeta.tip}</p>}
       </div>
 
-      {/* Max Tokens */}
       <div ref={maxTokRef} className={sectionCls}>
         <div className="flex items-center justify-between">
           <label className="text-xs font-medium text-theme-ink">
@@ -159,7 +143,6 @@ export default function ParameterPanel({
         {shown.has("maxTok") && <ParamInfoPanel meta={tokenMeta} color={tokenMeta.color} />}
       </div>
 
-      {/* Top-p — only rendered if topP prop is provided */}
       {topP != null && setTopP && (
         <div ref={topPRef} className={sectionCls}>
           <div className="flex items-center justify-between">

@@ -1,18 +1,6 @@
 import { memo } from "react";
 import { C } from "../../theme";
 
-/**
- * Badge — small label/tag atom.
- *
- * Props:
- *   children  — badge content
- *   variant   — "default" | "success" | "warning" | "danger" | "info"  (default: "default")
- *   size      — "sm" | "md"  (default: "sm")
- *   dot       — show a leading dot (boolean)
- *   style     — extra inline styles
- *   className — extra Tailwind classes
- */
-
 const VARIANTS = {
   default: { background: C.accentBg,            color: C.accent,  border: `1px solid ${C.accentBorder}`, dot: C.accent  },
   success: { background: "rgba(63,185,80,0.1)",  color: C.ok,      border: "1px solid rgba(63,185,80,0.3)",  dot: C.ok   },

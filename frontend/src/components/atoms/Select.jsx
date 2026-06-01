@@ -1,18 +1,6 @@
 import { memo } from "react";
 import { C } from "../../theme";
 
-/**
- * Select — styled dropdown atom with custom chevron.
- *
- * Props:
- *   value      — controlled value
- *   onChange(v) — called with the selected string value
- *   options    — [{ value, label }]
- *   disabled   — disables interaction
- *   width      — CSS width (default: 150)
- *   style      — extra inline styles
- *   className  — extra Tailwind classes
- */
 export default memo(function Select({
   value,
   onChange,

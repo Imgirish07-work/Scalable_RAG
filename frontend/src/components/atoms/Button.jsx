@@ -1,20 +1,6 @@
 import { memo, useState } from "react";
 import { C } from "../../theme";
 
-/**
- * Button — universal button atom.
- *
- * Props:
- *   variant   — "primary" | "ghost" | "danger" | "outline"  (default: "primary")
- *   size      — "sm" | "md" | "lg"                          (default: "md")
- *   disabled  — boolean
- *   onClick   — handler
- *   style     — extra inline styles (merged last, highest priority)
- *   className — extra Tailwind classes
- *   children  — content
- *   title     — tooltip text
- *   type      — button type attr (default: "button")
- */
 export default memo(function Button({
   variant   = "primary",
   size      = "md",

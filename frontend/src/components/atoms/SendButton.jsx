@@ -1,16 +1,9 @@
 import { memo, useState } from "react";
 import { C } from "../../theme";
 
-/**
- * SendButton — cyan gradient arrow button for query submission.
- *
- * Props:
- *   onClick   — handler
- *   disabled  — disables interaction and dims the button
- */
 export default memo(function SendButton({ onClick, disabled }) {
   const [hovered, setHovered] = useState(false);
-  // Use theme-aware arrow color: accent for dark, ink for light
+  // theme-aware arrow color: accent for dark, ink for light
   const isLight = document?.documentElement?.dataset?.theme?.startsWith('light');
   const arrowColor = isLight ? C.ink : "white";
   return (

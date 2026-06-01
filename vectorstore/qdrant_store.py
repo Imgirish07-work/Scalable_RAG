@@ -1,42 +1,4 @@
-"""
-Qdrant vector store — concrete implementation of BaseVectorStore.
-
-Design:
-    Subclasses BaseVectorStore and provides dense, sparse, and hybrid search
-    backed by Qdrant. A single QdrantClient is shared across all operations.
-    All sync Qdrant/LangChain calls are wrapped in asyncio.to_thread() to keep
-    the FastAPI event loop non-blocking.
-
-    Three connection modes (switched via env vars, no code changes required):
-        Mode 1 → in_memory=True                   — dev / unit tests
-        Mode 2 → in_memory=False, local Docker     — staging
-        Mode 3 → in_memory=False, Qdrant Cloud URL — production
-
-    Three search modes:
-        dense  — semantic similarity via BGE embeddings
-        sparse — keyword matching via SPLADE
-        hybrid — dense + sparse RRF fusion (recommended; best recall)
-
-    Embedding strategy:
-        Uses metadata['embed_content'] for embedding when available.
-        embed_content = "Title: {filename} | Section: {section}\\n{content}"
-        Produces richer vectors with document context. Original page_content
-        is preserved untouched for LLM consumption.
-
-    Payload schema per stored chunk:
-        doc_id, user_id, source, page, chunk_index,
-        total_chunks, char_count, ingested_at
-
-Chain of Responsibility:
-    Called by the RAG pipeline (retrievers, ingestion service).
-    QdrantStore.initialize() → builds client → creates collection → builds
-    LangChain store wrapper. add_documents() is called by the ingestion
-    pipeline; similarity_search() and its variants are called by retrievers.
-
-Dependencies:
-    qdrant_client, langchain_qdrant, langchain_core, config.settings,
-    vectorstore.embeddings, vectorstore.base_store
-"""
+"""Qdrant-backed vector store with dense, sparse, and hybrid (RRF) search."""
 
 import asyncio
 import time
@@ -78,32 +40,12 @@ SearchMode = Literal["dense", "sparse", "hybrid"]
 
 
 class QdrantStore(BaseVectorStore):
-    """Qdrant-backed vector store with dense, sparse, and hybrid search.
+    """Qdrant-backed vector store with dense, sparse, and hybrid search."""
 
-    Uses a two-phase initialisation pattern: the constructor stores config
-    only, and initialize() establishes the actual connection and collection.
-    This allows the object to be constructed synchronously and then initialised
-    inside an async context.
-
-    Attributes:
-        collection_name: Qdrant collection name.
-        in_memory: If True, uses an in-memory Qdrant client (dev/testing).
-        search_mode: Active search mode ('dense', 'sparse', or 'hybrid').
-        _client: Single shared QdrantClient instance.
-        _store: LangChain QdrantVectorStore wrapper around _client.
-        _sparse_embeddings_instance: Lazy-loaded SPLADE sparse model.
-        _injected_client: Optional client provided at construction time.
-        _qdrant_url: Qdrant server URL (overrides settings when set).
-        _qdrant_api_key: Qdrant API key (overrides settings when set).
-    """
-
-    # Vector name constants — must match collection creation and store construction.
     _SPARSE_MODEL = "Prithivida/Splade_PP_en_v1"
     _SPARSE_VECTOR_NAME = "sparse"
     _DENSE_VECTOR_NAME = "dense"
 
-    # gRPC stability — per-request timeout (int per SDK), channel keepalive,
-    # max connection age (force-recycle stale channels), and background ping interval.
     _GRPC_REQUEST_TIMEOUT: int = 10
     _GRPC_KEEPALIVE_TIME_MS: int = 30_000
     _GRPC_KEEPALIVE_TIMEOUT_MS: int = 5_000
@@ -121,19 +63,7 @@ class QdrantStore(BaseVectorStore):
         search_mode: SearchMode = "dense",
         client: Optional[QdrantClient] = None,
     ) -> None:
-        """Store configuration; no connections are made here.
-
-        Args:
-            collection_name: Qdrant collection name. Defaults to settings value.
-            in_memory: If True, use an in-memory Qdrant client (no server needed).
-            qdrant_url: Qdrant server URL. Overrides settings when provided.
-            qdrant_api_key: Qdrant API key. Overrides settings when provided.
-            search_mode: Search strategy — 'dense', 'sparse', or 'hybrid'.
-            client: Optional existing QdrantClient to reuse. When provided,
-                the caller's client is used as-is, skipping client construction.
-                Required when multiple collections must share one in-memory
-                database (the same pattern as sharing one server in production).
-        """
+        """Store configuration; no connections are made here."""
         self.collection_name = collection_name or settings.qdrant_collection_name
         self.in_memory = in_memory
         self.search_mode = search_mode
@@ -141,34 +71,21 @@ class QdrantStore(BaseVectorStore):
         self._qdrant_api_key = qdrant_api_key
         self._injected_client: Optional[QdrantClient] = client
 
-        # Populated by initialize() — not here (two-phase pattern).
         self._client: Optional[QdrantClient] = None
         self._store: Optional[QdrantVectorStore] = None
         self._sparse_embeddings_instance: Optional[FastEmbedSparse] = None
-        # Set by _build_client(); True only when gRPC is actually in use.
         self._grpc_active: bool = False
-        # Background ping task — started in initialize(), cancelled in close().
         self._keepalive_task: Optional[asyncio.Task] = None
 
     async def initialize(self) -> None:
-        """Create the client, ensure the collection exists, and build the store.
-
-        Must be called once before add_documents() or similarity_search().
-        Safe to call multiple times (idempotent).
-
-        Raises:
-            Exception: If connection or collection creation fails.
-        """
+        """Create the client, ensure the collection exists, and build the store."""
         try:
             self._client = await asyncio.to_thread(self._build_client)
 
-            # Collection creation is sync — offload to thread to avoid blocking.
             await asyncio.to_thread(self._create_collection_if_missing)
 
             self._store = await asyncio.to_thread(self._build_vector_store)
 
-            # Start keepalive only for gRPC server connections — not in-memory
-            # or injected clients (caller manages their lifecycle).
             if self._grpc_active and self._injected_client is None:
                 self._keepalive_task = asyncio.create_task(
                     self._keepalive_loop(),
@@ -189,23 +106,8 @@ class QdrantStore(BaseVectorStore):
             logger.exception("Error initializing QdrantStore: %s", e)
             raise
 
-    # Client construction
-
     def _build_client(self) -> QdrantClient:
-        """Build and return a QdrantClient for the configured connection mode.
-
-        If a client was injected at construction time, returns it directly
-        (shared client — no new connection is created).
-
-        Transport selection for server mode:
-            QDRANT_PREFER_GRPC=True  → gRPC on port 6334 (~24% faster).
-                Falls back to HTTP automatically if the gRPC handshake fails
-                (e.g., port blocked by corporate firewall).
-            QDRANT_PREFER_GRPC=False → HTTP on port 6333 (default).
-
-        Returns:
-            Configured QdrantClient instance.
-        """
+        """Build and return a QdrantClient for the configured connection mode."""
         if self._injected_client is not None:
             return self._injected_client
 
@@ -216,27 +118,22 @@ class QdrantStore(BaseVectorStore):
         url = self._qdrant_url or settings.qdrant_url
         api_key = self._qdrant_api_key or settings.qdrant_api_key
 
-        # timeout is int per qdrant-client 1.17 SDK signature.
         kwargs: dict = {"url": url, "timeout": self._GRPC_REQUEST_TIMEOUT}
         if api_key:
             kwargs["api_key"] = api_key
 
         if settings.QDRANT_PREFER_GRPC:
-            # grpc_options dict is converted to list[tuple] by
-            # qdrant_client.connection.parse_channel_options() before being
-            # passed to grpc.insecure_channel / secure_channel.
             grpc_options: dict = {
                 "grpc.keepalive_time_ms":              self._GRPC_KEEPALIVE_TIME_MS,
                 "grpc.keepalive_timeout_ms":           self._GRPC_KEEPALIVE_TIMEOUT_MS,
-                "grpc.keepalive_permit_without_calls": 1,  # ping even with no active RPC
-                "grpc.http2.max_pings_without_data":   0,  # no limit on data-less pings
+                "grpc.keepalive_permit_without_calls": 1,
+                "grpc.http2.max_pings_without_data":   0,
                 "grpc.max_connection_age_ms":          self._GRPC_MAX_CONN_AGE_MS,
                 "grpc.max_connection_age_grace_ms":    self._GRPC_MAX_CONN_AGE_GRACE_MS,
                 "grpc.max_connection_idle_ms":         self._GRPC_MAX_CONN_IDLE_MS,
             }
             try:
                 client = QdrantClient(**kwargs, prefer_grpc=True, grpc_options=grpc_options)
-                # Probe the channel immediately — confirms the port is reachable.
                 client.get_collections()
                 self._grpc_active = True
                 logger.info(
@@ -263,17 +160,8 @@ class QdrantStore(BaseVectorStore):
         )
         return QdrantClient(**kwargs)
 
-    # gRPC keepalive and reconnect
-
     async def _keepalive_loop(self) -> None:
-        """Ping Qdrant every _GRPC_PING_INTERVAL_S seconds; reconnect on failure.
-
-        Background task — started by initialize(), cancelled by close().
-        Complements gRPC-level keepalive pings: catches cases where the channel
-        is up at TCP level but Qdrant is not actually serving requests.
-        CancelledError (BaseException, not Exception) propagates naturally —
-        no explicit handling needed.
-        """
+        """Ping Qdrant periodically and reconnect on failure."""
         while True:
             await asyncio.sleep(self._GRPC_PING_INTERVAL_S)
             if self._client is None:
@@ -289,18 +177,11 @@ class QdrantStore(BaseVectorStore):
                 await self._reconnect()
 
     async def _reconnect(self) -> None:
-        """Rebuild the gRPC channel and LangChain store wrapper after a drop.
-
-        self._client is swapped only after the new channel is confirmed reachable,
-        so readers always see a valid (old or new) client, never None.
-        On failure, logs and returns — keepalive loop retries after next interval.
-        """
+        """Rebuild the gRPC channel and LangChain store wrapper after a drop."""
         try:
-            # _build_client() is sync and probes with get_collections() internally.
             new_client = await asyncio.to_thread(self._build_client)
             old_client = self._client
 
-            # GIL-atomic swap — readers see old or new, never None.
             self._client = new_client
             self._store = await asyncio.to_thread(self._build_vector_store)
 
@@ -313,7 +194,7 @@ class QdrantStore(BaseVectorStore):
                 try:
                     await asyncio.to_thread(old_client.close)
                 except Exception:
-                    pass  # already broken — best-effort cleanup
+                    pass
 
         except Exception as exc:
             logger.error(
@@ -323,27 +204,8 @@ class QdrantStore(BaseVectorStore):
                 self._GRPC_PING_INTERVAL_S,
             )
 
-    # Collection management
-
     def _create_collection_if_missing(self) -> None:
-        """Create the Qdrant collection with the correct vector config for the search mode.
-
-        Sync — runs inside asyncio.to_thread() from initialize().
-
-        Vector config by search mode:
-            dense  → dense vectors only (BGE cosine)
-            sparse → sparse vectors only (SPLADE)
-            hybrid → both dense + sparse (RRF fusion)
-
-        Collection is created with Scalar Quantization (int8):
-            SQ compresses float32 → int8 (4× less RAM, 2-3× faster ANN search).
-            quantile=0.99 clips the top 1% of values to reduce outlier impact.
-            always_ram=True keeps quantized vectors in RAM for lowest latency.
-            rescore=True (at search time) re-ranks the top-k ANN candidates
-            with original float32 vectors, recovering the ~1% recall loss.
-
-        Idempotent — skips creation if the collection already exists.
-        """
+        """Create the Qdrant collection with the correct vector config for the search mode."""
         try:
             existing = [c.name for c in self._client.get_collections().collections]
 
@@ -352,11 +214,8 @@ class QdrantStore(BaseVectorStore):
                     "Collection '%s' already exists — skipping creation",
                     self.collection_name,
                 )
-                # Soft validation — warns on schema mismatch but does not fail.
                 self._validate_collection_config()
-                # Apply SQ to existing collection if not yet configured.
                 self._ensure_quantization()
-                # Self-healing: backfill any payload indexes added in newer versions.
                 self._ensure_payload_indexes()
                 return
 
@@ -397,8 +256,6 @@ class QdrantStore(BaseVectorStore):
             logger.exception("Error creating collection: %s", e)
             raise
 
-    # Required keyword indexes on every chunk's payload.
-    # These power the tenant + logical-collection filter at search time.
     _REQUIRED_PAYLOAD_INDEXES: tuple[str, ...] = (
         "metadata.chunk_id",
         "metadata.user_id",
@@ -407,13 +264,7 @@ class QdrantStore(BaseVectorStore):
     )
 
     def _ensure_payload_indexes(self) -> None:
-        """Create required keyword payload indexes; idempotent and self-healing.
-
-        Safe to call on both fresh and existing collections — Qdrant raises
-        when an index already exists, which we treat as success. Any other
-        failure is logged but never aborts the caller, because missing an
-        index degrades search performance but does not break correctness.
-        """
+        """Create required keyword payload indexes; idempotent and self-healing."""
         for field in self._REQUIRED_PAYLOAD_INDEXES:
             try:
                 self._client.create_payload_index(
@@ -426,21 +277,13 @@ class QdrantStore(BaseVectorStore):
                     self.collection_name, field,
                 )
             except Exception as exc:
-                # Most common: index already exists. Logged at debug to avoid noise.
                 logger.debug(
                     "Payload index skipped | collection=%s | field=%s | reason=%s",
                     self.collection_name, field, type(exc).__name__,
                 )
 
     def _validate_collection_config(self) -> None:
-        """Warn if the existing collection config does not match the current search mode.
-
-        Soft check — logs a warning but does not raise. Full schema migration
-        (e.g., adding sparse vectors to a dense-only collection) requires a
-        manual admin step and is outside the scope of this method.
-
-        Sync — called from _create_collection_if_missing().
-        """
+        """Warn if the existing collection config does not match the current search mode."""
         try:
             info = self._client.get_collection(self.collection_name)
 
@@ -458,21 +301,13 @@ class QdrantStore(BaseVectorStore):
                     )
 
         except Exception:
-            # Validation is best-effort — do not fail on check errors.
             logger.debug(
                 "Could not validate collection config for '%s'",
                 self.collection_name,
             )
 
     def _ensure_quantization(self) -> None:
-        """Apply Scalar Quantization (int8) to an existing collection if not already set.
-
-        Called once per startup when the collection already exists.
-        Qdrant re-quantizes in the background — no downtime, no data loss.
-        Idempotent: skips the update if SQ is already configured.
-
-        Sync — runs inside asyncio.to_thread() via _create_collection_if_missing().
-        """
+        """Apply Scalar Quantization (int8) to an existing collection if not already set."""
         try:
             info = self._client.get_collection(self.collection_name)
             if info.config.quantization_config is not None:
@@ -498,29 +333,14 @@ class QdrantStore(BaseVectorStore):
                 self.collection_name,
             )
         except Exception:
-            # Quantization is an optimisation — not required for correctness.
             logger.warning(
                 "Could not apply quantization to '%s' — search continues unquantized",
                 self.collection_name,
                 exc_info=True,
             )
 
-    # Vector store construction
-
     def _build_vector_store(self) -> QdrantVectorStore:
-        """Build the LangChain QdrantVectorStore wrapper for the selected search mode.
-
-        Sync — no I/O, pure object construction.
-
-        vector_name and sparse_vector_name must exactly match what was used in
-        _create_collection_if_missing(). A mismatch causes silent read/write failures.
-
-        Returns:
-            Configured QdrantVectorStore instance.
-
-        Raises:
-            ValueError: If search_mode is not one of 'dense', 'sparse', 'hybrid'.
-        """
+        """Build the LangChain QdrantVectorStore wrapper for the selected search mode."""
         valid_modes = ("dense", "sparse", "hybrid")
         if self.search_mode not in valid_modes:
             raise ValueError(
@@ -562,14 +382,7 @@ class QdrantStore(BaseVectorStore):
             raise
 
     def _get_sparse_embeddings(self) -> FastEmbedSparse:
-        """Return the sparse embedding model, instantiating it on first call.
-
-        Lazy-loaded and cached on self — only created when sparse or hybrid
-        mode is actually used. Survives across multiple _build_vector_store calls.
-
-        Returns:
-            FastEmbedSparse instance for the configured SPLADE model.
-        """
+        """Return the sparse embedding model, instantiating it on first call."""
         if self._sparse_embeddings_instance is None:
             try:
                 kwargs: dict = {}
@@ -593,8 +406,6 @@ class QdrantStore(BaseVectorStore):
                     **kwargs,
                 )
 
-                # Log which ONNX execution provider SPLADE is actually using.
-                # FastEmbedSparse._model → SparseTextEmbedding.model → SpladePP.model → ort.InferenceSession
                 try:
                     splade_session = self._sparse_embeddings_instance._model.model.model
                     active_providers = splade_session.get_providers()
@@ -611,50 +422,18 @@ class QdrantStore(BaseVectorStore):
 
         return self._sparse_embeddings_instance
 
-    # Write — add documents
-
     async def add_documents(
         self,
         documents: List[Document],
         on_batch_progress: Optional[Callable[[int, int], Awaitable[None]]] = None,
     ) -> List[str]:
-        """Embed and store documents in Qdrant with deduplication and outer batch processing.
-
-        Embedding strategy:
-            Uses metadata['embed_content'] if available — this contains
-            "Title: {file} | Section: {heading}\\n{content}" for richer
-            semantic vectors. Falls back to page_content when not set.
-            Original page_content is saved in metadata['original_content']
-            so similarity_search() can restore it for LLM consumption.
-
-        Batching strategy:
-            Dedup runs once upfront via a single Qdrant scroll (efficient).
-            New docs are split into INGESTION_BATCH_SIZE outer batches.
-            Each batch: LangChain sub-batches into SPLADE_BATCH_SIZE chunks
-            so the SPLADE MLM tensor fits within VRAM budget → upsert → log.
-            Batches already committed survive a failure in a later batch.
-
-            SPLADE VRAM budget:
-                SPLADE_BATCH_SIZE=16 → (16, 512, 30522)×4B = 1.0 GB < 4 GB VRAM
-                default 64           → (64, 512, 30522)×4B = 4.0 GB — borderline
-                100                  → 6.27 GB — exceeds VRAM, triggers silent CPU fallback
-
-        Args:
-            documents: List of Documents from the Chunker.
-
-        Returns:
-            List of assigned Qdrant point IDs from all committed batches.
-
-        Raises:
-            Exception: If embedding or storage fails for any batch.
-        """
+        """Embed and store documents with deduplication and outer batching."""
         if not documents:
             logger.warning("add_documents received empty list")
             return []
 
         try:
-            # Order matters: enrich first (char_count uses original page_content),
-            # then dedup, then swap to embed_content. Do NOT reorder these calls.
+            # enrich first (char_count uses original page_content), then dedup, then swap to embed_content
             enriched_docs = self._enrich_metadata(documents)
 
             new_docs, skipped = await self._filter_existing_documents(enriched_docs)
@@ -678,7 +457,7 @@ class QdrantStore(BaseVectorStore):
                 "batches=%d, dedup_skipped=%d",
                 total,
                 batch_size,
-                -(-total // batch_size),   # ceiling division
+                -(-total // batch_size),
                 skipped,
             )
 
@@ -692,9 +471,6 @@ class QdrantStore(BaseVectorStore):
 
                 try:
                     _t0 = time.perf_counter()
-                    # batch_size=SPLADE_BATCH_SIZE controls LangChain's internal
-                    # _generate_rest_batches, keeping the SPLADE MLM output tensor
-                    # within VRAM limits (see SPLADE VRAM budget in docstring above).
                     batch_ids = await asyncio.to_thread(
                         self._store.add_documents,
                         batch,
@@ -744,33 +520,16 @@ class QdrantStore(BaseVectorStore):
         self,
         documents: List[Document],
     ) -> tuple[List[Document], int]:
-        """Filter out chunks already stored in Qdrant using a single batch scroll query.
-
-        The Chunker stores chunk_id = hash_text(page_content) in every chunk's
-        metadata. We use a single MatchAny scroll query — not N individual queries —
-        to check all chunk_ids at once, avoiding wasted embedding work on duplicates.
-
-        Falls back to ingesting all documents if the dedup check fails, so
-        a transient Qdrant error never blocks ingestion.
-
-        Args:
-            documents: Enriched documents from _enrich_metadata().
-
-        Returns:
-            Tuple of (new_documents_only, skipped_count).
-        """
+        """Filter out chunks already stored using a single batch scroll query."""
         if not documents:
             return documents, 0
 
-        # Fall back to hashing page_content when chunk_id is missing
-        # (e.g., documents ingested outside the standard Chunker pipeline).
         chunk_ids = [
             doc.metadata.get("chunk_id") or hash_text(doc.page_content)
             for doc in documents
         ]
 
         try:
-            # Single MatchAny scroll — OR across all chunk_ids in one request.
             existing_points, _ = await asyncio.to_thread(
                 self._client.scroll,
                 collection_name=self.collection_name,
@@ -806,7 +565,6 @@ class QdrantStore(BaseVectorStore):
             return new_docs, skipped
 
         except Exception as exc:
-            # Never block ingestion on a dedup failure.
             logger.warning(
                 "Dedup check failed, ingesting all %d chunks: %s",
                 len(documents), exc,
@@ -814,30 +572,12 @@ class QdrantStore(BaseVectorStore):
             return documents, 0
 
     def _prepare_for_embedding(self, documents: List[Document]) -> List[Document]:
-        """Swap page_content with embed_content so LangChain embeds the richer text.
-
-        LangChain QdrantVectorStore embeds whatever is in page_content. The
-        Chunker places richer text in metadata['embed_content'] that includes
-        title and section context. We swap it in here so the vector captures
-        that context.
-
-        Original page_content is saved in metadata['original_content'] so
-        similarity_search() can restore clean text for LLM consumption.
-
-        Sync — pure data transformation, no I/O.
-
-        Args:
-            documents: Enriched documents ready for storage.
-
-        Returns:
-            New Document list with embed_content as page_content.
-        """
+        """Swap page_content with embed_content so LangChain embeds the richer text."""
         embed_docs = []
 
         for doc in documents:
             embed_content = doc.metadata.get("embed_content", doc.page_content)
 
-            # Preserve original clean text for LLM retrieval.
             metadata = doc.metadata.copy()
             metadata["original_content"] = doc.page_content
 
@@ -848,31 +588,15 @@ class QdrantStore(BaseVectorStore):
         return embed_docs
 
     def _enrich_metadata(self, documents: List[Document]) -> List[Document]:
-        """Attach required payload fields to every document before storage.
-
-        Caller-supplied doc_id and user_id are preserved via setdefault.
-        char_count and ingested_at are always overwritten for accuracy.
-
-        Sync — pure data transformation, no I/O.
-
-        Args:
-            documents: Raw documents from Chunker.
-
-        Returns:
-            Documents with enriched metadata ready for Qdrant storage.
-        """
+        """Attach required payload fields to every document before storage."""
         total_chunks = len(documents)
         enriched_docs = []
 
         for i, doc in enumerate(documents):
             metadata = doc.metadata.copy()
 
-            # Placeholders — replaced by real UUIDs after the auth layer is wired up.
             metadata.setdefault("doc_id", "")
             metadata.setdefault("user_id", "")
-
-            # Logical-collection grouping within the user's own corpus.
-            # Always populated so that filter_collection queries find every chunk.
             metadata.setdefault("collection", "default")
 
             metadata.setdefault("source", "unknown")
@@ -881,7 +605,6 @@ class QdrantStore(BaseVectorStore):
             metadata.setdefault("chunk_index", i)
             metadata.setdefault("total_chunks", total_chunks)
 
-            # Always overwritten to reflect the current ingest run.
             metadata["char_count"] = len(doc.page_content)
             metadata["ingested_at"] = datetime.now(timezone.utc).isoformat()
 
@@ -891,8 +614,6 @@ class QdrantStore(BaseVectorStore):
 
         return enriched_docs
 
-    # Read — similarity search
-
     async def similarity_search(
         self,
         query: str,
@@ -901,35 +622,7 @@ class QdrantStore(BaseVectorStore):
         filter_user_id: Optional[str] = None,
         filter_collection: Optional[str] = None,
     ) -> List[Document]:
-        """Search for semantically similar documents.
-
-        Returns Documents with clean page_content (original text, not the
-        embed_content prefix). When score_threshold is provided, relevance
-        scores are attached to metadata['relevance_score'].
-
-        Score threshold guide (BGE + cosine, dense mode):
-            >= 0.7 — very confident match
-            >= 0.5 — good match (recommended default)
-            >= 0.3 — loose match
-             < 0.3 — likely irrelevant
-
-        Args:
-            query: Search text to embed and compare.
-            k: Number of results to return.
-            score_threshold: Minimum similarity score (0.0-1.0).
-                             None = return all top-k unfiltered.
-            filter_user_id: Filter to a specific user's documents.
-                            None = search across all users (no tenant scope).
-            filter_collection: Filter to a specific logical collection within
-                            the user's corpus. None = search all of the user's
-                            logical collections.
-
-        Returns:
-            List of matching Documents with clean page_content.
-
-        Raises:
-            Exception: If search fails.
-        """
+        """Search for semantically similar documents."""
         if not query or not query.strip():
             logger.warning("similarity_search received empty query")
             return []
@@ -964,20 +657,7 @@ class QdrantStore(BaseVectorStore):
         score_threshold: float,
         qdrant_filter: Optional[Filter],
     ) -> List[Document]:
-        """Search with relevance score filtering and score attachment.
-
-        Scores are preserved in metadata['relevance_score'] so the RAG layer
-        can use them for reranking or confidence decisions.
-
-        Args:
-            query: Search query text.
-            k: Number of results.
-            score_threshold: Minimum score to include in results.
-            qdrant_filter: Optional Qdrant payload filter.
-
-        Returns:
-            Filtered list of Documents with scores in metadata.
-        """
+        """Search with relevance score filtering and score attachment."""
         results = await asyncio.to_thread(
             self._store.similarity_search_with_relevance_scores,
             query=query,
@@ -1007,16 +687,7 @@ class QdrantStore(BaseVectorStore):
         k: int,
         qdrant_filter: Optional[Filter],
     ) -> List[Document]:
-        """Search without score filtering — returns top-k directly.
-
-        Args:
-            query: Search query text.
-            k: Number of results.
-            qdrant_filter: Optional Qdrant payload filter.
-
-        Returns:
-            List of top-k Documents.
-        """
+        """Search without score filtering — returns top-k directly."""
         results = await asyncio.to_thread(
             self._store.similarity_search,
             query=query,
@@ -1033,23 +704,7 @@ class QdrantStore(BaseVectorStore):
         return results
 
     def _restore_original_content(self, documents: List[Document]) -> List[Document]:
-        """Restore clean page_content after retrieval, reversing the embed_content swap.
-
-        During add_documents(), page_content was replaced with embed_content for
-        richer embeddings. This method swaps back the original text so the LLM
-        receives clean content without the "Title: ... | Section: ..." prefix.
-
-        Documents that lack original_content (old data or external ingestion)
-        are returned unchanged.
-
-        Sync — pure data transformation, no I/O.
-
-        Args:
-            documents: Documents returned from a Qdrant search.
-
-        Returns:
-            Documents with clean page_content for LLM consumption.
-        """
+        """Restore clean page_content after retrieval, reversing the embed_content swap."""
         restored = []
         for doc in documents:
             original = doc.metadata.get("original_content")
@@ -1064,29 +719,7 @@ class QdrantStore(BaseVectorStore):
         user_id: Optional[str],
         collection: Optional[str] = None,
     ) -> Optional[Filter]:
-        """Build a Qdrant payload filter for tenant + logical-collection scoping.
-
-        `user_id` enforces multi-tenant isolation: all chunks of every user live
-        in the same physical Qdrant collection and are separated by this filter.
-
-        `collection` is an optional logical grouping (a "folder" within the
-        user's own corpus). When provided, results are narrowed to that group.
-
-        Args:
-            user_id: User ID to filter by. None means no per-user scoping
-                (reserved for admin operations like the post-ingest HNSW warmup).
-                Empty string is rejected — it almost always indicates a caller
-                that forgot to propagate identity, which would silently leak
-                across tenants.
-            collection: Logical collection name to filter by. None means search
-                across all of the user's logical collections.
-
-        Returns:
-            Qdrant Filter object, or None when neither argument is provided.
-
-        Raises:
-            ValueError: If `user_id` is an empty string.
-        """
+        """Build a Qdrant payload filter for tenant + logical-collection scoping."""
         if user_id is not None and not user_id:
             raise ValueError(
                 "user_id was passed as empty string; pass None for explicit admin "
@@ -1123,34 +756,7 @@ class QdrantStore(BaseVectorStore):
         filter_user_id: Optional[str] = None,
         filter_collection: Optional[str] = None,
     ) -> List[Document]:
-        """Search for top-k results and return stored dense embedding vectors alongside them.
-
-        Uses QdrantClient.query_points(with_vectors=True) directly instead of the
-        LangChain wrapper, so each result carries its stored dense vector in
-        metadata['vector']. This vector is used by ContextRanker._rank_mmr() for
-        inter-chunk cosine similarity — eliminating the need to re-embed chunks
-        on every query (~2-4s saved per search).
-
-        Content and score behaviour is identical to similarity_search():
-            - page_content is restored to the original clean text.
-            - relevance_score is attached to metadata['relevance_score'].
-            - rescore=True re-ranks int8 ANN candidates with float32 vectors.
-
-        Args:
-            query: Search query text.
-            k: Number of results to return.
-            filter_user_id: Filter to a specific user's documents.
-                            None = search across all users.
-            filter_collection: Filter to a logical collection within the user's
-                            corpus. None = search the user's entire corpus.
-
-        Returns:
-            List of Documents with clean page_content, relevance_score in metadata,
-            and the dense embedding vector in metadata['vector'].
-
-        Raises:
-            Exception: If search fails.
-        """
+        """Search top-k and return stored dense embedding vectors in metadata['vector']."""
         if not query or not query.strip():
             logger.warning("similarity_search_with_vectors received empty query")
             return []
@@ -1166,8 +772,7 @@ class QdrantStore(BaseVectorStore):
 
             qdrant_filter = self._build_filter(filter_user_id, filter_collection)
 
-            # query_points replaces the deprecated client.search() (Qdrant client v1.7+).
-            # rescore=True: re-ranks int8 ANN results with float32 vectors — recovers SQ recall loss.
+            # rescore=True re-ranks int8 ANN candidates with float32 vectors to recover SQ recall loss
             response = await asyncio.to_thread(
                 self._client.query_points,
                 collection_name=self.collection_name,
@@ -1190,12 +795,11 @@ class QdrantStore(BaseVectorStore):
 
                 metadata["relevance_score"] = round(float(point.score), 4)
 
-                # Extract the dense vector from the named-vector dict.
                 raw_vec = point.vector
                 if isinstance(raw_vec, dict):
                     metadata["vector"] = raw_vec.get(self._DENSE_VECTOR_NAME)
                 else:
-                    metadata["vector"] = raw_vec  # fallback for unnamed vector format
+                    metadata["vector"] = raw_vec
 
                 docs.append(Document(page_content=page_content, metadata=metadata))
 
@@ -1220,32 +824,7 @@ class QdrantStore(BaseVectorStore):
         filter_user_id: Optional[str] = None,
         filter_collection: Optional[str] = None,
     ) -> List[Document]:
-        """Hybrid RRF search returning top-k results with dense embedding vectors.
-
-        Uses Qdrant's native prefetch + RRF fusion in a single query_points call.
-        Dense and sparse searches run in parallel inside Qdrant, results are fused
-        via Reciprocal Rank Fusion, and dense vectors are returned alongside payloads
-        for downstream MMR diversity scoring.
-
-        Dense leg: rescore=True re-ranks int8 ANN candidates with float32 vectors
-        before RRF fusion — recovers recall loss from scalar quantization.
-        Sparse leg: SPLADE vectors are not quantized — no rescore params needed.
-
-        Args:
-            query: Search query text.
-            k: Number of results to return.
-            filter_user_id: Filter to a specific user's documents.
-                            None = search across all users.
-            filter_collection: Filter to a logical collection within the user's
-                            corpus. None = search the user's entire corpus.
-
-        Returns:
-            List of Documents with clean page_content, relevance_score in metadata,
-            and the dense embedding vector in metadata['vector'].
-
-        Raises:
-            Exception: If hybrid search fails.
-        """
+        """Hybrid RRF search returning top-k results with dense embedding vectors."""
         if not query or not query.strip():
             logger.warning("hybrid_search_with_vectors received empty query")
             return []
@@ -1265,7 +844,6 @@ class QdrantStore(BaseVectorStore):
 
             qdrant_filter = self._build_filter(filter_user_id, filter_collection)
 
-            # Fetch more candidates per leg so RRF has a large enough pool to fuse.
             coarse_k = max(k * 3, 20)
 
             response = await asyncio.to_thread(
@@ -1304,7 +882,6 @@ class QdrantStore(BaseVectorStore):
 
                 metadata["relevance_score"] = round(float(point.score), 4)
 
-                # Extract dense vector for MMR inter-chunk diversity scoring.
                 raw_vec = point.vector
                 if isinstance(raw_vec, dict):
                     metadata["vector"] = raw_vec.get(self._DENSE_VECTOR_NAME)
@@ -1327,16 +904,8 @@ class QdrantStore(BaseVectorStore):
             logger.exception("Error in hybrid_search_with_vectors: %s", e)
             raise
 
-    # Admin operations
-
     async def delete_by_doc_id(self, doc_id: str) -> None:
-        """Delete every point whose payload.metadata.doc_id matches.
-
-        Used on user-initiated soft-delete and on terminal ingestion failure.
-        Idempotent — succeeds with zero matches, AND silently no-ops if the
-        collection itself does not exist yet (e.g. failure during the very
-        first ingest, before any successful upsert created the collection).
-        """
+        """Delete every point whose payload.metadata.doc_id matches; idempotent."""
         match_filter = Filter(
             must=[FieldCondition(
                 key="metadata.doc_id",
@@ -1369,13 +938,7 @@ class QdrantStore(BaseVectorStore):
             raise
 
     async def delete_collection(self) -> None:
-        """Permanently delete the entire Qdrant collection.
-
-        Irreversible — all vectors and metadata are lost. Use with caution.
-
-        Raises:
-            Exception: If deletion fails.
-        """
+        """Permanently delete the entire Qdrant collection."""
         try:
             await asyncio.to_thread(
                 self._client.delete_collection,
@@ -1392,13 +955,7 @@ class QdrantStore(BaseVectorStore):
         return [c.name for c in raw.collections]
 
     async def get_collection_stats(self) -> dict:
-        """Return collection statistics for observability dashboards.
-
-        Returns:
-            Dict containing backend, collection_name, document_count,
-            embedding_model, search_mode, and memory/server mode.
-            Returns an empty dict on failure (never raises).
-        """
+        """Return collection statistics for observability dashboards."""
         try:
             info = await asyncio.to_thread(
                 self._client.get_collection,
@@ -1417,23 +974,13 @@ class QdrantStore(BaseVectorStore):
             return {}
 
     async def close(self) -> None:
-        """Close the Qdrant client connection and release all held references.
-
-        Prevents connection leaks on application shutdown. Safe to call
-        multiple times.
-
-        Usage in FastAPI:
-            @app.on_event("shutdown")
-            async def shutdown():
-                await store.close()
-        """
-        # Cancel keepalive first — prevents a ping from racing with client.close().
+        """Close the Qdrant client connection and release all held references."""
         if self._keepalive_task is not None and not self._keepalive_task.done():
             self._keepalive_task.cancel()
             try:
                 await self._keepalive_task
             except asyncio.CancelledError:
-                pass  # expected — we just cancelled it
+                pass
             self._keepalive_task = None
 
         if self._client:
@@ -1443,6 +990,5 @@ class QdrantStore(BaseVectorStore):
             except Exception as e:
                 logger.exception("Error closing QdrantStore: %s", e)
 
-        # Release references to allow garbage collection.
         self._client = None
         self._store = None

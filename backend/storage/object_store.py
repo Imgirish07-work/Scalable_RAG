@@ -1,18 +1,4 @@
-"""Async S3-compatible object store wrapper.
-
-Single point of contact for MinIO (dev) and AWS S3 (prod, future). All
-document blobs flow through this module:
-
-  - `ensure_bucket()`             — boot-time bootstrap (create + CORS)
-  - `generate_presigned_put_url()` — issued at upload start; client PUTs to MinIO directly
-  - `get_object_stream()`         — streaming download during ingestion finalize
-  - `head_object()`               — size + ETag check before download
-  - `delete_object()`             — rollback path + orphan sweeper
-
-Credentials are picked up by `aioboto3` from the standard
-`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars; nothing else in
-this module sees them.
-"""
+"""Async S3-compatible object store wrapper for MinIO (dev) and AWS S3; credentials come from standard AWS env vars via aioboto3."""
 
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -26,14 +12,12 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# 1 MiB per chunk: large enough for throughput, small enough that the embed
-# pipeline can start before a 50 MB download completes.
+# 1 MiB chunk — big enough for throughput, small enough that embed can start before a 50 MB download completes
 _STREAM_CHUNK_BYTES = 1024 * 1024
 
-# Bucket / key not-found codes returned by both AWS S3 and MinIO.
 _NOT_FOUND_CODES = {"404", "NoSuchBucket", "NoSuchKey"}
 
-# Returned by `create_bucket` when another process won the race. Treated as success.
+# returned by create_bucket when another process won the race; treat as success
 _BUCKET_EXISTS_CODES = {"BucketAlreadyOwnedByYou", "BucketAlreadyExists"}
 
 
@@ -57,13 +41,7 @@ class ObjectStore:
 
     @asynccontextmanager
     async def _signing_client(self) -> AsyncIterator:
-        """Client configured with the public endpoint, used only for presigned URLs.
-
-        Keeps internal ops pointed at the docker-network address while URLs
-        handed to the browser carry the host-reachable address. The signature
-        is computed against the configured endpoint, so it stays valid when
-        the browser PUTs to it.
-        """
+        """Client configured with the public endpoint, used only for presigned URLs so the browser hits the host-reachable address."""
         async with self._session.client(
             "s3",
             endpoint_url=self._settings.effective_public_endpoint,
@@ -90,14 +68,11 @@ class ObjectStore:
                 except ClientError as create_exc:
                     create_code = create_exc.response.get("Error", {}).get("Code", "")
                     if create_code in _BUCKET_EXISTS_CODES:
-                        # Another worker raced us to creation — treat as success.
                         logger.info("Bucket created by concurrent worker | bucket=%s", bucket)
                     else:
                         raise
 
-            # MinIO does not implement PutBucketCors (returns NotImplemented) —
-            # it handles CORS globally via MINIO_API_CORS_ALLOW_ORIGIN, defaulting
-            # to permissive. Real AWS S3 accepts this call normally.
+            # minio returns NotImplemented for PutBucketCors; cors is handled globally via MINIO_API_CORS_ALLOW_ORIGIN
             try:
                 await s3.put_bucket_cors(
                     Bucket=bucket,
@@ -134,12 +109,7 @@ class ObjectStore:
         content_type: str,
         ttl_seconds: int | None = None,
     ) -> str:
-        """Sign a PUT URL that binds the client to the given key + Content-Type.
-
-        Any mismatch on the client's PUT request (different MIME, different
-        key path) causes MinIO to reject the upload — backend never has to
-        re-validate after the fact.
-        """
+        """Sign a PUT URL bound to the given key + Content-Type; MinIO rejects mismatches so the backend never re-validates."""
         ttl = ttl_seconds or self._settings.presigned_url_ttl_seconds
         async with self._signing_client() as s3:
             url = await s3.generate_presigned_url(
@@ -161,12 +131,7 @@ class ObjectStore:
         key: str,
         ttl_seconds: int | None = None,
     ) -> str:
-        """Sign a GET URL the browser can use to fetch the object directly.
-
-        Mirror of generate_presigned_put_url for downloads — used by the
-        in-app document viewer so the browser pulls bytes from MinIO without
-        round-tripping the backend.
-        """
+        """Sign a GET URL so the browser can fetch the object directly without round-tripping the backend."""
         ttl = ttl_seconds or self._settings.presigned_url_ttl_seconds
         async with self._signing_client() as s3:
             url = await s3.generate_presigned_url(
@@ -186,12 +151,7 @@ class ObjectStore:
             return await s3.head_object(Bucket=self._settings.s3_bucket, Key=key)
 
     async def get_object_stream(self, key: str) -> AsyncIterator[bytes]:
-        """Stream-download an object as async bytes chunks.
-
-        Holds the S3 client open for the lifetime of the iteration. The
-        consumer must fully iterate or `aclose()` the generator to release
-        the underlying connection.
-        """
+        """Stream-download an object as async bytes chunks; consumer must fully iterate or aclose() to release the connection."""
         async with self._client() as s3:
             response = await s3.get_object(Bucket=self._settings.s3_bucket, Key=key)
             body = response["Body"]
@@ -199,11 +159,7 @@ class ObjectStore:
                 yield chunk
 
     async def delete_object(self, key: str) -> None:
-        """Idempotent delete — missing keys do not raise.
-
-        Used both on the rollback path (terminal embed failure) and by the
-        orphan sweeper (pending rows older than the TTL).
-        """
+        """Idempotent delete — missing keys do not raise."""
         async with self._client() as s3:
             try:
                 await s3.delete_object(Bucket=self._settings.s3_bucket, Key=key)

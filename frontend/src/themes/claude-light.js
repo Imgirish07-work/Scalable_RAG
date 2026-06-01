@@ -1,12 +1,8 @@
-/**
- * Claude Light — cream background with terracotta accent.
- * Mirrors Claude.ai's light mode: warm paper feel, high text contrast.
- */
+// cream background with terracotta accent
 const claudeLight = {
   id:    "claude-light",
   label: "Claude Light",
   vars: {
-    /* ── Backgrounds ── */
     "--c-bg":           "#F5EFE6",
     "--c-bgPanel":      "#FAF5EC",
     "--c-bgSoft":       "#EDE7DC",
@@ -15,24 +11,20 @@ const claudeLight = {
     "--c-bgDeep":       "#EDE7DC",
     "--c-bgResponse":   "#FAF5EC",
 
-    /* ── Text ── */
     "--c-ink":          "#1A1915",
     "--c-inkSoft":      "#4A4843",
     "--c-inkMuted":     "#7C7972",
 
-    /* ── Borders ── */
     "--c-line":         "#D7D0C3",
     "--c-lineSoft":     "#E2DBCE",
     "--c-lineCard":     "#CFC8BC",
 
-    /* ── Accent (terracotta) ── */
     "--c-accent":       "#CC7A57",
     "--c-accentHover":  "#B86A48",
     "--c-accentBg":     "rgba(204,122,87,0.10)",
     "--c-accentBorder": "rgba(204,122,87,0.35)",
     "--c-accentGlow":   "rgba(204,122,87,0.18)",
 
-    /* ── Status ── */
     "--c-ok":           "#3F8F58",
     "--c-warn":         "#B5781F",
     "--c-danger":       "#B83D2C",
