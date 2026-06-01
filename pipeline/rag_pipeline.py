@@ -142,16 +142,20 @@ class RAGPipeline:
         warmup_start = time.perf_counter()
         logger.info("Pipeline warm-up starting...")
 
+        # batch warmup forces the GPU to compile kernels for the actual batch shape
+        # used during ingestion — otherwise the first real batch pays a 30s+ cold-start tax.
+        _WARMUP_BATCH = [f"warmup chunk {i}" for i in range(32)]
+
         async def _warmup_embeddings() -> None:
             model = await asyncio.to_thread(get_embeddings)
-            await asyncio.to_thread(model.embed_query, "warmup")
-            logger.debug("Warm-up: embedding model ready")
+            await asyncio.to_thread(model.embed_documents, _WARMUP_BATCH)
+            logger.debug("Warm-up: dense embedder ready (batch=%d)", len(_WARMUP_BATCH))
 
         async def _warmup_splade() -> None:
             if self._store and hasattr(self._store, "_get_sparse_embeddings"):
                 sparse = await asyncio.to_thread(self._store._get_sparse_embeddings)
-                await asyncio.to_thread(sparse.embed_query, "warmup")
-                logger.debug("Warm-up: SPLADE model ready")
+                await asyncio.to_thread(sparse.embed_documents, _WARMUP_BATCH)
+                logger.debug("Warm-up: SPLADE ready (batch=%d)", len(_WARMUP_BATCH))
 
         async def _warmup_qdrant() -> None:
             if self._store:
@@ -343,24 +347,15 @@ class RAGPipeline:
                     chunk.metadata["doc_id"] = doc_id
                 chunk.metadata["collection"] = logical_collection
 
-            # reuse existing Qdrant client so ingested docs are visible to all running queries
-            ingest_store = QdrantStore(
-                collection_name=physical_collection,
-                client=self._store._client,
-                search_mode=settings.RAG_RETRIEVAL_MODE,
-            )
-            await ingest_store.initialize()
-            point_ids = await ingest_store.add_documents(
+            # reuse the boot-time QdrantStore — same collection, same client, same SPLADE.
+            # avoids reloading 5s of SPLADE and 5 redundant qdrant roundtrips per job.
+            point_ids = await self._store.add_documents(
                 chunks, on_batch_progress=on_batch_progress,
             )
 
             if point_ids:
                 try:
-                    await ingest_store.similarity_search_with_vectors("warmup", k=1)
-                    logger.debug(
-                        "Post-ingest HNSW warmup complete | physical='%s' | logical='%s'",
-                        physical_collection, logical_collection,
-                    )
+                    await self._store.similarity_search_with_vectors("warmup", k=1)
                 except Exception:
                     pass
 

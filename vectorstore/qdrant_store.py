@@ -3,6 +3,7 @@
 import asyncio
 import time
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Awaitable, Callable, List, Literal, Optional
 
 from langchain_core.documents import Document
@@ -39,10 +40,42 @@ logger = get_logger(__name__)
 SearchMode = Literal["dense", "sparse", "hybrid"]
 
 
+_SPARSE_MODEL_NAME = "Prithivida/Splade_PP_en_v1"
+
+
+@lru_cache(maxsize=1)
+def _load_sparse_embeddings() -> FastEmbedSparse:
+    """Process-wide singleton SPLADE — loaded once, reused across every QdrantStore."""
+    kwargs: dict = {}
+    local_path = settings.SPLADE_LOCAL_PATH
+    if local_path:
+        kwargs["specific_model_path"] = local_path
+        logger.info("Loading SPLADE from local path: %s", local_path)
+    else:
+        logger.info("Loading SPLADE from network: %s", _SPARSE_MODEL_NAME)
+
+    sparse = FastEmbedSparse(
+        model_name=_SPARSE_MODEL_NAME,
+        batch_size=settings.SPLADE_BATCH_SIZE,
+        threads=settings.SPLADE_INTRA_OP_THREADS,
+        providers=_ONNX_PROVIDERS,
+    )
+    try:
+        active = sparse._model.model.model.get_providers()
+        logger.info(
+            "SPLADE loaded | requested=%s | active=%s",
+            [p if isinstance(p, str) else p[0] for p in _ONNX_PROVIDERS],
+            active,
+        )
+    except Exception:
+        logger.info("SPLADE loaded")
+    return sparse
+
+
 class QdrantStore(BaseVectorStore):
     """Qdrant-backed vector store with dense, sparse, and hybrid search."""
 
-    _SPARSE_MODEL = "Prithivida/Splade_PP_en_v1"
+    _SPARSE_MODEL = _SPARSE_MODEL_NAME
     _SPARSE_VECTOR_NAME = "sparse"
     _DENSE_VECTOR_NAME = "dense"
 
@@ -272,8 +305,10 @@ class QdrantStore(BaseVectorStore):
                     field_name=field,
                     field_schema=PayloadSchemaType.KEYWORD,
                 )
-                logger.info(
-                    "Payload index created | collection=%s | field=%s",
+                # qdrant returns success on existing indexes, so we can't tell creates
+                # from no-ops — log at DEBUG to avoid noise on every QdrantStore init.
+                logger.debug(
+                    "Payload index ensured | collection=%s | field=%s",
                     self.collection_name, field,
                 )
             except Exception as exc:
@@ -382,44 +417,9 @@ class QdrantStore(BaseVectorStore):
             raise
 
     def _get_sparse_embeddings(self) -> FastEmbedSparse:
-        """Return the sparse embedding model, instantiating it on first call."""
+        """Return the process-wide SPLADE singleton."""
         if self._sparse_embeddings_instance is None:
-            try:
-                kwargs: dict = {}
-                local_path = settings.SPLADE_LOCAL_PATH
-                if local_path:
-                    kwargs["specific_model_path"] = local_path
-                    logger.info(
-                        "Loading SPLADE from local path (skipping download): %s",
-                        local_path,
-                    )
-                else:
-                    logger.info(
-                        "Initializing sparse embedding model (requires network): %s",
-                        self._SPARSE_MODEL,
-                    )
-                self._sparse_embeddings_instance = FastEmbedSparse(
-                    model_name=self._SPARSE_MODEL,
-                    batch_size=settings.SPLADE_BATCH_SIZE,
-                    threads=settings.SPLADE_INTRA_OP_THREADS,
-                    providers=_ONNX_PROVIDERS,
-                    **kwargs,
-                )
-
-                try:
-                    splade_session = self._sparse_embeddings_instance._model.model.model
-                    active_providers = splade_session.get_providers()
-                    logger.info(
-                        "SPLADE sparse model loaded | requested=%s | active=%s",
-                        [p if isinstance(p, str) else p[0] for p in _ONNX_PROVIDERS],
-                        active_providers,
-                    )
-                except Exception:
-                    logger.info("Sparse embedding model initialized successfully")
-            except Exception as e:
-                logger.exception("Error initializing sparse embeddings: %s", e)
-                raise
-
+            self._sparse_embeddings_instance = _load_sparse_embeddings()
         return self._sparse_embeddings_instance
 
     async def add_documents(

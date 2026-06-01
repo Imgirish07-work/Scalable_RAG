@@ -19,9 +19,7 @@ _FAST_POOL: list[str] = [
 ]
 
 # strong pool: final answer generation, complex reasoning
-# kimi-k2-instruct is unlisted on groq — 404 if no access, _dispatch skips it for 24h
 _STRONG_POOL: list[str] = [
-    "moonshotai/kimi-k2-instruct",
     "llama-3.3-70b-versatile",
     "qwen/qwen3-32b",
     "meta-llama/llama-4-scout-17b-16e-instruct",

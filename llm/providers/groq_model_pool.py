@@ -32,7 +32,6 @@ _QUEUE_MAX_SIZE: int = 50
 _ALL_POOL_MODELS: list[str] = [
     "llama-3.1-8b-instant",
     "openai/gpt-oss-20b",
-    "moonshotai/kimi-k2-instruct",
     "llama-3.3-70b-versatile",
     "qwen/qwen3-32b",
     "meta-llama/llama-4-scout-17b-16e-instruct",

@@ -43,7 +43,9 @@ export const useUploadStore = create((set, get) => ({
     set((s) => ({ jobs: [...s.jobs, ...additions] }))
   },
 
-  // Indexing is expensive — drain queue sequentially to avoid hammering the embedder.
+  // Drains upload+finalize sequentially (cheap I/O). Arq enforces serial ingestion
+  // downstream, so we don't gate the queue on the SSE wait — that would freeze
+  // every subsequent upload behind the active ingest job.
   async start() {
     if (get()._running) return
     set({ _running: true })
@@ -91,9 +93,7 @@ export const useUploadStore = create((set, get) => ({
     })
     try {
       await retryIngestion(job.docId)
-      await waitForTerminalEvent(job.docId, (patch) =>
-        get()._update(jobId, patch),
-      )
+      get()._listenForTerminalEvent(jobId, job.docId)
     } catch (err) {
       const msg = err?.response?.data?.detail || err?.message || 'Retry failed'
       get()._update(jobId, {
@@ -155,9 +155,9 @@ export const useUploadStore = create((set, get) => ({
         phase: 'queued',
         message: 'Queued',
       })
-      await waitForTerminalEvent(session.doc_id, (patch) =>
-        get()._update(jobId, patch),
-      )
+      // fire-and-forget — the drain loop must continue so subsequent uploads
+      // don't wait 140s for the worker to finish ingesting this one
+      get()._listenForTerminalEvent(jobId, session.doc_id)
     } catch (err) {
       const msg = err?.response?.data?.detail || err?.message || 'Upload failed'
       get()._update(jobId, {
@@ -167,6 +167,14 @@ export const useUploadStore = create((set, get) => ({
         errorReason: 'UploadError',
       })
     }
+  },
+
+  _listenForTerminalEvent(jobId, docId) {
+    waitForTerminalEvent(docId, (patch) => {
+      // job may have been cancelled (removeJob) while listening — skip if so
+      const exists = get().jobs.some((j) => j.id === jobId)
+      if (exists) get()._update(jobId, patch)
+    })
   },
 }))
 

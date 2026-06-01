@@ -141,6 +141,13 @@ services:
     environment: *backend-env
     volumes: *backend-volumes
     command: ["arq", "backend.workers.arq_settings.WorkerSettings"]
+    # worker doesn't serve HTTP — override the curl healthcheck inherited from Dockerfile.backend
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f arq > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
     depends_on:
       postgres:
         condition: service_healthy
