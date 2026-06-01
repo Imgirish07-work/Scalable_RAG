@@ -10,7 +10,6 @@ import { C } from '../../theme'
 
 const STATUS_LABEL = {
   queued: 'Queued',
-  'creating-session': 'Preparing',
   uploading: 'Uploading',
   finalizing: 'Finalizing',
   processing: 'Processing',
@@ -35,21 +34,28 @@ export default function ChatComposer({
   const addFiles = useUploadStore((s) => s.addFiles)
   const start = useUploadStore((s) => s.start)
   const removeJob = useUploadStore((s) => s.removeJob)
+  const retryJob = useUploadStore((s) => s.retryJob)
 
   const jobs = useMemo(
     () => allJobs.filter((j) => j.conversationId === conversationId),
     [allJobs, conversationId],
   )
   const anyBlocking = jobs.some(
-    (j) => j.status !== 'ready' && j.status !== 'failed',
+    (j) => !['ready', 'failed', 'duplicate'].includes(j.status),
   )
   const canSubmit = value.trim().length > 0 && !anyBlocking && !isLoading
 
-  const toastedFailures = useRef(new Set())
+  const toastedTerminals = useRef(new Set())
   useEffect(() => {
     jobs.forEach((j) => {
-      if (j.status === 'failed' && !toastedFailures.current.has(j.id)) {
-        toastedFailures.current.add(j.id)
+      if (!['ready', 'failed', 'duplicate'].includes(j.status)) return
+      if (toastedTerminals.current.has(j.id)) return
+      toastedTerminals.current.add(j.id)
+      if (j.status === 'ready') {
+        toast.success('Document uploaded', j.filename)
+      } else if (j.status === 'duplicate') {
+        toast.info('Already in your library', j.filename)
+      } else {
         toast.error(
           'Upload failed',
           `${j.filename} — ${j.message || 'Unknown error'}`,
@@ -115,12 +121,19 @@ export default function ChatComposer({
                   filename={j.filename}
                   width={84}
                   height={104}
+                  status={j.status}
+                  phase={j.phase}
+                  progress={j.progress}
+                  chunksProcessed={j.chunksProcessed}
+                  chunksTotal={j.chunksTotal}
+                  message={j.message}
                   onClick={
                     j.status === 'ready' && onPreviewJob
                       ? () => onPreviewJob(j)
                       : undefined
                   }
                   onRemove={() => removeJob(j.id)}
+                  onRetry={j.status === 'failed' ? () => retryJob(j.id) : undefined}
                 />
               ))}
             </div>
@@ -195,7 +208,7 @@ export default function ChatComposer({
 
 function ProgressStrip({ jobs }) {
   const inFlight = jobs.filter(
-    (j) => j.status !== 'ready' && j.status !== 'failed',
+    (j) => !['ready', 'failed', 'duplicate'].includes(j.status),
   )
 
   if (inFlight.length === 0) {
@@ -205,20 +218,24 @@ function ProgressStrip({ jobs }) {
   }
 
   const active = inFlight.find((j) => j.status === 'uploading') || inFlight[0]
-  const label = STATUS_LABEL[active.status] || active.status
-  const pct =
-    active.status === 'uploading' && active.progress != null
-      ? ` ${active.progress}%`
-      : ''
+  const detail = activeDetail(active)
   const more = inFlight.length > 1 ? ` · +${inFlight.length - 1} more` : ''
 
   return (
     <StripLine
       dot={C.accent}
       pulsing
-      text={`${label} ${active.filename}${pct}${more}`}
+      text={`${active.filename} · ${detail}${more}`}
     />
   )
+}
+
+function activeDetail(job) {
+  if (job.status === 'uploading' && job.progress != null) {
+    return `Uploading ${job.progress}%`
+  }
+  if (job.message) return job.message
+  return STATUS_LABEL[job.status] || job.status
 }
 
 function StripLine({ dot, pulsing, text }) {

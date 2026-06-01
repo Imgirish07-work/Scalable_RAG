@@ -6,6 +6,10 @@ import { C } from "../../theme";
 
 const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"]);
 
+const ACTIVE_STATUSES = new Set([
+  "queued", "uploading", "finalizing", "processing",
+]);
+
 function extOf(name = "") {
   return (name.split(".").pop() || "").toLowerCase();
 }
@@ -31,13 +35,35 @@ function statusOverlayStyle(status) {
       borderColor: "var(--c-textError)",
     };
   }
-  if (status === "processing") {
+  if (status === "duplicate") {
+    return {
+      background: "rgba(120, 120, 120, 0.10)",
+      borderColor: C.lineCard,
+    };
+  }
+  if (ACTIVE_STATUSES.has(status)) {
     return {
       background: "rgba(208, 138, 106, 0.08)",
       borderColor: C.accentBorder,
     };
   }
   return null;
+}
+
+// Resolves the top-bar fill percent for the current phase.
+// Returns a number for determinate bars, "indet" for indeterminate, or null to hide.
+function resolveBarMode(status, phase, progress, chunksProcessed, chunksTotal) {
+  if (status === "uploading") return clampPct(progress);
+  if (phase === "embedding" && chunksTotal > 0) {
+    return clampPct(Math.round((chunksProcessed / chunksTotal) * 100));
+  }
+  if (ACTIVE_STATUSES.has(status)) return "indet";
+  return null;
+}
+
+function clampPct(n) {
+  if (typeof n !== "number" || Number.isNaN(n)) return 0;
+  return Math.min(100, Math.max(0, n));
 }
 
 export default memo(function DocPreviewCard({
@@ -49,7 +75,10 @@ export default memo(function DocPreviewCard({
   width = 190,
   height = 234,
   status,
+  phase,
   progress,
+  chunksProcessed = 0,
+  chunksTotal = 0,
   message,
   onClick,
   onRemove,
@@ -242,8 +271,10 @@ export default memo(function DocPreviewCard({
         )}
       </div>
 
-      {/* Top progress bar when uploading */}
-      {status === "uploading" && (
+      <TopProgressBar
+        mode={resolveBarMode(status, phase, progress, chunksProcessed, chunksTotal)}
+      />
+      {status === "failed" && (
         <div
           style={{
             position: "absolute",
@@ -251,30 +282,7 @@ export default memo(function DocPreviewCard({
             left: 0,
             right: 0,
             height: 3,
-            background: "rgba(0,0,0,0.08)",
-          }}
-        >
-          <div
-            style={{
-              height: "100%",
-              width: `${progress || 0}%`,
-              background: C.accent,
-              transition: "width 0.2s",
-            }}
-          />
-        </div>
-      )}
-
-      {status === "processing" && (
-        <div
-          className="animate-pulse"
-          style={{
-            position: "absolute",
-            top: 0,
-            left: 0,
-            right: 0,
-            height: 3,
-            background: C.accent,
+            background: "var(--c-textError)",
           }}
         />
       )}
@@ -316,16 +324,17 @@ export default memo(function DocPreviewCard({
 
       <DocPreviewBadge label={badgeLabel} tone={cardBadgeTone} />
 
-      {status === "uploading" && (
+      {(ACTIVE_STATUSES.has(status) || status === "failed") && message && (
         <div
           style={{
             position: "absolute",
-            left: 12,
-            right: 12,
-            bottom: 48,
+            left: 8,
+            right: 8,
+            bottom: 44,
             padding: "3px 8px",
             background: "var(--c-bgSoft)",
-            color: "var(--c-inkSoft)",
+            color:
+              status === "failed" ? "var(--c-textError)" : "var(--c-inkSoft)",
             fontSize: 10,
             fontWeight: 500,
             borderRadius: 6,
@@ -336,13 +345,62 @@ export default memo(function DocPreviewCard({
             fontFamily: "system-ui, sans-serif",
           }}
         >
-          {progress != null ? `${progress}%` : "Uploading"}
-          {message ? ` · ${message}` : ""}
+          {message}
         </div>
       )}
     </div>
   );
 });
+
+function TopProgressBar({ mode }) {
+  if (mode === null) return null;
+  if (mode === "indet") {
+    return (
+      <div
+        style={{
+          position: "absolute",
+          top: 0,
+          left: 0,
+          right: 0,
+          height: 3,
+          background: "rgba(0,0,0,0.08)",
+          overflow: "hidden",
+        }}
+      >
+        <div
+          style={{
+            height: "100%",
+            width: "40%",
+            background: C.accent,
+            animation: "doc-card-progress 1.2s ease-in-out infinite",
+          }}
+        />
+        <style>{`@keyframes doc-card-progress { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }`}</style>
+      </div>
+    );
+  }
+  return (
+    <div
+      style={{
+        position: "absolute",
+        top: 0,
+        left: 0,
+        right: 0,
+        height: 3,
+        background: "rgba(0,0,0,0.08)",
+      }}
+    >
+      <div
+        style={{
+          height: "100%",
+          width: `${mode}%`,
+          background: C.accent,
+          transition: "width 0.3s ease",
+        }}
+      />
+    </div>
+  );
+}
 
 function CornerButton({ children, title, onClick }) {
   return (
