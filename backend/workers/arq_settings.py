@@ -29,7 +29,7 @@ def _redis_settings_from_url(url: str) -> RedisSettings:
 async def on_startup(ctx: dict) -> None:
     logger.info(
         "Worker booting | queue=%s | max_jobs=%d",
-        worker_settings.queue_name, worker_settings.worker_max_jobs,
+        worker_settings.queue_name, worker_settings.max_jobs,
     )
     await get_object_store().ensure_bucket()
 
@@ -68,8 +68,8 @@ class WorkerSettings:
     functions = [ingest_document]
     redis_settings = _redis_settings_from_url(worker_settings.redis_url)
     queue_name = worker_settings.queue_name
-    max_jobs = worker_settings.worker_max_jobs
-    job_timeout = worker_settings.worker_job_timeout_seconds
+    max_jobs = worker_settings.max_jobs
+    job_timeout = worker_settings.job_timeout_seconds
     max_tries = worker_settings.arq_max_tries
     # 0 = purge result on completion so retries can reuse _job_id=doc_id.
     keep_result = 0

@@ -98,8 +98,8 @@ class WorkerSettings(BaseSettings):
 
     redis_url: str = Field(default="redis://redis:6379/0")
     queue_name: str = Field(default="scalable_rag:ingest")
-    worker_max_jobs: int = Field(default=2)
-    worker_job_timeout_seconds: int = Field(default=900)
+    max_jobs: int = Field(default=2)
+    job_timeout_seconds: int = Field(default=900)
 
     # Arq in-worker retries for transient blips; exhaustion → DLQ.
     arq_max_tries: int = Field(default=3)

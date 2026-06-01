@@ -1,21 +1,29 @@
 # GPU overlay for docker-compose.
 #
-# Grants the backend container access to all NVIDIA GPUs on the host.
-# Requires NVIDIA Container Toolkit installed inside WSL2 (Windows) or
-# the host (Linux). Use only on machines with a CUDA-capable GPU.
+# Grants backend (query path) and worker (ingestion path) access to all
+# NVIDIA GPUs on the host. Requires NVIDIA Container Toolkit.
 #
 # Usage:
-#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile dev up --build
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile dev up -d --build
 #
-# On CPU-only machines, just run the base file:
-#   docker compose --profile dev up --build
+# CPU-only machines: just use the base file.
+#
+# 4GB GPU note: both pods load ONNX/SPLADE → ~400MB baseline. Concurrent
+# SPLADE batches push toward 3GB peak. Cap WORKER_MAX_JOBS=1 in .env if
+# you see VRAM pressure or OOM kills.
+
+x-gpu-resources: &gpu-resources
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
 
 services:
   backend:
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    <<: *gpu-resources
+
+  worker:
+    <<: *gpu-resources
