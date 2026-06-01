@@ -149,9 +149,19 @@ class RAGPipeline:
         warmup_start = time.perf_counter()
         logger.info("Pipeline warm-up starting...")
 
-        # batch warmup forces the GPU to compile kernels for the actual batch shape
-        # used during ingestion — otherwise the first real batch pays a 30s+ cold-start tax.
-        _WARMUP_BATCH = [f"warmup chunk {i}" for i in range(100)]
+        # 200-token synthetic warmup chunk
+        _WARMUP_TEXT = (
+            "The quick brown fox jumps over the lazy dog near the riverbank. "
+            "Machine learning models require substantial computational resources during "
+            "both training and inference phases. Vector embeddings encode semantic meaning "
+            "into dense numerical representations that enable similarity search. "
+            "Large language models have transformed natural language processing tasks "
+            "including summarization, question answering, and document retrieval. "
+            "Retrieval-augmented generation combines dense retrieval with generative models "
+            "to ground responses in factual source documents. Chunking strategies determine "
+            "how documents are split into indexable units for downstream embedding. "
+        )
+        _WARMUP_BATCH = [_WARMUP_TEXT for _ in range(100)]
 
         async def _warmup_embeddings() -> None:
             model = await asyncio.to_thread(get_embeddings)
