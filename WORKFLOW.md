@@ -31,42 +31,131 @@ QdrantStore.upsert()     vectorstore/qdrant_store.py
 
 ---
 
-### 1b. Async Ingestion Flow (Phase 3 — current production path)
+### 1b. Async Ingestion Flow (current production path)
 
 ```
-HTTP POST /v1/ingest  (multipart upload)
-  │
-  ▼
-backend/api/v1/documents.py
-  │  writes document row (status=queued) to Postgres
-  │  calls queue_client.enqueue_ingest_job(doc_id, ...)
-  │  returns 202 Accepted + { job_id, document_id }
-  │
-  ▼ (Redis queue — arq)
-backend/workers/tasks.py  ingest_document_task(ctx, doc_id, ...)
-  │  sets document status=processing, records processing_started_at
-  │
-  ▼
-backend/services/ingestion_service.py  IngestionService.run()
-  │
-  ├─ DocumentCleaner    chunking/document_cleaner.py
-  │    normalizes raw text
-  ├─ StructurePreserver chunking/structure_preserver.py
-  │    preserves headings / tables / lists
-  ├─ Chunker            chunking/chunker.py
-  │    token-bounded chunks with overlap
-  │
-  └─ _ChunkProgressEmitter (on_batch_progress callback)
-       for each batch of embedded chunks:
-         QdrantStore.upsert()    vectorstore/qdrant_store.py
-         RedisEventBus.publish() backend/services/redis_event_bus.py
-           │  emits { doc_id, chunks_done, chunks_total } on Redis pub/sub
-           ▼
-         All backend pods subscribed → SSE push to connected clients
-  │
-  ▼
-mark_ready_if_processing()   atomic WHERE status='processing' guard
-  sets document status=ready in Postgres
+ BROWSER (React)
+ ┌─────────────────────────────────────────────────────────┐
+ │  1. POST /v1/ingest          → reserve doc_id           │
+ │  2. PUT  <presigned-url>     → upload file to MinIO     │
+ │  3. POST /v1/documents/{id}/finalize → trigger worker   │
+ │  4. GET  /v1/documents/{id}/events   → open SSE stream  │
+ └───────┬──────────────────────────────────────┬──────────┘
+         │  HTTP/JSON                            │  SSE (text/event-stream)
+         ▼                                       ▼
+ ┌───────────────────────────────────────────────────────────────────────────┐
+ │  FastAPI  (backend pod)                                                   │
+ │                                                                           │
+ │  [1] POST /v1/ingest                                                      │
+ │      DocumentService.create_upload_session()                              │
+ │        • INSERT document row  (status=pending)  → Postgres                │
+ │        • generate presigned PUT URL             → MinIO                   │
+ │        • return {doc_id, upload_url}                                      │
+ │                                                                           │
+ │  [3] POST /v1/documents/{doc_id}/finalize                                 │
+ │      DocumentService.finalize()                                           │
+ │        • validate doc row exists & is pending                             │
+ │        • arq_pool.enqueue_job("ingest_document", doc_id, user_id)        │
+ │        • return {job_id}                                                  │
+ │                                                                           │
+ │  [4] GET /v1/documents/{doc_id}/events  (SSE)                             │
+ │      DocumentService.subscribe_to_events()                                │
+ │        • RedisEventBus.subscribe(doc_id)   ←── Redis SUBSCRIBE            │
+ │        • stream events as  text/event-stream until terminal phase         │
+ └───────────────────┬────────────────────────────┬─────────────────────────┘
+                     │                            │
+          ┌──────────▼──────────┐     ┌───────────▼──────────────┐
+          │      Redis          │     │       Postgres            │
+          │                     │     │                           │
+          │  • Arq job queue    │     │  documents table          │
+          │  • Pub/sub channels │     │  status: pending          │
+          │    events:{doc_id}  │     │         processing        │
+          │  • Keepalive ticks  │     │         ready / failed    │
+          └──────────┬──────────┘     │         duplicate / dlq   │
+                     │                └───────────────────────────┘
+          ┌──────────▼───────────────────────────────────────────────────────┐
+          │  Arq Worker  (worker pod)                                        │
+          │                                                                  │
+          │  WorkerSettings                                                  │
+          │    functions  = [ingest_document]                                │
+          │    cron_jobs  = [_gpu_keepalive  every 3 min]                   │
+          │    max_jobs   = 1   (GPU safety — serial execution)              │
+          │                                                                  │
+          │  on_startup:                                                     │
+          │    • build_ingest_pipeline()  → RAGPipeline (ingest mode)       │
+          │    • _run_warmup()  → embeds warmup_doc.txt chunks               │
+          │    • IngestionService(store, pipeline, event_bus)                │
+          │                                                                  │
+          │  ── TASK: ingest_document(ctx, doc_id, user_id) ──               │
+          │                                                                  │
+          │  IngestionService.run()                                          │
+          │    │                                                             │
+          │    ├─ repo.update_status(doc_id, "processing")  → Postgres      │
+          │    ├─ publish("processing")  ──────────────────────────────► Redis
+          │    │                                                             │
+          │    ├─ store.head_object(s3_key)  → MinIO                        │
+          │    ├─ publish("downloading")  ─────────────────────────────► Redis
+          │    │                                                             │
+          │    ├─ _download_and_hash()                                      │
+          │    │    • stream GET from MinIO                                  │
+          │    │    • write to temp file + SHA-256 hash                      │
+          │    ├─ publish("hashed")  ───────────────────────────────────► Redis
+          │    │                                                             │
+          │    ├─ _verify_mime_from_disk()  (python-magic)                  │
+          │    │                                                             │
+          │    ├─ dedup check: find_active_by_content_hash()  → Postgres    │
+          │    │    if duplicate ──► cascade_delete → Qdrant + MinIO        │
+          │    │                ──► hard_delete     → Postgres               │
+          │    │                ──► publish("duplicate")  ──────────────► Redis
+          │    │                ──► return                                   │
+          │    │                                                             │
+          │    ├─ repo.set_content_hash(doc_id, hash)  → Postgres           │
+          │    ├─ publish("chunking")  ─────────────────────────────────► Redis
+          │    │                                                             │
+          │    └─ pipeline.ingest(temp_path, collection, user_id, doc_id    │
+          │         on_batch_progress=ChunkProgressEmitter.emit)            │
+          │                                                                  │
+          │         ┌─────────────────────────────────────────┐             │
+          │         │  RAGPipeline.ingest()  (ingest mode)    │             │
+          │         │                                         │             │
+          │         │  DocumentCleaner → StructurePreserver   │             │
+          │         │  Chunker (800-char splits)              │             │
+          │         │                                         │             │
+          │         │  for each batch of chunks:              │             │
+          │         │    dense_embed()  ← ONNX/GPU            │             │
+          │         │    sparse_embed() ← SPLADE/GPU          │             │
+          │         │    QdrantStore.upsert_batch()  ─────────┼──────────► Qdrant
+          │         │    on_batch_progress(n, total)          │             │
+          │         │      └─► publish("embedding", ...)  ────┼──────────► Redis
+          │         │                                         │             │
+          │         │  returns IngestionResult(chunks_stored) │             │
+          │         └─────────────────────────────────────────┘             │
+          │                                                                  │
+          │    ├─ repo.mark_ready_if_processing()  → Postgres               │
+          │    ├─ publish("ready")  ───────────────────────────────────► Redis
+          │    └─ update Prometheus metrics                                  │
+          │                                                                  │
+          │  ── CRON: _gpu_keepalive()  (every 3 min) ──                    │
+          │    • embeds 20 chunks from warmup_doc.txt                        │
+          │    • keeps CUDA kernels hot, prevents 40s cold-start             │
+          └──────────────────────────────────────────────────────────────────┘
+                     │
+          ┌──────────▼──────────┐     ┌──────────────────────┐
+          │      MinIO          │     │      Qdrant           │
+          │  (object store)     │     │  (vector store)       │
+          │                     │     │                       │
+          │  • presigned PUT    │     │  • dense vectors      │
+          │  • GET stream       │     │  • sparse vectors     │
+          │  • delete on dedup  │     │  • BM42 payloads      │
+          └─────────────────────┘     │  • delete_by_doc_id   │
+                                      └──────────────────────┘
+```
+
+**Redis pub/sub phase sequence** (terminal phase ends SSE stream):
+```
+processing → downloading → hashed → chunking →
+embedding (×N batches, chunks_processed / chunks_total) →
+ready  ✓  (or: duplicate / failed)
 ```
 
 **Stuck-job recovery:**
@@ -78,21 +167,34 @@ OrphanSweeper (periodic background task)   backend/services/orphan_sweeper.py
 ```
 
 **Prometheus metrics emitted during async ingestion:**
-- `ingest_jobs_queued_total` — incremented when a job is enqueued
-- `ingest_jobs_inflight` (gauge) — tracks concurrent in-progress tasks
-- `ingest_jobs_failed_total` — incremented on task exception
+- `ingest_total{outcome}` — counter per terminal outcome (ready / failed / duplicate)
+- `ingest_chunks_total` — total chunks embedded and stored
+- `ingest_duration_seconds{outcome}` — histogram of end-to-end ingest time
+- `ingest_jobs_inflight` (gauge) — concurrent in-progress tasks
+- `ingest_jobs_failed_total{reason}` — incremented on task exception
 
-**Key files (Phase 3):**
+**Key design decisions:**
+
+| Decision | Why |
+|----------|-----|
+| `max_jobs=1` | GPU safety — serial ingestion prevents OOM from concurrent ONNX sessions |
+| Presigned PUT URL | Client uploads directly to MinIO; API pod never buffers the file |
+| Redis pub/sub for events | Worker and API are separate processes; in-process queue won't cross the boundary |
+| `mark_ready_if_processing` guard | Sweeper may move the row to `failed` while the job is finishing; avoids status race |
+| Keepalive cron every 3 min | GPU VRAM persists across jobs but CUDA kernel state decays after ~5-8 min idle |
+| Ingest-mode pipeline | Worker skips LLM / agents / cache — only store + embeddings loaded |
+
+**Key files:**
 
 | File | Role |
 |------|------|
-| `backend/workers/arq_settings.py` | ARQ `WorkerSettings`, Redis pool config |
-| `backend/workers/queue_client.py` | `enqueue_ingest_job()` helper |
-| `backend/workers/tasks.py` | `ingest_document_task` arq task |
-| `backend/services/ingestion_service.py` | Orchestrates chunk → embed → upsert |
+| `backend/workers/arq_settings.py` | `WorkerSettings`, Redis config, GPU keepalive cron |
+| `backend/workers/tasks.py` | `ingest_document` arq task entry point |
+| `backend/services/ingestion_service.py` | Full ingest orchestration: download → hash → dedup → chunk → embed → upsert |
 | `backend/services/redis_event_bus.py` | Redis pub/sub SSE fan-out |
-| `backend/services/pipeline_factory.py` | Lazy pipeline singleton for workers |
+| `backend/services/pipeline_factory.py` | Builds ingest-mode `RAGPipeline` for worker pod |
 | `backend/services/orphan_sweeper.py` | Lease-based stuck-job detector |
+| `pipeline/warmup_doc.txt` | Real-text warmup corpus (~15 chunks) used by startup warmup and keepalive cron |
 
 ---
 
@@ -249,10 +351,12 @@ ProviderHealth             llm/provider_health.py
 | `rag/rag_factory.py`      | Creates `SimpleRAG` with correct retriever   |
 | `agents/agent_orchestrator.py` | Runs the full agent path               |
 | `vectorstore/qdrant_store.py` | All vector DB operations              |
-| `backend/workers/tasks.py` | ARQ task entry point for async ingestion    |
-| `backend/services/ingestion_service.py` | Core ingestion orchestration with progress emission |
+| `backend/workers/arq_settings.py` | `WorkerSettings`, Redis config, GPU keepalive cron |
+| `backend/workers/tasks.py` | `ingest_document` arq task entry point |
+| `backend/services/ingestion_service.py` | Full ingest orchestration: download → hash → dedup → chunk → embed → upsert |
 | `backend/services/redis_event_bus.py` | Redis pub/sub fan-out for SSE progress |
 | `backend/services/orphan_sweeper.py` | Stuck-job lease detection and recovery |
+| `pipeline/warmup_doc.txt` | Real-text warmup corpus for startup warmup and GPU keepalive cron |
 
 ---
 
