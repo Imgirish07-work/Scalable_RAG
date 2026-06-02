@@ -108,9 +108,8 @@ class Settings(BaseSettings):
 
     CACHE_STRATEGY: str = "exact"
 
-    CACHE_SEMANTIC_THRESHOLD: float = 0.95
-    CACHE_SEMANTIC_THRESHOLD_HIGH: float = 0.93
-    CACHE_SEMANTIC_THRESHOLD_PARTIAL: float = 0.88
+    CACHE_SEMANTIC_THRESHOLD_LOW: float = 0.95
+    CACHE_SEMANTIC_THRESHOLD_DIRECT: float = 0.98
     CACHE_SEMANTIC_COLLECTION: str = "cache_semantic"
 
     CACHE_CIRCUIT_BREAKER_THRESHOLD: int = 5
@@ -189,14 +188,11 @@ class Settings(BaseSettings):
             )
         return v
 
-    @field_validator("CACHE_SEMANTIC_THRESHOLD")
+    @field_validator("CACHE_SEMANTIC_THRESHOLD_LOW", "CACHE_SEMANTIC_THRESHOLD_DIRECT")
     @classmethod
     def validate_semantic_threshold(cls, v: float) -> float:
-        """Ensure CACHE_SEMANTIC_THRESHOLD is within [0.0, 1.0]."""
         if not 0.0 <= v <= 1.0:
-            raise ValueError(
-                f"CACHE_SEMANTIC_THRESHOLD must be between 0.0 and 1.0, got {v}"
-            )
+            raise ValueError(f"semantic threshold must be in [0.0, 1.0], got {v}")
         return v
 
     @field_validator("REDIS_ENV")

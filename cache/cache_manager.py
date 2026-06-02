@@ -146,17 +146,17 @@ class CacheManager:
                 self._settings, "CACHE_SEMANTIC_COLLECTION", "cache_semantic"
             )
             threshold_direct = getattr(
-                self._settings, "CACHE_SEMANTIC_THRESHOLD", 0.98
+                self._settings, "CACHE_SEMANTIC_THRESHOLD_DIRECT", 0.98
             )
-            threshold_high = getattr(
-                self._settings, "CACHE_SEMANTIC_THRESHOLD_HIGH", 0.93
+            threshold_low = getattr(
+                self._settings, "CACHE_SEMANTIC_THRESHOLD_LOW", 0.95
             )
             # in-memory Qdrant required: reusing QDRANT_URL for cache would add ~200ms RTT per lookup
             self._semantic_strategy = await asyncio.to_thread(
                 SemanticCacheStrategy,
                 collection_name=collection,
                 threshold_direct=threshold_direct,
-                threshold_high=threshold_high,
+                threshold_low=threshold_low,
                 use_memory=True,
             )
             await self._semantic_strategy.initialize()

@@ -13,9 +13,10 @@ Design:
     Miss:    "What is RLM?"            (cosine ~0.72, below threshold)
 
     Tiered thresholds (configurable):
-        DIRECT  — cosine >= 0.98 → serve directly, high confidence
-        HIGH    — cosine >= 0.93 → serve with monitoring flag
-        MISS    — cosine <  0.93 → no match
+        DIRECT  — cosine >= 0.98 → serve directly, no gates
+        HIGH    — 0.95 <= cosine < 0.98 → serve only if Jaccard >= 0.6
+                  AND length-ratio in [0.7, 1.4] (rejects substring supersets)
+        MISS    — cosine <  0.95 → no match
 
     Embedding reuse:
         Uses get_embeddings() from vectorstore/embeddings.py.
@@ -43,6 +44,7 @@ Dependencies:
 """
 
 import asyncio
+import re
 import uuid
 from typing import Optional
 
@@ -58,6 +60,8 @@ from cache.exceptions.cache_exceptions import CacheKeyError
 
 logger = get_logger(__name__)
 
+_TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
+
 
 class SemanticCacheStrategy(BaseCacheStrategy):
     """BGE embedding + Qdrant vector similarity cache strategy.
@@ -71,16 +75,20 @@ class SemanticCacheStrategy(BaseCacheStrategy):
         _embedding_dim: Embedding vector dimension (from get_embedding_dimension()).
         _collection: Qdrant collection name for cache vectors.
         _threshold_direct: Cosine threshold for direct serve (>= 0.98).
-        _threshold_high: Cosine threshold for high-confidence serve (>= 0.93).
+        _threshold_low: Cosine floor for candidate consideration (>= 0.95).
         _client: QdrantClient instance.
         _initialized: Whether initialize() has been called.
     """
+
+    _JACCARD_MIN: float = 0.6
+    _LENGTH_RATIO_MIN: float = 0.7
+    _LENGTH_RATIO_MAX: float = 1.4
 
     def __init__(
         self,
         collection_name: str = "cache_semantic",
         threshold_direct: float = 0.98,
-        threshold_high: float = 0.93,
+        threshold_low: float = 0.95,
         qdrant_client=None,
         qdrant_url: str = "",
         qdrant_api_key: str = "",
@@ -90,13 +98,19 @@ class SemanticCacheStrategy(BaseCacheStrategy):
 
         Args:
             collection_name: Qdrant collection for cache vectors.
-            threshold_direct: Cosine >= this → direct serve.
-            threshold_high: Cosine >= this → high-confidence serve.
+            threshold_direct: Cosine >= this → serve directly, skip gates.
+            threshold_low: Cosine >= this → candidate; gates decide acceptance.
             qdrant_client: Optional pre-built QdrantClient (for testing).
             qdrant_url: Qdrant server URL (if no client provided).
             qdrant_api_key: Qdrant API key (if no client provided).
             use_memory: If True and no client/url, use in-memory Qdrant.
         """
+        if threshold_low > threshold_direct:
+            raise ValueError(
+                f"threshold_low ({threshold_low}) must be <= "
+                f"threshold_direct ({threshold_direct})"
+            )
+
         self._embed_normalizer = QueryNormalizerChain(
             steps=[WhitespaceNormalizer()]
         )
@@ -104,17 +118,16 @@ class SemanticCacheStrategy(BaseCacheStrategy):
         self._embedding_dim: int = 0
         self._collection = collection_name
         self._threshold_direct = threshold_direct
-        self._threshold_high = threshold_high
+        self._threshold_low = threshold_low
         self._client = qdrant_client or self._create_client(
             qdrant_url, qdrant_api_key, use_memory
         )
         self._initialized: bool = False
         logger.info(
-            "SemanticCacheStrategy created: collection='%s', "
-            "thresholds=(direct=%.2f, high=%.2f)",
+            "SemanticCacheStrategy created | collection=%s | direct=%.2f | low=%.2f",
             self._collection,
             self._threshold_direct,
-            self._threshold_high,
+            self._threshold_low,
         )
 
     @staticmethod
@@ -361,7 +374,6 @@ class SemanticCacheStrategy(BaseCacheStrategy):
                 )
                 return None
 
-            # Apply tiered threshold to the single top result
             top = results[0]
             score = top.score
             cache_key = top.payload.get("cache_key", "")
@@ -372,20 +384,18 @@ class SemanticCacheStrategy(BaseCacheStrategy):
 
             tier = self._classify_tier(score)
 
-            if tier == "miss":
-                logger.debug(
-                    "Semantic miss: query='%s', score=%.4f (below threshold)",
-                    query[:60],
-                    score,
-                )
-                return None
+            if tier == "high":
+                candidate_text = top.payload.get("query_text", "")
+                if not self._passes_gates(query, candidate_text):
+                    logger.info(
+                        "Semantic gate reject | query=%s | candidate=%s | score=%.4f",
+                        query[:60], candidate_text[:60], score,
+                    )
+                    return None
 
             logger.info(
-                "Semantic hit: query='%s', score=%.4f, tier=%s, key=%s",
-                query[:60],
-                score,
-                tier,
-                cache_key[:16] + "...",
+                "Semantic hit | query=%s | score=%.4f | tier=%s | key=%s",
+                query[:60], score, tier, cache_key[:16] + "...",
             )
 
             return SimilarityMatch(
@@ -393,7 +403,7 @@ class SemanticCacheStrategy(BaseCacheStrategy):
                 similarity_score=score,
                 tier=tier,
             )
-        except Exception as e:
+        except Exception:
             logger.exception(
                 "Semantic find_similar failed: query='%s'", query[:60]
             )
@@ -408,7 +418,7 @@ class SemanticCacheStrategy(BaseCacheStrategy):
     ) -> list:
         """Sync Qdrant search — runs inside asyncio.to_thread().
 
-        Searches for the single nearest neighbor above the high threshold.
+        Searches for the single nearest neighbor above the low threshold.
         Filters by model_name to prevent cross-model cache pollution.
 
         Args:
@@ -444,7 +454,7 @@ class SemanticCacheStrategy(BaseCacheStrategy):
                 must=must_conditions
             ),
             limit=1,
-            score_threshold=self._threshold_high,
+            score_threshold=self._threshold_low,
         )
 
         return response.points
@@ -460,10 +470,29 @@ class SemanticCacheStrategy(BaseCacheStrategy):
         """
         if score >= self._threshold_direct:
             return "direct"
-        elif score >= self._threshold_high:
+        elif score >= self._threshold_low:
             return "high"
         else:
             return "miss"
+
+    @staticmethod
+    def _tokens(text: str) -> list[str]:
+        return [t.lower() for t in _TOKEN_PATTERN.findall(text)]
+
+    @classmethod
+    def _passes_gates(cls, query: str, candidate: str) -> bool:
+        q_tokens = cls._tokens(query)
+        c_tokens = cls._tokens(candidate)
+        if not q_tokens or not c_tokens:
+            return False
+
+        q_set, c_set = set(q_tokens), set(c_tokens)
+        jaccard = len(q_set & c_set) / len(q_set | c_set)
+        if jaccard < cls._JACCARD_MIN:
+            return False
+
+        ratio = len(q_tokens) / len(c_tokens)
+        return cls._LENGTH_RATIO_MIN <= ratio <= cls._LENGTH_RATIO_MAX
 
     # Index entry (write path)
 
