@@ -1,6 +1,7 @@
 """Facade over all subsystems (LLM, vector store, cache, RAG variants, agent layer); owns lifecycle, query routing, ingestion, health, and fallback."""
 
 import asyncio
+import json
 import time
 from typing import Awaitable, Callable, Literal, Optional
 
@@ -43,6 +44,7 @@ from rag.models.rag_response import RAGResponse
 from rag.rag_factory import RAGFactory
 from vectorstore.embeddings import get_embeddings
 from vectorstore.qdrant_store import QdrantStore
+from utils.helpers import hash_text
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -468,6 +470,24 @@ class RAGPipeline:
         rag = await self._build_rag_for_request(request, llm)
         return await rag.query(request)
 
+    @staticmethod
+    def _build_scope_hash(request: RAGRequest) -> str:
+        """Deterministic hash of all request fields that scope the cached answer."""
+        parts = [
+            request.logical_collection,
+            request.config.domain or "",
+            request.config.rag_variant or "",
+            request.config.retrieval_mode,
+            request.config.rerank_strategy,
+            str(request.config.top_k),
+        ]
+        if request.config.metadata_filters:
+            parts.append(hash_text(json.dumps(
+                [f.model_dump() for f in request.config.metadata_filters],
+                sort_keys=True,
+            )))
+        return hash_text("|".join(parts))
+
     async def _try_agent_cache_read(self, request: RAGRequest) -> RAGResponse | None:
         """Attempt to read a cached agent response. Returns None on miss or error."""
         try:
@@ -477,6 +497,7 @@ class RAGPipeline:
                 temperature=0.0,
                 system_prompt="__agent__",
                 user_id=request.user_id or "",
+                scope_hash=self._build_scope_hash(request),
             )
             if result.hit:
                 if result.strategy.value == "semantic":
@@ -545,6 +566,7 @@ class RAGPipeline:
                 sources=[chunk.model_dump() for chunk in response.sources],
                 confidence_value=response.confidence.value if response.confidence else 0.0,
                 user_id=request.user_id or "",
+                scope_hash=self._build_scope_hash(request),
             )
             await self._cache.resolve_in_flight(
                 query=request.query,
@@ -552,6 +574,7 @@ class RAGPipeline:
                 temperature=0.0,
                 system_prompt="__agent__",
                 user_id=request.user_id or "",
+                scope_hash=self._build_scope_hash(request),
             )
         except Exception as exc:
             logger.warning(

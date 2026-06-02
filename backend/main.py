@@ -3,9 +3,8 @@
 import asyncio
 import os
 
-os.environ.setdefault("HF_HUB_DISABLE_SSL_VERIFICATION", "1")
-os.environ.setdefault("CURL_CA_BUNDLE", "")
-os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
+if os.environ.get("BACKEND_ALLOW_INSECURE_TLS", "").lower() in ("1", "true"):
+    os.environ.setdefault("HF_HUB_DISABLE_SSL_VERIFICATION", "1")
 
 import time
 from contextlib import asynccontextmanager

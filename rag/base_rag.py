@@ -1,5 +1,6 @@
 """Abstract base class for RAG variants using Template Method; query() is sealed."""
 
+import json
 import time
 from abc import ABC, abstractmethod
 
@@ -27,6 +28,7 @@ from rag.exceptions.rag_exceptions import (
     RAGGenerationError,
     RAGContextError,
 )
+from utils.helpers import hash_text
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -157,6 +159,7 @@ class BaseRAG(ABC):
                                     temperature=request.config.temperature,
                                     system_prompt=request.config.system_prompt or "",
                                     user_id=request.user_id or "",
+                                    scope_hash=self._build_scope_hash(request),
                                 )
                             except Exception:
                                 pass
@@ -454,6 +457,24 @@ class BaseRAG(ABC):
                 },
             ) from exc
 
+    @staticmethod
+    def _build_scope_hash(request: RAGRequest) -> str:
+        """Deterministic hash of all request fields that scope the cached answer."""
+        parts = [
+            request.logical_collection,
+            request.config.domain or "",
+            request.config.rag_variant or "",
+            request.config.retrieval_mode,
+            request.config.rerank_strategy,
+            str(request.config.top_k),
+        ]
+        if request.config.metadata_filters:
+            parts.append(hash_text(json.dumps(
+                [f.model_dump() for f in request.config.metadata_filters],
+                sort_keys=True,
+            )))
+        return hash_text("|".join(parts))
+
     async def _try_cache_read(self, request: RAGRequest) -> RAGResponse | None:
         """Attempt to read a cached response. Returns None on miss or error."""
         try:
@@ -463,6 +484,7 @@ class BaseRAG(ABC):
                 temperature=request.config.temperature,
                 system_prompt=request.config.system_prompt or "",
                 user_id=request.user_id or "",
+                scope_hash=self._build_scope_hash(request),
             )
 
             if result.hit:
@@ -525,6 +547,7 @@ class BaseRAG(ABC):
                 sources=[chunk.model_dump() for chunk in (sources or [])],
                 confidence_value=confidence.value if confidence is not None else 0.0,
                 user_id=request.user_id or "",
+                scope_hash=self._build_scope_hash(request),
             )
             await self._cache.resolve_in_flight(
                 query=request.query,
@@ -532,6 +555,7 @@ class BaseRAG(ABC):
                 temperature=request.config.temperature,
                 system_prompt=request.config.system_prompt or "",
                 user_id=request.user_id or "",
+                scope_hash=self._build_scope_hash(request),
             )
         except Exception as exc:
             logger.warning(

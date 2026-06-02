@@ -537,18 +537,20 @@ class QdrantStore(BaseVectorStore):
             for doc in documents
         ]
 
+        doc_id = documents[0].metadata.get("doc_id", "") if documents else ""
+        must_conditions: list = [
+            FieldCondition(key="metadata.chunk_id", match=MatchAny(any=chunk_ids))
+        ]
+        if doc_id:
+            must_conditions.append(
+                FieldCondition(key="metadata.doc_id", match=MatchValue(value=doc_id))
+            )
+
         try:
             existing_points, _ = await asyncio.to_thread(
                 self._client.scroll,
                 collection_name=self.collection_name,
-                scroll_filter=Filter(
-                    must=[
-                        FieldCondition(
-                            key="metadata.chunk_id",
-                            match=MatchAny(any=chunk_ids),
-                        )
-                    ]
-                ),
+                scroll_filter=Filter(must=must_conditions),
                 with_payload=["metadata.chunk_id"],
                 limit=len(chunk_ids),
             )

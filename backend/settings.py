@@ -14,6 +14,7 @@ class BackendSettings(BaseSettings):
 
     cors_origins: str = Field(default="*")
     max_upload_size_mb: int = Field(default=50)
+    allow_insecure_tls: bool = Field(default=False)
     ingest_temp_dir: str = Field(default="./data/uploads")
     max_concurrent_subqueries: int = Field(default=3)
     log_requests: bool = Field(default=True)

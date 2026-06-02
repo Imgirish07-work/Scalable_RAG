@@ -82,6 +82,7 @@ class ExactCacheStrategy(BaseCacheStrategy):
         temperature: float,
         system_prompt_hash: str = "",
         user_id: str = "",
+        scope_hash: str = "",
     ) -> str:
         """Generate SHA-256 cache key from normalized inputs.
 
@@ -107,6 +108,7 @@ class ExactCacheStrategy(BaseCacheStrategy):
                 temperature=temperature,
                 system_prompt_hash=system_prompt_hash,
                 user_id=user_id,
+                scope_hash=scope_hash,
             )
 
             if not fingerprint:
@@ -136,6 +138,7 @@ class ExactCacheStrategy(BaseCacheStrategy):
         temperature: float,
         system_prompt_hash: str = "",
         user_id: str = "",
+        scope_hash: str = "",
     ) -> Optional[SimilarityMatch]:
         """Check if the exact key exists in any backend.
 
@@ -162,6 +165,7 @@ class ExactCacheStrategy(BaseCacheStrategy):
                 temperature=temperature,
                 system_prompt_hash=system_prompt_hash,
                 user_id=user_id,
+                scope_hash=scope_hash,
             )
         except CacheKeyError:
             return None
@@ -200,6 +204,8 @@ class ExactCacheStrategy(BaseCacheStrategy):
         model_name: str,
         temperature: float,
         system_prompt_hash: str = "",
+        user_id: str = "",
+        scope_hash: str = "",
     ) -> None:
         """No-op for exact strategy.
 
