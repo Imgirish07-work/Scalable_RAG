@@ -67,6 +67,7 @@ class BaseCacheStrategy(ABC):
         model_name: str,
         temperature: float,
         system_prompt_hash: str = "",
+        user_id: str = "",
     ) -> str:
         """Generate a deterministic cache key from inputs.
 
@@ -91,6 +92,7 @@ class BaseCacheStrategy(ABC):
         model_name: str,
         temperature: float,
         system_prompt_hash: str = "",
+        user_id: str = "",
     ) -> Optional[SimilarityMatch]:
         """Search for a similar cached entry.
 
@@ -116,6 +118,7 @@ class BaseCacheStrategy(ABC):
         model_name: str,
         temperature: float,
         system_prompt_hash: str = "",
+        user_id: str = "",
     ) -> None:
         """Index a new entry for future similarity lookups.
 

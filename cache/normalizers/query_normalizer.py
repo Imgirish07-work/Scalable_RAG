@@ -227,6 +227,7 @@ class QueryNormalizerChain:
         model_name: str,
         temperature: float,
         system_prompt_hash: str = "",
+        user_id: str = "",
     ) -> str:
         """Build the canonical string that gets hashed into a cache key.
 
@@ -239,20 +240,20 @@ class QueryNormalizerChain:
             model_name: LLM model identifier.
             temperature: Generation temperature.
             system_prompt_hash: Pre-computed SHA-256 of system prompt.
+            user_id: Caller identity; omitted from key when empty (backward compat).
 
         Returns:
             Canonical fingerprint string like:
-            "what is rag|gemini-2.5-flash|0.0|abc123def456..."
+            "alice|what is rag|gemini-2.5-flash|0.0|abc123def456..."
         """
         normalized_query = self.normalize(query)
         nanonical_model = model_name.strip().lower()
         canonical_temp = f"{temperature:.1f}"
 
-        parts = [
-            normalized_query,
-            nanonical_model,
-            canonical_temp,
-        ]
+        parts = [normalized_query, nanonical_model, canonical_temp]
+
+        if user_id:
+            parts.insert(0, user_id.strip().lower())
 
         if system_prompt_hash:
             parts.append(system_prompt_hash)

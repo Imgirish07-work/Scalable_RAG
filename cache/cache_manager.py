@@ -262,6 +262,7 @@ class CacheManager:
         model_name: str,
         temperature: float,
         system_prompt: str = "",
+        user_id: str = "",
     ) -> CacheResult:
         """Look up a cached LLM response; never raises to the caller."""
         start = time.perf_counter()
@@ -277,6 +278,7 @@ class CacheManager:
                 model_name=model_name,
                 temperature=temperature,
                 system_prompt_hash=system_prompt_hash,
+                user_id=user_id,
             )
 
             result = await self._try_get_from_l1(key, start)
@@ -293,7 +295,7 @@ class CacheManager:
 
             if self._semantic_strategy is not None:
                 result = await self._try_semantic_lookup(
-                    query, model_name, temperature, system_prompt_hash, start
+                    query, model_name, temperature, system_prompt_hash, start, user_id
                 )
                 if result is not None:
                     self._record_hit_metrics(result)
@@ -403,6 +405,7 @@ class CacheManager:
         temperature: float,
         system_prompt_hash: str,
         start: float,
+        user_id: str = "",
     ) -> Optional[CacheResult]:
         """Attempt semantic similarity match via Qdrant; never raises."""
         try:
@@ -411,6 +414,7 @@ class CacheManager:
                 model_name=model_name,
                 temperature=temperature,
                 system_prompt_hash=system_prompt_hash,
+                user_id=user_id,
             )
 
             if match is None:
@@ -505,6 +509,7 @@ class CacheManager:
         ttl_seconds: Optional[int] = None,
         sources: list = [],
         confidence_value: float = 0.0,
+        user_id: str = "",
     ) -> bool:
         """Cache an LLM response; returns True if written to at least L1."""
         start = time.perf_counter()
@@ -530,6 +535,7 @@ class CacheManager:
                 model_name=model_name,
                 temperature=temperature,
                 system_prompt_hash=system_prompt_hash,
+                user_id=user_id,
             )
 
             if ttl_seconds is not None:
@@ -580,6 +586,7 @@ class CacheManager:
                         model_name=model_name,
                         temperature=temperature,
                         system_prompt_hash=system_prompt_hash,
+                        user_id=user_id,
                     )
                 except Exception:
                     logger.exception("Semantic index failed: key=%s", key[:16] + "...")
@@ -609,12 +616,13 @@ class CacheManager:
         temperature: float,
         system_prompt: str = "",
         timeout: float = 10.0,
+        user_id: str = "",
     ) -> CacheResult:
         """Cache lookup with request coalescing; waits on in-flight duplicate LLM calls."""
         if not self._enabled:
             return CacheResult.miss()
 
-        result = await self.get(query, model_name, temperature, system_prompt)
+        result = await self.get(query, model_name, temperature, system_prompt, user_id=user_id)
         if result.hit:
             return result
 
@@ -626,6 +634,7 @@ class CacheManager:
                 model_name=model_name,
                 temperature=temperature,
                 system_prompt_hash=system_prompt_hash,
+                user_id=user_id,
             )
         except Exception:
             return result
@@ -648,7 +657,7 @@ class CacheManager:
             )
             return CacheResult.miss()
 
-        return await self.get(query, model_name, temperature, system_prompt)
+        return await self.get(query, model_name, temperature, system_prompt, user_id=user_id)
 
     async def resolve_in_flight(
         self,
@@ -656,6 +665,7 @@ class CacheManager:
         model_name: str,
         temperature: float,
         system_prompt: str = "",
+        user_id: str = "",
     ) -> None:
         """Signal that an in-flight LLM call has completed, unblocking get_or_wait() waiters."""
         system_prompt_hash = hash_text(system_prompt) if system_prompt else ""
@@ -666,6 +676,7 @@ class CacheManager:
                 model_name=model_name,
                 temperature=temperature,
                 system_prompt_hash=system_prompt_hash,
+                user_id=user_id,
             )
         except Exception:
             return
@@ -723,6 +734,7 @@ class CacheManager:
         model_name: str,
         temperature: float,
         system_prompt: str = "",
+        user_id: str = "",
     ) -> bool:
         """Delete a specific cached entry from all backends; returns True if found in at least one."""
         system_prompt_hash = hash_text(system_prompt) if system_prompt else ""
@@ -733,6 +745,7 @@ class CacheManager:
                 model_name=model_name,
                 temperature=temperature,
                 system_prompt_hash=system_prompt_hash,
+                user_id=user_id,
             )
         except Exception:
             logger.exception("Invalidation failed — key generation error")
@@ -757,6 +770,18 @@ class CacheManager:
             logger.info("Cache entry invalidated: key=%s", key[:16] + "...")
 
         return deleted
+
+    async def invalidate_user(self, user_id: str) -> bool:
+        """Delete all semantic cache entries for the given user; returns True on success."""
+        if not self._semantic_strategy or not user_id:
+            return False
+        try:
+            await asyncio.to_thread(self._semantic_strategy.delete_user_entries, user_id)
+            logger.info("User cache invalidated: user_id=%s", user_id)
+            return True
+        except Exception:
+            logger.exception("invalidate_user failed: user_id=%s", user_id)
+            return False
 
     async def clear_all(self) -> dict:
         """Clear all entries from all backends; returns per-backend removal counts (-1 on error)."""

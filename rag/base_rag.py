@@ -156,6 +156,7 @@ class BaseRAG(ABC):
                                     model_name=self._llm.model_name,
                                     temperature=request.config.temperature,
                                     system_prompt=request.config.system_prompt or "",
+                                    user_id=request.user_id or "",
                                 )
                             except Exception:
                                 pass
@@ -461,6 +462,7 @@ class BaseRAG(ABC):
                 model_name=self._llm.model_name,
                 temperature=request.config.temperature,
                 system_prompt=request.config.system_prompt or "",
+                user_id=request.user_id or "",
             )
 
             if result.hit:
@@ -522,12 +524,14 @@ class BaseRAG(ABC):
                 system_prompt=request.config.system_prompt or "",
                 sources=[chunk.model_dump() for chunk in (sources or [])],
                 confidence_value=confidence.value if confidence is not None else 0.0,
+                user_id=request.user_id or "",
             )
             await self._cache.resolve_in_flight(
                 query=request.query,
                 model_name=self._llm.model_name,
                 temperature=request.config.temperature,
                 system_prompt=request.config.system_prompt or "",
+                user_id=request.user_id or "",
             )
         except Exception as exc:
             logger.warning(

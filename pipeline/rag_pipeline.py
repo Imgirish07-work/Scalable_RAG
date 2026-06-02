@@ -476,6 +476,7 @@ class RAGPipeline:
                 model_name=self._llm.model_name,
                 temperature=0.0,
                 system_prompt="__agent__",
+                user_id=request.user_id or "",
             )
             if result.hit:
                 if result.strategy.value == "semantic":
@@ -543,12 +544,14 @@ class RAGPipeline:
                 system_prompt="__agent__",
                 sources=[chunk.model_dump() for chunk in response.sources],
                 confidence_value=response.confidence.value if response.confidence else 0.0,
+                user_id=request.user_id or "",
             )
             await self._cache.resolve_in_flight(
                 query=request.query,
                 model_name=self._llm.model_name,
                 temperature=0.0,
                 system_prompt="__agent__",
+                user_id=request.user_id or "",
             )
         except Exception as exc:
             logger.warning(

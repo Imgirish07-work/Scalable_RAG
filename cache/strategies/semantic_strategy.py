@@ -276,6 +276,7 @@ class SemanticCacheStrategy(BaseCacheStrategy):
         model_name: str,
         temperature: float,
         system_prompt_hash: str = "",
+        user_id: str = "",
     ) -> str:
         """Generate SHA-256 cache key — identical to exact strategy.
 
@@ -303,6 +304,7 @@ class SemanticCacheStrategy(BaseCacheStrategy):
                 model_name=model_name,
                 temperature=temperature,
                 system_prompt_hash=system_prompt_hash,
+                user_id=user_id,
             )
             if not fingerprint:
                 raise ValueError("Empty fingerprint after normalization")
@@ -328,6 +330,7 @@ class SemanticCacheStrategy(BaseCacheStrategy):
         model_name: str,
         temperature: float,
         system_prompt_hash: str = "",
+        user_id: str = "",
     ) -> Optional[SimilarityMatch]:
         """Search for a semantically similar cached query in Qdrant.
 
@@ -365,6 +368,7 @@ class SemanticCacheStrategy(BaseCacheStrategy):
                 model_name=model_name,
                 temperature=temperature,
                 system_prompt_hash=system_prompt_hash,
+                user_id=user_id,
             )
 
             if not results:
@@ -415,6 +419,7 @@ class SemanticCacheStrategy(BaseCacheStrategy):
         model_name: str,
         temperature: float,
         system_prompt_hash: str,
+        user_id: str = "",
     ) -> list:
         """Sync Qdrant search — runs inside asyncio.to_thread().
 
@@ -444,6 +449,14 @@ class SemanticCacheStrategy(BaseCacheStrategy):
                 FieldCondition(
                     key="system_prompt_hash",
                     match=MatchValue(value=system_prompt_hash),
+                )
+            )
+
+        if user_id:
+            must_conditions.append(
+                FieldCondition(
+                    key="user_id",
+                    match=MatchValue(value=user_id.strip().lower()),
                 )
             )
 
@@ -503,6 +516,7 @@ class SemanticCacheStrategy(BaseCacheStrategy):
         model_name: str,
         temperature: float,
         system_prompt_hash: str = "",
+        user_id: str = "",
     ) -> None:
         """Embed a query and upsert into Qdrant for future similarity lookups.
 
@@ -537,6 +551,7 @@ class SemanticCacheStrategy(BaseCacheStrategy):
                 "model_name": model_name.strip().lower(),
                 "temperature": float(temperature),
                 "system_prompt_hash": system_prompt_hash,
+                "user_id": user_id.strip().lower(),
             }
 
             await asyncio.to_thread(
@@ -577,6 +592,17 @@ class SemanticCacheStrategy(BaseCacheStrategy):
                 )
             ]
         )
+
+    def delete_user_entries(self, user_id: str) -> None:
+        """Delete all Qdrant points for the given user. Sync — runs in to_thread()."""
+        from qdrant_client.models import Filter, FieldCondition, MatchValue, FilterSelector
+        self._client.delete(
+            collection_name=self._collection,
+            points_selector=FilterSelector(filter=Filter(must=[
+                FieldCondition(key="user_id", match=MatchValue(value=user_id.strip().lower()))
+            ])),
+        )
+        logger.info("Semantic entries deleted: user_id=%s", user_id)
 
     # Helpers
 
